@@ -1,4 +1,4 @@
-import { Notice, Plugin, TFile, WorkspaceLeaf, setIcon } from "obsidian";
+import { Notice, Plugin, TFile, WorkspaceLeaf, getLanguage, setIcon } from "obsidian";
 import * as fontkitModule from "@pdf-lib/fontkit";
 import { PDFDocument, degrees, rgb } from "pdf-lib";
 
@@ -26,14 +26,7 @@ const TEXT_FONTS = [
 
 function isChineseUi(): boolean {
   const languages = new Set<string>();
-  try {
-    const storedLanguage = activeWindow.localStorage.getItem("language");
-    if (storedLanguage) {
-      languages.add(storedLanguage);
-    }
-  } catch {
-    // Popouts or restricted contexts can block localStorage; navigator language is enough.
-  }
+  languages.add(getLanguage());
   languages.add(activeWindow.navigator.language);
   for (const language of activeWindow.navigator.languages ?? []) {
     languages.add(language);
@@ -43,6 +36,12 @@ function isChineseUi(): boolean {
 
 function uiText(zh: string, en: string): string {
   return isChineseUi() ? zh : en;
+}
+
+function toArrayBufferCopy(bytes: Uint8Array): ArrayBuffer {
+  const copy = new Uint8Array(bytes.byteLength);
+  copy.set(bytes);
+  return copy.buffer;
 }
 
 function createActiveElement<K extends keyof HTMLElementTagNameMap>(tagName: K): HTMLElementTagNameMap[K] {
@@ -55,13 +54,6 @@ function appendToActiveBody(element: HTMLElement): void {
 
 function getActiveBody(): HTMLElement {
   return activeDocument.body;
-}
-
-function getActiveWindowSize(): { height: number; width: number } {
-  return {
-    height: activeWindow.innerHeight,
-    width: activeWindow.innerWidth
-  };
 }
 
 type CrossWindowNode = Node & {
@@ -574,7 +566,7 @@ export default class PdftionPlugin extends Plugin {
   private queuePdfSurfaceScans(): void {
     this.clearSurfaceScanTimers();
     for (const delay of [0, 80, 180, 420, 900, 1800, 3200]) {
-      const timer = activeWindow.setTimeout(() => {
+      const timer = window.setTimeout(() => {
         this.surfaceScanTimers = this.surfaceScanTimers.filter((value) => value !== timer);
         this.scanPdfSurfaces();
       }, delay);
@@ -584,7 +576,7 @@ export default class PdftionPlugin extends Plugin {
 
   private clearSurfaceScanTimers(): void {
     for (const timer of this.surfaceScanTimers) {
-      activeWindow.clearTimeout(timer);
+      window.clearTimeout(timer);
     }
     this.surfaceScanTimers = [];
   }
@@ -1167,7 +1159,7 @@ class InkSession {
 
   private scheduleScanPages(delay = 250): void {
     this.clearScanTimer();
-    this.scanTimer = activeWindow.setTimeout(() => {
+    this.scanTimer = window.setTimeout(() => {
       this.scanTimer = null;
       this.scanPages();
     }, delay);
@@ -1505,12 +1497,12 @@ class InkSession {
     if (this.healthTimer !== null) {
       return;
     }
-    this.healthTimer = activeWindow.setInterval(() => this.repairActiveOverlays(), OVERLAY_HEALTH_CHECK_MS);
+    this.healthTimer = window.setInterval(() => this.repairActiveOverlays(), OVERLAY_HEALTH_CHECK_MS);
   }
 
   private stopOverlayHealthCheck(): void {
     if (this.healthTimer !== null) {
-      activeWindow.clearInterval(this.healthTimer);
+      window.clearInterval(this.healthTimer);
       this.healthTimer = null;
     }
   }
@@ -1741,7 +1733,7 @@ class InkSession {
         dragX = clamp(startRect.left + moveEvent.clientX - startX, 0, maxLeft) - startRect.left;
         dragY = clamp(startRect.top + moveEvent.clientY - startY, 0, maxTop) - startRect.top;
         if (frame === 0) {
-          frame = activeWindow.requestAnimationFrame(applyTransform);
+          frame = window.requestAnimationFrame(applyTransform);
         }
       };
       const up = (): void => {
@@ -2528,7 +2520,7 @@ class InkSession {
       top: `${fallbackTop}px`
     });
 
-    activeWindow.requestAnimationFrame(() => {
+    window.requestAnimationFrame(() => {
       const rect = panel.getBoundingClientRect();
       const buttonRect = button?.getBoundingClientRect();
       let left = buttonRect ? buttonRect.right - rect.width : activeWindow.innerWidth - rect.width - 12;
@@ -3974,7 +3966,7 @@ class InkSession {
     }
 
     const docx = buildDocxFromParagraphs(markdownToDocxParagraphs(await this.getPdfContentMarkdown()), targetFile.basename);
-    const buffer = docx.buffer.slice(docx.byteOffset, docx.byteOffset + docx.byteLength) as ArrayBuffer;
+    const buffer = toArrayBufferCopy(docx);
     await this.plugin.app.vault.adapter.writeBinary(targetPath, buffer);
     new Notice(uiText(`已导出 DOCX：${targetPath}`, `Exported DOCX: ${targetPath}`));
     return targetPath;
@@ -4048,7 +4040,7 @@ class InkSession {
       const pages = await this.captureVisualConversionPages();
       const targetPath = await this.getUniqueConvertedPath("pdftion-converted", "docx");
       const docx = buildDocxFromPageImages(pages, this.file.basename);
-      const buffer = docx.buffer.slice(docx.byteOffset, docx.byteOffset + docx.byteLength) as ArrayBuffer;
+      const buffer = toArrayBufferCopy(docx);
       await this.plugin.app.vault.adapter.writeBinary(targetPath, buffer);
       if (options.notice !== false) {
         new Notice(uiText(`已转换 DOCX：${targetPath}`, `Converted DOCX: ${targetPath}`));
@@ -4145,7 +4137,7 @@ class InkSession {
     for (const page of pages) {
       const pageName = `page-${String(page.pageIndex + 1).padStart(3, "0")}.png`;
       page.path = `${folderPath}/${pageName}`;
-      const buffer = page.bytes.buffer.slice(page.bytes.byteOffset, page.bytes.byteOffset + page.bytes.byteLength) as ArrayBuffer;
+      const buffer = toArrayBufferCopy(page.bytes);
       await this.plugin.app.vault.adapter.writeBinary(page.path, buffer);
     }
     return folderPath;
@@ -5539,7 +5531,7 @@ class InkSession {
       return;
     }
     this.clearAutoSaveTimer();
-    this.saveTimer = activeWindow.setTimeout(() => {
+    this.saveTimer = window.setTimeout(() => {
       this.saveTimer = null;
       void this.saveIntoPdf(true);
     }, delay);
@@ -5555,14 +5547,14 @@ class InkSession {
 
   private clearAutoSaveTimer(): void {
     if (this.saveTimer !== null) {
-      activeWindow.clearTimeout(this.saveTimer);
+      window.clearTimeout(this.saveTimer);
       this.saveTimer = null;
     }
   }
 
   private clearScanTimer(): void {
     if (this.scanTimer !== null) {
-      activeWindow.clearTimeout(this.scanTimer);
+      window.clearTimeout(this.scanTimer);
       this.scanTimer = null;
     }
   }
@@ -5713,7 +5705,7 @@ async function trySharePdf(fileName: string, bytes: Uint8Array): Promise<boolean
     return false;
   }
 
-  const fileBuffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+  const fileBuffer = toArrayBufferCopy(bytes);
   const file = new File([fileBuffer], fileName, { type: "application/pdf" });
   const shareData: ShareData & { files: File[] } = {
     files: [file],
@@ -5813,11 +5805,11 @@ function arrayBufferToDataUrl(buffer: ArrayBuffer, mime: string): string {
 }
 
 function sleepMs(ms: number): Promise<void> {
-  return new Promise((resolve) => activeWindow.setTimeout(resolve, ms));
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
 function waitForNextFrame(): Promise<void> {
-  return new Promise((resolve) => activeWindow.requestAnimationFrame(() => resolve()));
+  return new Promise((resolve) => window.requestAnimationFrame(() => resolve()));
 }
 
 function loadDataUrlImage(dataUrl: string): Promise<HTMLImageElement> {
@@ -6922,34 +6914,6 @@ function getResizeCorner(bounds: NormalizedBounds, handle: ResizeHandle): InkPoi
   return { x: bounds.maxX, y: bounds.maxY };
 }
 
-function shiftStrokesInsidePage(strokes: InkStroke[]): void {
-  const box = normalizedStrokesBounds(strokes);
-  if (!box) {
-    return;
-  }
-
-  let dx = 0;
-  let dy = 0;
-  if (box.minX < 0) {
-    dx = -box.minX;
-  } else if (box.maxX > 1) {
-    dx = 1 - box.maxX;
-  }
-
-  if (box.minY < 0) {
-    dy = -box.minY;
-  } else if (box.maxY > 1) {
-    dy = 1 - box.maxY;
-  }
-
-  for (const stroke of strokes) {
-    for (const point of stroke.points) {
-      point.x = clamp(point.x + dx, 0, 1);
-      point.y = clamp(point.y + dy, 0, 1);
-    }
-  }
-}
-
 function shiftElementsInsidePage(elements: InkElement[]): void {
   const box = normalizedElementsBounds(elements);
   if (!box) {
@@ -7060,7 +7024,8 @@ function collectPdfPathHints(rootEl: HTMLElement): string[] {
     add(rootEl.getAttribute(attr));
   }
 
-  for (const el of rootEl.querySelectorAll<HTMLElement>("a, embed, iframe, object, .internal-embed, .media-embed")) {
+  const hintElements = Array.from(rootEl.querySelectorAll("a, embed, iframe, object, .internal-embed, .media-embed")).filter(isHTMLElement);
+  for (const el of hintElements) {
     for (const attr of attrs) {
       add(el.getAttribute(attr));
     }
@@ -7119,7 +7084,7 @@ function safeAnnotationKey(path: string): string {
 function focusTextEditor(editor: HTMLTextAreaElement): void {
   editor.focus({ preventScroll: true });
   editor.select();
-  activeWindow.setTimeout(() => {
+  window.setTimeout(() => {
     if (activeDocument.activeElement !== editor) {
       editor.focus({ preventScroll: true });
     }

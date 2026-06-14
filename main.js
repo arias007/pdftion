@@ -52135,13 +52135,7 @@ var TEXT_FONTS = [
 ];
 function isChineseUi() {
   const languages = /* @__PURE__ */ new Set();
-  try {
-    const storedLanguage = activeWindow.localStorage.getItem("language");
-    if (storedLanguage) {
-      languages.add(storedLanguage);
-    }
-  } catch {
-  }
+  languages.add((0, import_obsidian.getLanguage)());
   languages.add(activeWindow.navigator.language);
   for (const language of activeWindow.navigator.languages ?? []) {
     languages.add(language);
@@ -52150,6 +52144,11 @@ function isChineseUi() {
 }
 function uiText(zh, en) {
   return isChineseUi() ? zh : en;
+}
+function toArrayBufferCopy(bytes) {
+  const copy = new Uint8Array(bytes.byteLength);
+  copy.set(bytes);
+  return copy.buffer;
 }
 function createActiveElement(tagName) {
   return activeDocument.createElement(tagName);
@@ -52365,7 +52364,7 @@ var PdftionPlugin = class extends import_obsidian.Plugin {
   queuePdfSurfaceScans() {
     this.clearSurfaceScanTimers();
     for (const delay of [0, 80, 180, 420, 900, 1800, 3200]) {
-      const timer = activeWindow.setTimeout(() => {
+      const timer = window.setTimeout(() => {
         this.surfaceScanTimers = this.surfaceScanTimers.filter((value) => value !== timer);
         this.scanPdfSurfaces();
       }, delay);
@@ -52374,7 +52373,7 @@ var PdftionPlugin = class extends import_obsidian.Plugin {
   }
   clearSurfaceScanTimers() {
     for (const timer of this.surfaceScanTimers) {
-      activeWindow.clearTimeout(timer);
+      window.clearTimeout(timer);
     }
     this.surfaceScanTimers = [];
   }
@@ -52888,7 +52887,7 @@ var InkSession = class {
   }
   scheduleScanPages(delay = 250) {
     this.clearScanTimer();
-    this.scanTimer = activeWindow.setTimeout(() => {
+    this.scanTimer = window.setTimeout(() => {
       this.scanTimer = null;
       this.scanPages();
     }, delay);
@@ -53137,11 +53136,11 @@ var InkSession = class {
     if (this.healthTimer !== null) {
       return;
     }
-    this.healthTimer = activeWindow.setInterval(() => this.repairActiveOverlays(), OVERLAY_HEALTH_CHECK_MS);
+    this.healthTimer = window.setInterval(() => this.repairActiveOverlays(), OVERLAY_HEALTH_CHECK_MS);
   }
   stopOverlayHealthCheck() {
     if (this.healthTimer !== null) {
-      activeWindow.clearInterval(this.healthTimer);
+      window.clearInterval(this.healthTimer);
       this.healthTimer = null;
     }
   }
@@ -53335,7 +53334,7 @@ var InkSession = class {
         dragX = clamp(startRect.left + moveEvent.clientX - startX, 0, maxLeft) - startRect.left;
         dragY = clamp(startRect.top + moveEvent.clientY - startY, 0, maxTop) - startRect.top;
         if (frame === 0) {
-          frame = activeWindow.requestAnimationFrame(applyTransform);
+          frame = window.requestAnimationFrame(applyTransform);
         }
       };
       const up = () => {
@@ -54044,7 +54043,7 @@ var InkSession = class {
       right: `${Math.max(8, activeWindow.innerWidth - (button?.getBoundingClientRect().right ?? activeWindow.innerWidth - 12))}px`,
       top: `${fallbackTop}px`
     });
-    activeWindow.requestAnimationFrame(() => {
+    window.requestAnimationFrame(() => {
       const rect = panel.getBoundingClientRect();
       const buttonRect = button?.getBoundingClientRect();
       let left = buttonRect ? buttonRect.right - rect.width : activeWindow.innerWidth - rect.width - 12;
@@ -55285,7 +55284,7 @@ var InkSession = class {
       index += 1;
     }
     const docx = buildDocxFromParagraphs(markdownToDocxParagraphs(await this.getPdfContentMarkdown()), targetFile.basename);
-    const buffer2 = docx.buffer.slice(docx.byteOffset, docx.byteOffset + docx.byteLength);
+    const buffer2 = toArrayBufferCopy(docx);
     await this.plugin.app.vault.adapter.writeBinary(targetPath, buffer2);
     new import_obsidian.Notice(uiText(`\u5DF2\u5BFC\u51FA DOCX\uFF1A${targetPath}`, `Exported DOCX: ${targetPath}`));
     return targetPath;
@@ -55354,7 +55353,7 @@ var InkSession = class {
       const pages = await this.captureVisualConversionPages();
       const targetPath = await this.getUniqueConvertedPath("pdftion-converted", "docx");
       const docx = buildDocxFromPageImages(pages, this.file.basename);
-      const buffer2 = docx.buffer.slice(docx.byteOffset, docx.byteOffset + docx.byteLength);
+      const buffer2 = toArrayBufferCopy(docx);
       await this.plugin.app.vault.adapter.writeBinary(targetPath, buffer2);
       if (options.notice !== false) {
         new import_obsidian.Notice(uiText(`\u5DF2\u8F6C\u6362 DOCX\uFF1A${targetPath}`, `Converted DOCX: ${targetPath}`));
@@ -55443,7 +55442,7 @@ var InkSession = class {
     for (const page of pages) {
       const pageName = `page-${String(page.pageIndex + 1).padStart(3, "0")}.png`;
       page.path = `${folderPath}/${pageName}`;
-      const buffer2 = page.bytes.buffer.slice(page.bytes.byteOffset, page.bytes.byteOffset + page.bytes.byteLength);
+      const buffer2 = toArrayBufferCopy(page.bytes);
       await this.plugin.app.vault.adapter.writeBinary(page.path, buffer2);
     }
     return folderPath;
@@ -56694,7 +56693,7 @@ var InkSession = class {
       return;
     }
     this.clearAutoSaveTimer();
-    this.saveTimer = activeWindow.setTimeout(() => {
+    this.saveTimer = window.setTimeout(() => {
       this.saveTimer = null;
       void this.saveIntoPdf(true);
     }, delay);
@@ -56708,13 +56707,13 @@ var InkSession = class {
   }
   clearAutoSaveTimer() {
     if (this.saveTimer !== null) {
-      activeWindow.clearTimeout(this.saveTimer);
+      window.clearTimeout(this.saveTimer);
       this.saveTimer = null;
     }
   }
   clearScanTimer() {
     if (this.scanTimer !== null) {
-      activeWindow.clearTimeout(this.scanTimer);
+      window.clearTimeout(this.scanTimer);
       this.scanTimer = null;
     }
   }
@@ -56847,7 +56846,7 @@ async function trySharePdf(fileName, bytes) {
   if (typeof File === "undefined" || typeof navigator === "undefined") {
     return false;
   }
-  const fileBuffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+  const fileBuffer = toArrayBufferCopy(bytes);
   const file = new File([fileBuffer], fileName, { type: "application/pdf" });
   const shareData = {
     files: [file],
@@ -56935,10 +56934,10 @@ function arrayBufferToDataUrl(buffer2, mime) {
   return `data:${mime};base64,${btoa(binary)}`;
 }
 function sleepMs(ms) {
-  return new Promise((resolve) => activeWindow.setTimeout(resolve, ms));
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 function waitForNextFrame() {
-  return new Promise((resolve) => activeWindow.requestAnimationFrame(() => resolve()));
+  return new Promise((resolve) => window.requestAnimationFrame(() => resolve()));
 }
 function loadDataUrlImage(dataUrl) {
   return new Promise((resolve, reject) => {
@@ -57973,7 +57972,8 @@ function collectPdfPathHints(rootEl) {
   for (const attr of attrs) {
     add(rootEl.getAttribute(attr));
   }
-  for (const el of rootEl.querySelectorAll("a, embed, iframe, object, .internal-embed, .media-embed")) {
+  const hintElements = Array.from(rootEl.querySelectorAll("a, embed, iframe, object, .internal-embed, .media-embed")).filter(isHTMLElement);
+  for (const el of hintElements) {
     for (const attr of attrs) {
       add(el.getAttribute(attr));
     }
@@ -58013,7 +58013,7 @@ function safeAnnotationKey(path) {
 function focusTextEditor(editor) {
   editor.focus({ preventScroll: true });
   editor.select();
-  activeWindow.setTimeout(() => {
+  window.setTimeout(() => {
     if (activeDocument.activeElement !== editor) {
       editor.focus({ preventScroll: true });
     }

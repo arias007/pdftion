@@ -8,26 +8,42 @@ type ResizeHandle = "nw" | "ne" | "sw" | "se";
 const AUTO_SAVE_IDLE_DELAY_MS = 1800;
 const AUTO_SAVE_CLOSE_DELAY_MS = 200;
 const OVERLAY_HEALTH_CHECK_MS = 5000;
-const INK_COLORS = [
+const PALETTE_COLORS = [
   "#000000",
-  "#ffffff",
   "#e03131",
-  "#c2255c",
   "#fab005",
   "#2f9e44",
-  "#1971c2",
-  "#7048e8",
-  "#f76707",
-  "#868e96"
+  "#1971c2"
 ];
 const PDFTION_AI_API_NAME = "PdftionAI";
 const TEXT_FONTS = [
-  { label: "默认", value: "sans-serif" },
-  { label: "宋体", value: "SimSun, STSong, serif" },
-  { label: "黑体", value: "SimHei, Microsoft YaHei, sans-serif" },
-  { label: "等宽", value: "Consolas, monospace" },
-  { label: "衬线", value: "Georgia, serif" }
+  { labelEn: "Default", labelZh: "默认", value: "sans-serif" },
+  { labelEn: "Serif CJK", labelZh: "宋体", value: "SimSun, STSong, serif" },
+  { labelEn: "Sans CJK", labelZh: "黑体", value: "SimHei, Microsoft YaHei, sans-serif" },
+  { labelEn: "Mono", labelZh: "等宽", value: "Consolas, monospace" },
+  { labelEn: "Serif", labelZh: "衬线", value: "Georgia, serif" }
 ];
+
+function isChineseUi(): boolean {
+  const languages = new Set<string>();
+  try {
+    const storedLanguage = activeWindow.localStorage.getItem("language");
+    if (storedLanguage) {
+      languages.add(storedLanguage);
+    }
+  } catch {
+    // Popouts or restricted contexts can block localStorage; navigator language is enough.
+  }
+  languages.add(activeWindow.navigator.language);
+  for (const language of activeWindow.navigator.languages ?? []) {
+    languages.add(language);
+  }
+  return Array.from(languages).some((language) => /^zh\b|中文|cn/i.test(language));
+}
+
+function uiText(zh: string, en: string): string {
+  return isChineseUi() ? zh : en;
+}
 
 function createActiveElement<K extends keyof HTMLElementTagNameMap>(tagName: K): HTMLElementTagNameMap[K] {
   return activeDocument.createElement(tagName);
@@ -94,7 +110,7 @@ async function showPromptModal(options: {
 
     const cancel = createActiveElement("button");
     cancel.type = "button";
-    cancel.textContent = options.cancelLabel ?? "取消";
+    cancel.textContent = options.cancelLabel ?? uiText("取消", "Cancel");
     cancel.addEventListener("click", () => {
       modal.remove();
       resolve(null);
@@ -161,7 +177,7 @@ async function showConfirmModal(options: {
 
     const cancel = createActiveElement("button");
     cancel.type = "button";
-    cancel.textContent = options.cancelLabel ?? "取消";
+    cancel.textContent = options.cancelLabel ?? uiText("取消", "Cancel");
     cancel.addEventListener("click", () => {
       modal.remove();
       resolve(false);
@@ -170,7 +186,7 @@ async function showConfirmModal(options: {
 
     const confirm = createActiveElement("button");
     confirm.type = "button";
-    confirm.textContent = options.confirmLabel ?? "确认";
+    confirm.textContent = options.confirmLabel ?? uiText("确认", "Confirm");
     confirm.classList.add("mod-cta");
     confirm.addEventListener("click", () => {
       modal.remove();
@@ -466,11 +482,11 @@ export default class PdftionPlugin extends Plugin {
 
     this.addCommand({
       id: "toggle",
-      name: "Toggle PDF annotation",
+      name: uiText("切换 PDF 批注", "Toggle PDF annotation"),
       callback: () => {
         const session = this.getActivePdfSession();
         if (!session) {
-          new Notice("Open a PDF first.");
+          new Notice(uiText("请先打开 PDF。", "Open a PDF first."));
           return;
         }
         session.toggle();
@@ -479,11 +495,11 @@ export default class PdftionPlugin extends Plugin {
 
     this.addCommand({
       id: "export-annotated-pdf",
-      name: "Export current PDF with visible annotations",
+      name: uiText("导出带批注 PDF", "Export visible annotated PDF"),
       callback: () => {
         const session = this.getActivePdfSession();
         if (!session) {
-          new Notice("Open a PDF first.");
+          new Notice(uiText("请先打开 PDF。", "Open a PDF first."));
           return;
         }
         void session.exportAnnotatedPdf();
@@ -492,11 +508,11 @@ export default class PdftionPlugin extends Plugin {
 
     this.addCommand({
       id: "export-annotations-markdown",
-      name: "Export annotations to Markdown",
+      name: uiText("导出批注 Markdown", "Export annotations to Markdown"),
       callback: () => {
         const session = this.getActivePdfSession();
         if (!session) {
-          new Notice("Open a PDF first.");
+          new Notice(uiText("请先打开 PDF。", "Open a PDF first."));
           return;
         }
         void session.exportAnnotationsMarkdown();
@@ -505,11 +521,11 @@ export default class PdftionPlugin extends Plugin {
 
     this.addCommand({
       id: "show-pdf-page-navigator",
-      name: "Show page navigator",
+      name: uiText("打开页面导航", "Show page navigator"),
       callback: () => {
         const session = this.getActivePdfSession();
         if (!session) {
-          new Notice("Open a PDF first.");
+          new Notice(uiText("请先打开 PDF。", "Open a PDF first."));
           return;
         }
         session.showPageNavigator();
@@ -518,11 +534,11 @@ export default class PdftionPlugin extends Plugin {
 
     this.addCommand({
       id: "convert-pdf-markdown-docx",
-      name: "PDF/Markdown/DOCX conversion hub",
+      name: uiText("PDF/Markdown/DOCX 转换", "PDF/Markdown/DOCX conversion"),
       callback: () => {
         const session = this.getActivePdfSession();
         if (!session) {
-          new Notice("Open a PDF first.");
+          new Notice(uiText("请先打开 PDF。", "Open a PDF first."));
           return;
         }
         void session.exportMarkdownDocxBridge();
@@ -1213,7 +1229,7 @@ class InkSession {
       return;
     }
 
-    const button = createIconButton("pen-line", "PDF ink annotation");
+    const button = createIconButton("pen-line", uiText("PDF 批注", "PDF annotation"));
     button.classList.add("pdftion-button");
     button.addEventListener("click", (event) => {
       event.preventDefault();
@@ -1536,7 +1552,7 @@ class InkSession {
       this.showToolbar();
       this.scanPages();
       this.startOverlayHealthCheck();
-      new Notice("PDF ink enabled.");
+      new Notice(uiText("PDF 批注已开启。", "PDF annotation enabled."));
     } else {
       this.stopOverlayHealthCheck();
       this.currentStroke = null;
@@ -1572,32 +1588,35 @@ class InkSession {
     const toolbar = activeDocument.createElement("div");
     toolbar.className = "pdftion-toolbar";
 
-    const dragHandle = createIconButton("grip-horizontal", "拖动工具栏");
+    const dragHandle = createIconButton("grip-horizontal", uiText("拖动工具栏", "Move toolbar"));
     dragHandle.classList.add("pdftion-drag-handle");
     this.attachToolbarDragHandle(dragHandle);
     toolbar.appendChild(dragHandle);
 
-    const select = createIconButton("mouse-pointer-2", "Select");
+    const select = createIconButton("mouse-pointer-2", uiText("选择", "Select"));
     select.dataset.tool = "select";
     select.addEventListener("click", () => this.setTool("select"));
     toolbar.appendChild(select);
 
-    const pen = createIconButton("pen-line", "Pen");
+    const pen = createIconButton("pen-line", uiText("笔", "Pen"));
     pen.dataset.tool = "pen";
+    pen.classList.add("pdftion-color-tool", "pdftion-pen-button");
     pen.addEventListener("click", () => this.setTool("pen"));
     toolbar.appendChild(pen);
 
-    const highlighter = createIconButton("highlighter", "Highlighter");
+    const highlighter = createIconButton("highlighter", uiText("水彩", "Highlighter"));
     highlighter.dataset.tool = "highlight";
+    highlighter.classList.add("pdftion-color-tool", "pdftion-highlight-button");
     highlighter.addEventListener("click", () => this.setTool("highlight"));
     toolbar.appendChild(highlighter);
 
-    const text = createIconButton("type", "PDF文字");
+    const text = createIconButton("type", uiText("文字", "Text"));
     text.dataset.tool = "text";
+    text.classList.add("pdftion-color-tool", "pdftion-text-button");
     text.addEventListener("click", () => this.setTool("text"));
     toolbar.appendChild(text);
 
-    const image = createIconButton("image", "图片工具");
+    const image = createIconButton("image", uiText("图片", "Image"));
     image.classList.add("pdftion-image-button");
     image.addEventListener("click", (event) => {
       event.preventDefault();
@@ -1606,13 +1625,13 @@ class InkSession {
     });
     toolbar.appendChild(image);
 
-    const eraser = createIconButton("eraser", "Eraser");
+    const eraser = createIconButton("eraser", uiText("橡皮", "Eraser"));
     eraser.dataset.tool = "eraser";
     eraser.addEventListener("click", () => this.setTool("eraser"));
     toolbar.appendChild(eraser);
 
-    const palette = createIconButton("palette", "调色板");
-    palette.classList.add("pdftion-palette-button");
+    const palette = createIconButton("palette", uiText("颜色与大小", "Color and size"));
+    palette.classList.add("pdftion-color-tool", "pdftion-palette-button");
     palette.addEventListener("click", (event) => {
       event.preventDefault();
       event.stopPropagation();
@@ -1620,15 +1639,15 @@ class InkSession {
     });
     toolbar.appendChild(palette);
 
-    const undo = createIconButton("undo-2", "Undo");
+    const undo = createIconButton("undo-2", uiText("撤销", "Undo"));
     undo.addEventListener("click", () => this.undo());
     toolbar.appendChild(undo);
 
-    const redo = createIconButton("redo-2", "Redo");
+    const redo = createIconButton("redo-2", uiText("重做", "Redo"));
     redo.addEventListener("click", () => this.redo());
     toolbar.appendChild(redo);
 
-    const exportPdf = createIconButton("share-2", "分享/导出");
+    const exportPdf = createIconButton("share-2", uiText("分享/导出", "Share/export"));
     exportPdf.classList.add("pdftion-share-button");
     exportPdf.addEventListener("click", (event) => {
       event.preventDefault();
@@ -1637,7 +1656,7 @@ class InkSession {
     });
     toolbar.appendChild(exportPdf);
 
-    const navigator = createIconButton("list", "页面/标注导航");
+    const navigator = createIconButton("list", uiText("页面/标注导航", "Page/annotation navigator"));
     navigator.addEventListener("click", (event) => {
       event.preventDefault();
       event.stopPropagation();
@@ -1645,7 +1664,7 @@ class InkSession {
     });
     toolbar.appendChild(navigator);
 
-    const clear = createIconButton("trash-2", "删除选中/清空插件标注");
+    const clear = createIconButton("trash-2", uiText("删除选中/清空标注", "Delete selection/clear annotations"));
     clear.addEventListener("click", () => void this.clearUnsavedInk());
     toolbar.appendChild(clear);
 
@@ -1771,15 +1790,52 @@ class InkSession {
       button.classList.toggle("is-active", button.dataset.tool === this.tool);
     }
     this.toolbar.querySelector<HTMLElement>(".pdftion-image-button")?.classList.toggle("is-active", this.tool === "image-crop");
+    this.setToolbarIconColor(".pdftion-pen-button", this.penColor);
+    this.setToolbarIconColor(".pdftion-highlight-button", this.highlightColor);
+    this.setToolbarIconColor(".pdftion-text-button", this.getTextPaletteColor());
+    this.setToolbarIconColor(".pdftion-palette-button", this.getCurrentPaletteColor());
 
     const colorButtons = this.palette ? Array.from(this.palette.querySelectorAll(".pdftion-color")).filter(isHTMLElement) : [];
     for (const colorButton of colorButtons) {
       const target = colorButton.dataset.target;
-      const activeColor = target === "highlight" ? this.highlightColor : target === "text" ? this.getTextPaletteColor() : this.penColor;
-      colorButton.classList.toggle("is-active", colorButton.title === activeColor);
+      const activeColor = this.getPaletteColorForTarget(target);
+      const colorInput = colorButton.querySelector<HTMLInputElement>("input[type='color']");
+      colorButton.setCssProps({ "--pdftion-current-color": activeColor });
+      if (colorInput) {
+        colorInput.value = activeColor;
+      }
+      const isAdvanced = colorButton.classList.contains("pdftion-color-advanced");
+      const swatchColor = normalizeHexColor(colorButton.dataset.color ?? colorButton.title);
+      colorButton.classList.toggle("is-active", isAdvanced ? !PALETTE_COLORS.includes(activeColor) : swatchColor === activeColor);
     }
 
     this.updatePaletteState();
+  }
+
+  private setToolbarIconColor(selector: string, color: string): void {
+    this.toolbar?.querySelector<HTMLElement>(selector)?.setCssProps({
+      "--pdftion-tool-color": normalizeHexColor(color)
+    });
+  }
+
+  private getCurrentPaletteColor(): string {
+    if (this.tool === "highlight") {
+      return normalizeHexColor(this.highlightColor);
+    }
+    if (this.tool === "text" || this.hasSelectedText()) {
+      return normalizeHexColor(this.getTextPaletteColor());
+    }
+    return normalizeHexColor(this.penColor);
+  }
+
+  private getPaletteColorForTarget(target: string | undefined): string {
+    if (target === "highlight") {
+      return normalizeHexColor(this.highlightColor);
+    }
+    if (target === "text") {
+      return normalizeHexColor(this.getTextPaletteColor());
+    }
+    return normalizeHexColor(this.penColor);
   }
 
   private setTool(tool: ToolMode): void {
@@ -1796,7 +1852,7 @@ class InkSession {
       this.palette?.remove();
       this.palette = null;
       if (tool === "image-crop") {
-        new Notice("拖拽框选 PDF 区域以截取为可编辑图片。");
+        new Notice(uiText("拖拽框选 PDF 区域，截取为可编辑图片。", "Drag a PDF region to capture it as an editable image."));
       }
       this.updateToolbarState();
       return;
@@ -1828,7 +1884,7 @@ class InkSession {
     const panel = activeDocument.createElement("div");
     panel.className = "pdftion-image-menu";
 
-    const capture = createIconButton("scan-line", "截取图片编辑");
+    const capture = createIconButton("scan-line", uiText("截取图片", "Capture image"));
     capture.classList.add("pdftion-image-menu-button");
     capture.addEventListener("click", () => {
       panel.remove();
@@ -1837,7 +1893,7 @@ class InkSession {
     });
     panel.appendChild(capture);
 
-    const insert = createIconButton("image-plus", "从文件插入图片");
+    const insert = createIconButton("image-plus", uiText("插入图片", "Insert image"));
     insert.classList.add("pdftion-image-menu-button");
     insert.addEventListener("click", () => {
       panel.remove();
@@ -1873,7 +1929,7 @@ class InkSession {
     const panel = activeDocument.createElement("div");
     panel.className = "pdftion-share-menu";
 
-    const pdf = createIconButton("file-output", "导出烧录 PDF");
+    const pdf = createIconButton("file-output", uiText("导出 PDF", "Export PDF"));
     pdf.classList.add("pdftion-share-menu-button");
     pdf.addEventListener("click", () => {
       panel.remove();
@@ -1882,7 +1938,7 @@ class InkSession {
     });
     panel.appendChild(pdf);
 
-    const docx = createIconButton("file-type-2", "转换 DOCX 文档");
+    const docx = createIconButton("file-type-2", uiText("导出 DOCX", "Export DOCX"));
     docx.classList.add("pdftion-share-menu-button");
     docx.addEventListener("click", () => {
       panel.remove();
@@ -1891,7 +1947,7 @@ class InkSession {
     });
     panel.appendChild(docx);
 
-    const md = createIconButton("file-text", "转换 MD 文件");
+    const md = createIconButton("file-text", uiText("导出 MD", "Export MD"));
     md.classList.add("pdftion-share-menu-button");
     md.addEventListener("click", () => {
       panel.remove();
@@ -2443,18 +2499,18 @@ class InkSession {
 
     if (this.tool === "eraser") {
       panel.appendChild(
-        this.createPaletteRange("橡皮大小", "pdftion-width-eraser", 2, 120, 1, this.eraserWidth, (value) => {
+        this.createPaletteRange(uiText("橡皮", "Eraser"), "eraser", "pdftion-width-eraser", 2, 120, 1, this.eraserWidth, (value) => {
           this.eraserWidth = value;
         })
       );
     } else if (this.tool === "highlight") {
-      panel.appendChild(this.createPaletteToolGroup("highlight", "水彩"));
+      panel.appendChild(this.createPaletteToolGroup("highlight", uiText("水彩", "Highlighter")));
     } else if (this.hasSelectedText()) {
       panel.appendChild(this.createPaletteTextGroup());
     } else if (this.tool === "text") {
       panel.appendChild(this.createPaletteTextGroup());
     } else {
-      panel.appendChild(this.createPaletteToolGroup("pen", "笔"));
+      panel.appendChild(this.createPaletteToolGroup("pen", uiText("笔", "Pen")));
     }
     activeDocument.body.appendChild(panel);
     this.palette = panel;
@@ -2495,21 +2551,13 @@ class InkSession {
   private createPaletteToolGroup(tool: "pen" | "highlight", title: string): HTMLElement {
     const group = activeDocument.createElement("div");
     group.className = "pdftion-palette-group";
-
-    const heading = activeDocument.createElement("div");
-    heading.className = "pdftion-palette-heading";
-    heading.textContent = title;
-    group.appendChild(heading);
+    group.setAttribute("aria-label", title);
+    group.title = title;
 
     const colorRow = activeDocument.createElement("div");
     colorRow.className = "pdftion-palette-colors";
-    for (const swatch of INK_COLORS) {
-      const colorButton = activeDocument.createElement("button");
-      colorButton.className = "pdftion-color";
-      colorButton.dataset.target = tool;
-      colorButton.setCssProps({ "--pdftion-swatch-color": swatch });
-      colorButton.title = swatch;
-      colorButton.type = "button";
+    for (const swatch of PALETTE_COLORS) {
+      const colorButton = this.createPaletteColorButton(swatch, tool);
       colorButton.addEventListener("click", () => {
         this.setToolColor(tool, swatch);
         this.updateToolbarState();
@@ -2520,13 +2568,13 @@ class InkSession {
     group.appendChild(colorRow);
 
     group.appendChild(
-      this.createPaletteRange(`${title}大小`, `pdftion-width-${tool}`, tool === "highlight" ? 2 : 0.5, tool === "highlight" ? 96 : 72, 0.5, this.getToolWidth(tool), (value) => {
+      this.createPaletteRange(uiText("大小", "Size"), "maximize-2", `pdftion-width-${tool}`, tool === "highlight" ? 2 : 0.5, tool === "highlight" ? 96 : 72, 0.5, this.getToolWidth(tool), (value) => {
         this.setToolWidth(tool, value);
       })
     );
 
     group.appendChild(
-      this.createPaletteRange(`${title}透明度`, `pdftion-opacity-${tool}`, 0.05, 1, 0.05, this.getToolOpacity(tool), (value) => {
+      this.createPaletteRange(uiText("透明", "Alpha"), "droplet", `pdftion-opacity-${tool}`, 0.05, 1, 0.05, this.getToolOpacity(tool), (value) => {
         this.setToolOpacity(tool, value);
       })
     );
@@ -2537,21 +2585,13 @@ class InkSession {
   private createPaletteTextGroup(): HTMLElement {
     const group = activeDocument.createElement("div");
     group.className = "pdftion-palette-group";
-
-    const heading = activeDocument.createElement("div");
-    heading.className = "pdftion-palette-heading";
-    heading.textContent = "文字";
-    group.appendChild(heading);
+    group.setAttribute("aria-label", uiText("文字", "Text"));
+    group.title = uiText("文字", "Text");
 
     const colorRow = activeDocument.createElement("div");
     colorRow.className = "pdftion-palette-colors";
-    for (const swatch of INK_COLORS) {
-      const colorButton = activeDocument.createElement("button");
-      colorButton.className = "pdftion-color";
-      colorButton.dataset.target = "text";
-      colorButton.setCssProps({ "--pdftion-swatch-color": swatch });
-      colorButton.title = swatch;
-      colorButton.type = "button";
+    for (const swatch of PALETTE_COLORS) {
+      const colorButton = this.createPaletteColorButton(swatch, "text");
       colorButton.addEventListener("click", () => {
         this.setTextPaletteColor(swatch);
         this.updateToolbarState();
@@ -2563,38 +2603,70 @@ class InkSession {
 
     const fontRow = activeDocument.createElement("label");
     fontRow.className = "pdftion-palette-range";
-    fontRow.title = "字体";
+    fontRow.title = uiText("字体", "Font");
     const fontLabel = activeDocument.createElement("span");
-    fontLabel.textContent = "字体";
+    fontLabel.className = "pdftion-palette-icon";
+    fontLabel.setAttribute("aria-hidden", "true");
+    setIcon(fontLabel, "type");
     fontRow.appendChild(fontLabel);
-    const select = activeDocument.createElement("select");
-    select.className = "pdftion-font-family";
-    for (const font of TEXT_FONTS) {
-      const option = activeDocument.createElement("option");
-      option.value = font.value;
-      option.textContent = font.label;
-      select.appendChild(option);
-    }
-    select.value = this.getTextPaletteFontFamily();
-    select.addEventListener("change", () => this.setTextPaletteFontFamily(select.value));
-    fontRow.appendChild(select);
+    const fontButton = createIconButton("case-sensitive", uiText("字体", "Font"));
+    fontButton.classList.add("pdftion-font-family");
+    this.updateFontButtonTitle(fontButton);
+    fontButton.addEventListener("click", () => {
+      const current = this.getTextPaletteFontFamily();
+      const index = TEXT_FONTS.findIndex((font) => font.value === current);
+      const next = TEXT_FONTS[(index + 1) % TEXT_FONTS.length] ?? TEXT_FONTS[0];
+      this.setTextPaletteFontFamily(next.value);
+      this.updateFontButtonTitle(fontButton);
+      this.updateToolbarState();
+    });
+    fontRow.appendChild(fontButton);
     group.appendChild(fontRow);
 
     group.appendChild(
-      this.createPaletteRange("文字大小", "pdftion-size-text", 6, 120, 1, this.getTextPaletteFontSize(), (value) => this.setTextPaletteFontSize(value))
+      this.createPaletteRange(uiText("大小", "Size"), "maximize-2", "pdftion-size-text", 6, 120, 1, this.getTextPaletteFontSize(), (value) => this.setTextPaletteFontSize(value))
     );
 
     group.appendChild(
-      this.createPaletteRange("文字透明度", "pdftion-opacity-text", 0.05, 1, 0.05, this.getTextPaletteOpacity(), (value) => this.setTextPaletteOpacity(value))
+      this.createPaletteRange(uiText("透明", "Alpha"), "droplet", "pdftion-opacity-text", 0.05, 1, 0.05, this.getTextPaletteOpacity(), (value) => this.setTextPaletteOpacity(value))
     );
 
     return group;
   }
 
+  private updateFontButtonTitle(button: HTMLElement): void {
+    const current = this.getTextPaletteFontFamily();
+    const font = TEXT_FONTS.find((item) => item.value === current) ?? TEXT_FONTS[0];
+    const title = `${uiText("字体", "Font")}: ${uiText(font.labelZh, font.labelEn)}`;
+    button.title = title;
+    button.setAttribute("aria-label", title);
+  }
+
+  private createPaletteColorButton(swatch: string, target: "pen" | "highlight" | "text"): HTMLElement {
+    const colorButton = activeDocument.createElement("button");
+    colorButton.className = "pdftion-color";
+    colorButton.dataset.color = swatch;
+    colorButton.dataset.target = target;
+    colorButton.setCssProps({ "--pdftion-swatch-color": swatch });
+    colorButton.title = swatch;
+    colorButton.type = "button";
+    colorButton.setAttribute("aria-label", swatch);
+
+    const chip = activeDocument.createElement("span");
+    chip.className = "pdftion-color-swatch";
+    chip.setCssProps({ "--pdftion-swatch-color": swatch });
+    chip.setAttribute("aria-hidden", "true");
+    colorButton.appendChild(chip);
+
+    return colorButton;
+  }
+
   private createAdvancedColorInput(target: "pen" | "highlight" | "text", value: string, onInput: (color: string) => void): HTMLElement {
     const row = activeDocument.createElement("button");
     row.className = "pdftion-color pdftion-color-advanced";
-    row.title = "自定义颜色";
+    row.dataset.target = target;
+    row.setCssProps({ "--pdftion-current-color": normalizeHexColor(value) });
+    row.title = uiText("自定义颜色", "Custom color");
     row.type = "button";
 
     const input = activeDocument.createElement("input");
@@ -2616,6 +2688,7 @@ class InkSession {
 
   private createPaletteRange(
     title: string,
+    icon: string,
     className: string,
     min: number,
     max: number,
@@ -2628,11 +2701,15 @@ class InkSession {
     row.title = title;
 
     const label = activeDocument.createElement("span");
-    label.textContent = title;
+    label.className = "pdftion-palette-icon";
+    label.setAttribute("aria-hidden", "true");
+    setIcon(label, icon);
     row.appendChild(label);
 
     const input = activeDocument.createElement("input");
     input.className = className;
+    input.title = title;
+    input.setAttribute("aria-label", title);
     input.max = String(max);
     input.min = String(min);
     input.step = String(step);
@@ -2676,9 +2753,9 @@ class InkSession {
       textOpacityInput.value = String(this.getTextPaletteOpacity());
     }
 
-    const textFontInput = this.palette.querySelector<HTMLSelectElement>(".pdftion-font-family");
-    if (textFontInput) {
-      textFontInput.value = this.getTextPaletteFontFamily();
+    const textFontButton = this.palette.querySelector<HTMLElement>(".pdftion-font-family");
+    if (textFontButton) {
+      this.updateFontButtonTitle(textFontButton);
     }
   }
 
@@ -2707,6 +2784,7 @@ class InkSession {
   }
 
   private setTextPaletteColor(color: string): void {
+    color = normalizeHexColor(color);
     this.textColor = color;
     this.updateSelectedTextElements((text) => {
       text.color = color;
@@ -2762,8 +2840,8 @@ class InkSession {
 
     const header = activeDocument.createElement("div");
     header.className = "pdftion-panel-header";
-    header.textContent = "pdftion";
-    const close = createIconButton("x", "关闭");
+    header.textContent = "Pdftion";
+    const close = createIconButton("x", uiText("关闭", "Close"));
     close.addEventListener("click", () => {
       panel.remove();
       this.pageNavigator = null;
@@ -2774,72 +2852,52 @@ class InkSession {
     const stats = this.aiGetStats();
     const summary = activeDocument.createElement("div");
     summary.className = "pdftion-panel-summary";
-    summary.textContent = `读取页面... | 笔迹 ${stats.strokes} | 文字 ${stats.texts} | 图片 ${stats.images} | 遮挡 ${stats.covers}`;
+    summary.textContent = this.getPageNavigatorSummary(null, stats);
     panel.appendChild(summary);
 
     const list = activeDocument.createElement("div");
     list.className = "pdftion-page-list";
-    list.textContent = "读取页面...";
+    list.textContent = uiText("读取页面...", "Loading pages...");
     panel.appendChild(list);
 
     const actions = activeDocument.createElement("div");
     actions.className = "pdftion-panel-actions";
 
-    const up = activeDocument.createElement("button");
-    up.type = "button";
-    up.textContent = "上移";
+    const up = createIconButton("arrow-up", uiText("上移", "Move up"));
     up.addEventListener("click", () => void this.moveSelectedPages(-1));
     actions.appendChild(up);
 
-    const down = activeDocument.createElement("button");
-    down.type = "button";
-    down.textContent = "下移";
+    const down = createIconButton("arrow-down", uiText("下移", "Move down"));
     down.addEventListener("click", () => void this.moveSelectedPages(1));
     actions.appendChild(down);
 
-    const reorder = activeDocument.createElement("button");
-    reorder.type = "button";
-    reorder.textContent = "重排";
+    const reorder = createIconButton("shuffle", uiText("重排", "Reorder"));
     reorder.addEventListener("click", () => void this.reorderPagesByPrompt());
     actions.appendChild(reorder);
 
-    const rotate = activeDocument.createElement("button");
-    rotate.type = "button";
-    rotate.textContent = "旋转";
+    const rotate = createIconButton("rotate-cw", uiText("旋转", "Rotate"));
     rotate.addEventListener("click", () => void this.rotateSelectedPagesClockwise());
     actions.appendChild(rotate);
 
-    const crop = activeDocument.createElement("button");
-    crop.type = "button";
-    crop.textContent = "裁切";
+    const crop = createIconButton("crop", uiText("裁切", "Crop"));
     crop.addEventListener("click", () => void this.cropSelectedPagesByPrompt());
     actions.appendChild(crop);
 
-    const deletePages = activeDocument.createElement("button");
-    deletePages.type = "button";
-    deletePages.textContent = "删页";
+    const deletePages = createIconButton("file-minus", uiText("删页", "Delete pages"));
     deletePages.addEventListener("click", () => void this.deleteSelectedPages());
     actions.appendChild(deletePages);
 
-    const importPdf = activeDocument.createElement("button");
-    importPdf.type = "button";
-    importPdf.textContent = "导入PDF";
+    const importPdf = createIconButton("file-plus", uiText("导入 PDF", "Import PDF"));
     importPdf.addEventListener("click", () => void this.importPdfByPrompt());
     actions.appendChild(importPdf);
 
-    const exportMd = activeDocument.createElement("button");
-    exportMd.type = "button";
-    exportMd.textContent = "导出 MD";
+    const exportMd = createIconButton("file-text", uiText("导出 MD", "Export MD"));
     exportMd.addEventListener("click", () => void this.exportAnnotationsMarkdown());
     actions.appendChild(exportMd);
-    const insertLink = activeDocument.createElement("button");
-    insertLink.type = "button";
-    insertLink.textContent = "OB链接";
+    const insertLink = createIconButton("link", uiText("插入链接", "Insert link"));
     insertLink.addEventListener("click", () => void this.insertObsidianLinkInteractive());
     actions.appendChild(insertLink);
-    const convert = activeDocument.createElement("button");
-    convert.type = "button";
-    convert.textContent = "MD/DOCX";
+    const convert = createIconButton("files", uiText("转换文档", "Convert docs"));
     convert.addEventListener("click", () => void this.exportMarkdownDocxBridge());
     actions.appendChild(convert);
     panel.appendChild(actions);
@@ -2857,7 +2915,7 @@ class InkSession {
   private async populatePageNavigatorList(list: HTMLElement, summary: HTMLElement): Promise<void> {
     const pageCount = await this.getCurrentPdfPageCount();
     const stats = this.aiGetStats();
-    summary.textContent = `页 ${pageCount} | 笔迹 ${stats.strokes} | 文字 ${stats.texts} | 图片 ${stats.images} | 遮挡 ${stats.covers}`;
+    summary.textContent = this.getPageNavigatorSummary(pageCount, stats);
     list.textContent = "";
 
     if (this.selectedPageIndexes.size === 0) {
@@ -2884,7 +2942,8 @@ class InkSession {
       item.type = "button";
       item.className = "pdftion-page-item";
       const count = this.getEditableElements().filter((element) => element.pageIndex === pageIndex).length;
-      item.textContent = `第 ${pageIndex + 1} 页 (${count})`;
+      item.textContent = `${pageIndex + 1} (${count})`;
+      item.title = uiText(`第 ${pageIndex + 1} 页，${count} 个元素`, `Page ${pageIndex + 1}, ${count} elements`);
       item.addEventListener("click", () => {
         checkbox.checked = true;
         this.selectedPageIndexes.add(pageIndex);
@@ -2894,6 +2953,14 @@ class InkSession {
 
       list.appendChild(row);
     }
+  }
+
+  private getPageNavigatorSummary(pageCount: number | null, stats: PdfElementStats): string {
+    const pages = pageCount === null ? "..." : String(pageCount);
+    return uiText(
+      `页 ${pages} | 笔 ${stats.strokes} | 文 ${stats.texts} | 图 ${stats.images} | 遮 ${stats.covers}`,
+      `P ${pages} | ink ${stats.strokes} | text ${stats.texts} | img ${stats.images} | cover ${stats.covers}`
+    );
   }
 
   private async getCurrentPdfPageCount(): Promise<number> {
@@ -2948,38 +3015,38 @@ class InkSession {
   private async reorderPagesByPrompt(): Promise<void> {
     const pageCount = await this.getCurrentPdfPageCount();
     const raw = await showPromptModal({
-      actionLabel: "重排",
+      actionLabel: uiText("重排", "Reorder"),
       defaultValue: "",
-      message: `输入新的页码顺序，例如 3,1,2 或 1-3,5。当前共 ${pageCount} 页。`,
-      title: "重组页面"
+      message: uiText(`输入新的页码顺序，例如 3,1,2 或 1-3,5。当前共 ${pageCount} 页。`, `Enter a new page order, for example 3,1,2 or 1-3,5. Current pages: ${pageCount}.`),
+      title: uiText("重组页面", "Reorder pages")
     });
     if (!raw) {
       return;
     }
     const order = parsePageOrder(raw, pageCount);
     if (!order) {
-      new Notice("页码顺序无效。");
+      new Notice(uiText("页码顺序无效。", "Invalid page order."));
       return;
     }
-    await this.rewritePdfWithPageOrder(order, "页码已重组");
+    await this.rewritePdfWithPageOrder(order, uiText("页码已重组", "Pages reordered"));
   }
 
   private async deleteSelectedPages(): Promise<void> {
     const pageCount = await this.getCurrentPdfPageCount();
     const selected = new Set(this.getSelectedPageIndexes(pageCount));
     if (selected.size >= pageCount) {
-      new Notice("不能删除全部页面。");
+      new Notice(uiText("不能删除全部页面。", "Cannot delete all pages."));
       return;
     }
     if (!(await showConfirmModal({
-      confirmLabel: "删除",
-      message: `删除 ${selected.size} 页？此操作会修改当前 PDF。`,
-      title: "删除页面"
+      confirmLabel: uiText("删除", "Delete"),
+      message: uiText(`删除 ${selected.size} 页？此操作会修改当前 PDF。`, `Delete ${selected.size} pages? This will modify the current PDF.`),
+      title: uiText("删除页面", "Delete pages")
     }))) {
       return;
     }
     const order = Array.from({ length: pageCount }, (_, index) => index).filter((pageIndex) => !selected.has(pageIndex));
-    await this.rewritePdfWithPageOrder(order, "已删除页面");
+    await this.rewritePdfWithPageOrder(order, uiText("已删除页面", "Pages deleted"));
   }
 
   private async rotateSelectedPagesClockwise(): Promise<void> {
@@ -2994,23 +3061,23 @@ class InkSession {
     }
     const rotated = this.getEditableElements().map((element) => selected.includes(element.pageIndex) ? rotateElementClockwise(element) : cloneElement(element));
     const saved = await pdf.save({ useObjectStreams: true });
-    await this.persistPdfRewrite(saved, rotated, "已旋转选中页面");
+    await this.persistPdfRewrite(saved, rotated, uiText("已旋转选中页面", "Selected pages rotated"));
   }
 
   private async cropSelectedPagesByPrompt(): Promise<void> {
     const pageCount = await this.getCurrentPdfPageCount();
     const selected = this.getSelectedPageIndexes(pageCount);
     const raw = await showPromptModal({
-      actionLabel: "裁切",
-      message: "输入裁切比例：左,上,右,下。可填 0.05 或 5%，例如 0.03,0.04,0.03,0.04",
-      title: "裁切页面"
+      actionLabel: uiText("裁切", "Crop"),
+      message: uiText("输入裁切比例：左,上,右,下。可填 0.05 或 5%，例如 0.03,0.04,0.03,0.04", "Enter crop margins: left,top,right,bottom. Use 0.05 or 5%, for example 0.03,0.04,0.03,0.04."),
+      title: uiText("裁切页面", "Crop pages")
     });
     if (!raw) {
       return;
     }
     const crop = parseCropInput(raw);
     if (!crop) {
-      new Notice("裁切参数无效。");
+      new Notice(uiText("裁切参数无效。", "Invalid crop values."));
       return;
     }
     const binary = await this.plugin.app.vault.readBinary(this.file);
@@ -3024,7 +3091,7 @@ class InkSession {
     }
     const cropped = this.getEditableElements().map((element) => selected.includes(element.pageIndex) ? cropElement(element, crop) : cloneElement(element));
     const saved = await pdf.save({ useObjectStreams: true });
-    await this.persistPdfRewrite(saved, cropped, "已裁切选中页面");
+    await this.persistPdfRewrite(saved, cropped, uiText("已裁切选中页面", "Selected pages cropped"));
   }
 
   private async importPdfByPrompt(): Promise<void> {
@@ -3035,10 +3102,10 @@ class InkSession {
     const pageCount = await this.getCurrentPdfPageCount();
     const defaultInsert = this.getSelectedPageIndexes(pageCount).at(-1) ?? pageCount - 1;
     const raw = await showPromptModal({
-      actionLabel: "插入",
+      actionLabel: uiText("插入", "Insert"),
       defaultValue: String(defaultInsert + 1),
-      message: "插入到第几页之后？填 0 表示插到最前，留空表示插到选中页之后。",
-      title: "导入 PDF"
+      message: uiText("插入到第几页之后？填 0 表示插到最前，留空表示插到选中页之后。", "Insert after which page? Use 0 for the beginning, or leave blank to insert after the selected page."),
+      title: uiText("导入 PDF", "Import PDF")
     });
     const insertAfter = raw?.trim() ? Math.max(0, Math.floor(Number(raw)) || 0) : defaultInsert + 1;
     const insertIndex = clamp(insertAfter, 0, pageCount);
@@ -3069,14 +3136,14 @@ class InkSession {
       return clone;
     });
     const saved = await output.save({ useObjectStreams: true });
-    await this.persistPdfRewrite(saved, shifted, `已导入并合并 ${file.name}`);
+    await this.persistPdfRewrite(saved, shifted, uiText(`已导入并合并 ${file.name}`, `Imported and merged ${file.name}`));
   }
 
   private async rewritePdfWithPageOrder(order: number[], message: string): Promise<void> {
     const binary = await this.plugin.app.vault.readBinary(this.file);
     const source = await PDFDocument.load(binary, { ignoreEncryption: true });
     if (order.length === 0 || order.some((pageIndex) => pageIndex < 0 || pageIndex >= source.getPageCount())) {
-      new Notice("页码顺序无效。");
+      new Notice(uiText("页码顺序无效。", "Invalid page order."));
       return;
     }
     const output = await PDFDocument.create();
@@ -3134,6 +3201,7 @@ class InkSession {
   }
 
   private setToolColor(tool: "pen" | "highlight", color: string): void {
+    color = normalizeHexColor(color);
     if (tool === "highlight") {
       this.highlightColor = color;
     } else {
@@ -3665,9 +3733,9 @@ class InkSession {
     }
 
     if (!(await showConfirmModal({
-      confirmLabel: "清空",
-      message: "清空本插件可编辑标注？不会直接删除原 PDF 内容，但会移除覆盖层和本插件标注。",
-      title: "清空标注"
+      confirmLabel: uiText("清空", "Clear"),
+      message: uiText("清空可编辑标注？不会直接删除原 PDF 内容，但会移除覆盖层和本插件标注。", "Clear editable annotations? This will not delete original PDF content, but it will remove overlays and plugin annotations."),
+      title: uiText("清空标注", "Clear annotations")
     }))) {
       return;
     }
@@ -3780,7 +3848,7 @@ class InkSession {
     const targetPath = targetFile.path;
     if (!this.dirty && elements.every((element) => element.saved)) {
       if (!auto) {
-        new Notice("No new ink to save.");
+        new Notice(uiText("没有新的标注需要保存。", "No new annotations to save."));
       }
       return;
     }
@@ -3820,11 +3888,11 @@ class InkSession {
       this.dirty = false;
       this.redrawAll();
       if (!auto) {
-        new Notice(`Saved ink into ${targetFile.name}.`);
+        new Notice(uiText(`已保存到 ${targetFile.name}。`, `Saved into ${targetFile.name}.`));
       }
     } catch (error) {
       console.error(error);
-      new Notice("Could not auto-save ink into this PDF. Check the console for details.");
+      new Notice(uiText("自动保存失败，请查看控制台。", "Could not auto-save into this PDF. Check the console for details."));
     } finally {
       this.saving = false;
       if (this.pendingSaveAfterCurrentSave) {
@@ -3867,7 +3935,7 @@ class InkSession {
       this.dirty = false;
     } catch (error) {
       console.error(error);
-      new Notice("Could not save pdftion editable annotations. Check the console for details.");
+      new Notice(uiText("保存 Pdftion 可编辑标注失败，请查看控制台。", "Could not save Pdftion editable annotations. Check the console for details."));
     } finally {
       this.saving = false;
       if (this.pendingSaveAfterCurrentSave) {
@@ -3890,7 +3958,7 @@ class InkSession {
 
     const markdown = await this.getPdfContentMarkdown();
     await this.plugin.app.vault.adapter.write(targetPath, markdown);
-    new Notice(`已导出 PDF 内容 Markdown：${targetPath}`);
+    new Notice(uiText(`已导出 Markdown：${targetPath}`, `Exported Markdown: ${targetPath}`));
     return targetPath;
   }
 
@@ -3908,7 +3976,7 @@ class InkSession {
     const docx = buildDocxFromParagraphs(markdownToDocxParagraphs(await this.getPdfContentMarkdown()), targetFile.basename);
     const buffer = docx.buffer.slice(docx.byteOffset, docx.byteOffset + docx.byteLength) as ArrayBuffer;
     await this.plugin.app.vault.adapter.writeBinary(targetPath, buffer);
-    new Notice(`已导出 PDF 内容 DOCX：${targetPath}`);
+    new Notice(uiText(`已导出 DOCX：${targetPath}`, `Exported DOCX: ${targetPath}`));
     return targetPath;
   }
 
@@ -3943,7 +4011,7 @@ class InkSession {
     const mdPath = await this.exportConvertedMarkdown({ notice: false });
     const docxPath = await this.exportConvertedDocx({ notice: false });
     if (mdPath || docxPath) {
-      new Notice(`已导出转换文档：${[mdPath, docxPath].filter(Boolean).join(", ")}`);
+      new Notice(uiText(`已导出转换文档：${[mdPath, docxPath].filter(Boolean).join(", ")}`, `Exported converted documents: ${[mdPath, docxPath].filter(Boolean).join(", ")}`));
     }
     return mdPath ?? docxPath;
   }
@@ -3964,12 +4032,12 @@ class InkSession {
       const markdown = buildVisualConversionMarkdown(this.file, pages, folderPath);
       await this.plugin.app.vault.adapter.write(targetPath, markdown);
       if (options.notice !== false) {
-        new Notice(`已转换 MD：${targetPath}`);
+        new Notice(uiText(`已转换 MD：${targetPath}`, `Converted MD: ${targetPath}`));
       }
       return targetPath;
     } catch (error) {
       console.error(error);
-      new Notice("转换 MD 失败，查看控制台。");
+      new Notice(uiText("转换 MD 失败，请查看控制台。", "MD conversion failed. Check the console."));
       return null;
     }
   }
@@ -3983,12 +4051,12 @@ class InkSession {
       const buffer = docx.buffer.slice(docx.byteOffset, docx.byteOffset + docx.byteLength) as ArrayBuffer;
       await this.plugin.app.vault.adapter.writeBinary(targetPath, buffer);
       if (options.notice !== false) {
-        new Notice(`已转换 DOCX：${targetPath}`);
+        new Notice(uiText(`已转换 DOCX：${targetPath}`, `Converted DOCX: ${targetPath}`));
       }
       return targetPath;
     } catch (error) {
       console.error(error);
-      new Notice("转换 DOCX 失败，查看控制台。");
+      new Notice(uiText("转换 DOCX 失败，请查看控制台。", "DOCX conversion failed. Check the console."));
       return null;
     }
   }
@@ -4111,7 +4179,7 @@ class InkSession {
   async exportAnnotatedPdf(options: { notice?: boolean; share?: boolean } = {}): Promise<string | null> {
     try {
       if (options.notice !== false) {
-        new Notice("正在导出烧录 PDF...");
+        new Notice(uiText("正在导出 PDF...", "Exporting PDF..."));
       }
       this.commitNativeTextEditor();
       this.redrawAll();
@@ -4129,19 +4197,19 @@ class InkSession {
       const buffer = new ArrayBuffer(saved.byteLength);
       new Uint8Array(buffer).set(saved);
       if (options.notice !== false) {
-        new Notice(`正在写入烧录 PDF：${targetPath}`);
+        new Notice(uiText(`正在写入 PDF：${targetPath}`, `Writing PDF: ${targetPath}`));
       }
       await this.plugin.app.vault.adapter.writeBinary(targetPath, buffer);
 
       const shared = options.share === false ? false : await trySharePdf(targetPath.split("/").pop() ?? targetFile.name, saved);
       if (options.notice !== false) {
-        new Notice(shared ? `已生成并分享 ${targetPath}` : `已生成烧录 PDF：${targetPath}`);
+        new Notice(shared ? uiText(`已生成并分享 ${targetPath}`, `Generated and shared ${targetPath}`) : uiText(`已生成 PDF：${targetPath}`, `Generated PDF: ${targetPath}`));
       }
       return targetPath;
     } catch (error) {
       console.error(error);
       const message = error instanceof Error ? error.message : String(error);
-      new Notice(`导出烧录 PDF 失败：${message}`);
+      new Notice(uiText(`导出 PDF 失败：${message}`, `PDF export failed: ${message}`));
       return null;
     }
   }
@@ -4150,13 +4218,13 @@ class InkSession {
     this.commitNativeTextEditor();
     const elements = this.getEditableElements().map(cloneElement);
     if (!elements.some((element) => element.kind === "cover")) {
-      new Notice("没有遮挡区域可固化。");
+      new Notice(uiText("没有遮挡区域可固化。", "No cover regions to flatten."));
       return;
     }
     if (!(await showConfirmModal({
-      confirmLabel: "固化",
-      message: "固化遮挡会修改当前 PDF：有遮挡的已渲染页面会重建为图片页，从而删除底层被遮挡文字/图片对象。继续？",
-      title: "固化遮挡"
+      confirmLabel: uiText("固化", "Flatten"),
+      message: uiText("固化遮挡会修改当前 PDF：有遮挡的已渲染页面会重建为图片页，从而删除底层被遮挡文字/图片对象。继续？", "Flattening covers will modify the current PDF by rebuilding rendered covered pages as images. Continue?"),
+      title: uiText("固化遮挡", "Flatten covers")
     }))) {
       return;
     }
@@ -4164,11 +4232,11 @@ class InkSession {
     const binary = await this.plugin.app.vault.readBinary(this.file);
     const { flattenedPages, pdf } = await this.buildPdfWithFlattenedCoveredPages(binary, elements, "covers-only");
     if (flattenedPages.size === 0) {
-      new Notice("当前没有可固化的已渲染遮挡页。请先滚到有遮挡的页面再试。");
+      new Notice(uiText("当前没有可固化的已渲染遮挡页。请先滚到有遮挡的页面再试。", "No rendered covered pages are available. Scroll to covered pages and try again."));
       return;
     }
     const saved = await pdf.save({ useObjectStreams: true });
-    await this.persistPdfRewrite(saved, elements, `已固化 ${flattenedPages.size} 页遮挡`);
+    await this.persistPdfRewrite(saved, elements, uiText(`已固化 ${flattenedPages.size} 页遮挡`, `Flattened covers on ${flattenedPages.size} pages`));
   }
 
   private async buildPdfWithFlattenedCoveredPages(
@@ -4512,7 +4580,7 @@ class InkSession {
     const size = await getImageDataUrlSize(dataUrl);
     const overlay = this.getVisibleOverlay() ?? Array.from(this.overlays.values())[0];
     if (!overlay) {
-      new Notice("没有可插入图片的 PDF 页面。");
+      new Notice(uiText("没有可插入图片的 PDF 页面。", "No PDF page is available for image insertion."));
       return;
     }
     const maxWidth = 0.42;
@@ -4550,9 +4618,9 @@ class InkSession {
 
   private async insertObsidianLinkInteractive(): Promise<void> {
     const raw = await showPromptModal({
-      actionLabel: "插入",
-      message: "输入 OB 链接或笔记名，例如 [[笔记]] / ![[图片.png]]",
-      title: "插入 OB 链接"
+      actionLabel: uiText("插入", "Insert"),
+      message: uiText("输入链接或笔记名，例如 [[笔记]] / ![[图片.png]]", "Enter a link or note name, for example [[Note]] / ![[image.png]]"),
+      title: uiText("插入链接", "Insert link")
     });
     if (!raw) {
       return;
@@ -4579,7 +4647,7 @@ class InkSession {
 
     const overlay = this.resolveTargetOverlay(input.pageIndex);
     if (!overlay) {
-      new Notice("没有可插入 OB 链接的 PDF 页面。");
+      new Notice(uiText("没有可插入链接的 PDF 页面。", "No PDF page is available for link insertion."));
       return null;
     }
     return this.aiAddText({
@@ -4599,7 +4667,7 @@ class InkSession {
   async insertVaultImage(input: PdftionVaultImageInput): Promise<string | null> {
     const file = this.resolveVaultFile(input.path);
     if (!(file instanceof TFile) || !isImageExtension(file.extension)) {
-      new Notice("未找到可插入的 Vault 图片。");
+      new Notice(uiText("未找到可插入的图片。", "No insertable image was found."));
       return null;
     }
 
@@ -4608,7 +4676,7 @@ class InkSession {
     const size = await getImageDataUrlSize(dataUrl);
     const overlay = this.resolveTargetOverlay(input.pageIndex);
     if (!overlay) {
-      new Notice("没有可插入图片的 PDF 页面。");
+      new Notice(uiText("没有可插入图片的 PDF 页面。", "No PDF page is available for image insertion."));
       return null;
     }
     const dimensions = fitImageToOverlay(size, overlay, input.width, input.height);
@@ -5299,7 +5367,7 @@ class InkSession {
       right: clamp(Number(crop.right ?? 0), 0, 0.45),
       top: clamp(Number(crop.top ?? 0), 0, 0.45)
     });
-    new Notice("页面裁剪参数已记录；当前版本先开放给 AI/API，后续接入导出裁剪。");
+    new Notice(uiText("页面裁剪参数已记录。", "Page crop values recorded."));
     return true;
   }
 

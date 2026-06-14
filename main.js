@@ -52118,26 +52118,39 @@ var PDFButton_default = PDFButton;
 var AUTO_SAVE_IDLE_DELAY_MS = 1800;
 var AUTO_SAVE_CLOSE_DELAY_MS = 200;
 var OVERLAY_HEALTH_CHECK_MS = 5e3;
-var INK_COLORS = [
+var PALETTE_COLORS = [
   "#000000",
-  "#ffffff",
   "#e03131",
-  "#c2255c",
   "#fab005",
   "#2f9e44",
-  "#1971c2",
-  "#7048e8",
-  "#f76707",
-  "#868e96"
+  "#1971c2"
 ];
 var PDFTION_AI_API_NAME = "PdftionAI";
 var TEXT_FONTS = [
-  { label: "\u9ED8\u8BA4", value: "sans-serif" },
-  { label: "\u5B8B\u4F53", value: "SimSun, STSong, serif" },
-  { label: "\u9ED1\u4F53", value: "SimHei, Microsoft YaHei, sans-serif" },
-  { label: "\u7B49\u5BBD", value: "Consolas, monospace" },
-  { label: "\u886C\u7EBF", value: "Georgia, serif" }
+  { labelEn: "Default", labelZh: "\u9ED8\u8BA4", value: "sans-serif" },
+  { labelEn: "Serif CJK", labelZh: "\u5B8B\u4F53", value: "SimSun, STSong, serif" },
+  { labelEn: "Sans CJK", labelZh: "\u9ED1\u4F53", value: "SimHei, Microsoft YaHei, sans-serif" },
+  { labelEn: "Mono", labelZh: "\u7B49\u5BBD", value: "Consolas, monospace" },
+  { labelEn: "Serif", labelZh: "\u886C\u7EBF", value: "Georgia, serif" }
 ];
+function isChineseUi() {
+  const languages = /* @__PURE__ */ new Set();
+  try {
+    const storedLanguage = activeWindow.localStorage.getItem("language");
+    if (storedLanguage) {
+      languages.add(storedLanguage);
+    }
+  } catch {
+  }
+  languages.add(activeWindow.navigator.language);
+  for (const language of activeWindow.navigator.languages ?? []) {
+    languages.add(language);
+  }
+  return Array.from(languages).some((language) => /^zh\b|中文|cn/i.test(language));
+}
+function uiText(zh, en) {
+  return isChineseUi() ? zh : en;
+}
 function createActiveElement(tagName) {
   return activeDocument.createElement(tagName);
 }
@@ -52175,7 +52188,7 @@ async function showPromptModal(options) {
     actions.className = "pdftion-dialog-actions";
     const cancel = createActiveElement("button");
     cancel.type = "button";
-    cancel.textContent = options.cancelLabel ?? "\u53D6\u6D88";
+    cancel.textContent = options.cancelLabel ?? uiText("\u53D6\u6D88", "Cancel");
     cancel.addEventListener("click", () => {
       modal.remove();
       resolve(null);
@@ -52228,7 +52241,7 @@ async function showConfirmModal(options) {
     actions.className = "pdftion-dialog-actions";
     const cancel = createActiveElement("button");
     cancel.type = "button";
-    cancel.textContent = options.cancelLabel ?? "\u53D6\u6D88";
+    cancel.textContent = options.cancelLabel ?? uiText("\u53D6\u6D88", "Cancel");
     cancel.addEventListener("click", () => {
       modal.remove();
       resolve(false);
@@ -52236,7 +52249,7 @@ async function showConfirmModal(options) {
     actions.appendChild(cancel);
     const confirm = createActiveElement("button");
     confirm.type = "button";
-    confirm.textContent = options.confirmLabel ?? "\u786E\u8BA4";
+    confirm.textContent = options.confirmLabel ?? uiText("\u786E\u8BA4", "Confirm");
     confirm.classList.add("mod-cta");
     confirm.addEventListener("click", () => {
       modal.remove();
@@ -52268,11 +52281,11 @@ var PdftionPlugin = class extends import_obsidian.Plugin {
     getActiveBody().classList.add("pdftion-menu-boost");
     this.addCommand({
       id: "toggle",
-      name: "Toggle PDF annotation",
+      name: uiText("\u5207\u6362 PDF \u6279\u6CE8", "Toggle PDF annotation"),
       callback: () => {
         const session = this.getActivePdfSession();
         if (!session) {
-          new import_obsidian.Notice("Open a PDF first.");
+          new import_obsidian.Notice(uiText("\u8BF7\u5148\u6253\u5F00 PDF\u3002", "Open a PDF first."));
           return;
         }
         session.toggle();
@@ -52280,11 +52293,11 @@ var PdftionPlugin = class extends import_obsidian.Plugin {
     });
     this.addCommand({
       id: "export-annotated-pdf",
-      name: "Export current PDF with visible annotations",
+      name: uiText("\u5BFC\u51FA\u5E26\u6279\u6CE8 PDF", "Export visible annotated PDF"),
       callback: () => {
         const session = this.getActivePdfSession();
         if (!session) {
-          new import_obsidian.Notice("Open a PDF first.");
+          new import_obsidian.Notice(uiText("\u8BF7\u5148\u6253\u5F00 PDF\u3002", "Open a PDF first."));
           return;
         }
         void session.exportAnnotatedPdf();
@@ -52292,11 +52305,11 @@ var PdftionPlugin = class extends import_obsidian.Plugin {
     });
     this.addCommand({
       id: "export-annotations-markdown",
-      name: "Export annotations to Markdown",
+      name: uiText("\u5BFC\u51FA\u6279\u6CE8 Markdown", "Export annotations to Markdown"),
       callback: () => {
         const session = this.getActivePdfSession();
         if (!session) {
-          new import_obsidian.Notice("Open a PDF first.");
+          new import_obsidian.Notice(uiText("\u8BF7\u5148\u6253\u5F00 PDF\u3002", "Open a PDF first."));
           return;
         }
         void session.exportAnnotationsMarkdown();
@@ -52304,11 +52317,11 @@ var PdftionPlugin = class extends import_obsidian.Plugin {
     });
     this.addCommand({
       id: "show-pdf-page-navigator",
-      name: "Show page navigator",
+      name: uiText("\u6253\u5F00\u9875\u9762\u5BFC\u822A", "Show page navigator"),
       callback: () => {
         const session = this.getActivePdfSession();
         if (!session) {
-          new import_obsidian.Notice("Open a PDF first.");
+          new import_obsidian.Notice(uiText("\u8BF7\u5148\u6253\u5F00 PDF\u3002", "Open a PDF first."));
           return;
         }
         session.showPageNavigator();
@@ -52316,11 +52329,11 @@ var PdftionPlugin = class extends import_obsidian.Plugin {
     });
     this.addCommand({
       id: "convert-pdf-markdown-docx",
-      name: "PDF/Markdown/DOCX conversion hub",
+      name: uiText("PDF/Markdown/DOCX \u8F6C\u6362", "PDF/Markdown/DOCX conversion"),
       callback: () => {
         const session = this.getActivePdfSession();
         if (!session) {
-          new import_obsidian.Notice("Open a PDF first.");
+          new import_obsidian.Notice(uiText("\u8BF7\u5148\u6253\u5F00 PDF\u3002", "Open a PDF first."));
           return;
         }
         void session.exportMarkdownDocxBridge();
@@ -52927,7 +52940,7 @@ var InkSession = class {
       this.moveButtonIntoHostIfAvailable(existing);
       return;
     }
-    const button = createIconButton("pen-line", "PDF ink annotation");
+    const button = createIconButton("pen-line", uiText("PDF \u6279\u6CE8", "PDF annotation"));
     button.classList.add("pdftion-button");
     button.addEventListener("click", (event) => {
       event.preventDefault();
@@ -53164,7 +53177,7 @@ var InkSession = class {
       this.showToolbar();
       this.scanPages();
       this.startOverlayHealthCheck();
-      new import_obsidian.Notice("PDF ink enabled.");
+      new import_obsidian.Notice(uiText("PDF \u6279\u6CE8\u5DF2\u5F00\u542F\u3002", "PDF annotation enabled."));
     } else {
       this.stopOverlayHealthCheck();
       this.currentStroke = null;
@@ -53196,27 +53209,30 @@ var InkSession = class {
     }
     const toolbar = activeDocument.createElement("div");
     toolbar.className = "pdftion-toolbar";
-    const dragHandle = createIconButton("grip-horizontal", "\u62D6\u52A8\u5DE5\u5177\u680F");
+    const dragHandle = createIconButton("grip-horizontal", uiText("\u62D6\u52A8\u5DE5\u5177\u680F", "Move toolbar"));
     dragHandle.classList.add("pdftion-drag-handle");
     this.attachToolbarDragHandle(dragHandle);
     toolbar.appendChild(dragHandle);
-    const select = createIconButton("mouse-pointer-2", "Select");
+    const select = createIconButton("mouse-pointer-2", uiText("\u9009\u62E9", "Select"));
     select.dataset.tool = "select";
     select.addEventListener("click", () => this.setTool("select"));
     toolbar.appendChild(select);
-    const pen = createIconButton("pen-line", "Pen");
+    const pen = createIconButton("pen-line", uiText("\u7B14", "Pen"));
     pen.dataset.tool = "pen";
+    pen.classList.add("pdftion-color-tool", "pdftion-pen-button");
     pen.addEventListener("click", () => this.setTool("pen"));
     toolbar.appendChild(pen);
-    const highlighter = createIconButton("highlighter", "Highlighter");
+    const highlighter = createIconButton("highlighter", uiText("\u6C34\u5F69", "Highlighter"));
     highlighter.dataset.tool = "highlight";
+    highlighter.classList.add("pdftion-color-tool", "pdftion-highlight-button");
     highlighter.addEventListener("click", () => this.setTool("highlight"));
     toolbar.appendChild(highlighter);
-    const text = createIconButton("type", "PDF\u6587\u5B57");
+    const text = createIconButton("type", uiText("\u6587\u5B57", "Text"));
     text.dataset.tool = "text";
+    text.classList.add("pdftion-color-tool", "pdftion-text-button");
     text.addEventListener("click", () => this.setTool("text"));
     toolbar.appendChild(text);
-    const image = createIconButton("image", "\u56FE\u7247\u5DE5\u5177");
+    const image = createIconButton("image", uiText("\u56FE\u7247", "Image"));
     image.classList.add("pdftion-image-button");
     image.addEventListener("click", (event) => {
       event.preventDefault();
@@ -53224,25 +53240,25 @@ var InkSession = class {
       this.toggleImageMenu();
     });
     toolbar.appendChild(image);
-    const eraser = createIconButton("eraser", "Eraser");
+    const eraser = createIconButton("eraser", uiText("\u6A61\u76AE", "Eraser"));
     eraser.dataset.tool = "eraser";
     eraser.addEventListener("click", () => this.setTool("eraser"));
     toolbar.appendChild(eraser);
-    const palette = createIconButton("palette", "\u8C03\u8272\u677F");
-    palette.classList.add("pdftion-palette-button");
+    const palette = createIconButton("palette", uiText("\u989C\u8272\u4E0E\u5927\u5C0F", "Color and size"));
+    palette.classList.add("pdftion-color-tool", "pdftion-palette-button");
     palette.addEventListener("click", (event) => {
       event.preventDefault();
       event.stopPropagation();
       this.togglePalette();
     });
     toolbar.appendChild(palette);
-    const undo = createIconButton("undo-2", "Undo");
+    const undo = createIconButton("undo-2", uiText("\u64A4\u9500", "Undo"));
     undo.addEventListener("click", () => this.undo());
     toolbar.appendChild(undo);
-    const redo = createIconButton("redo-2", "Redo");
+    const redo = createIconButton("redo-2", uiText("\u91CD\u505A", "Redo"));
     redo.addEventListener("click", () => this.redo());
     toolbar.appendChild(redo);
-    const exportPdf = createIconButton("share-2", "\u5206\u4EAB/\u5BFC\u51FA");
+    const exportPdf = createIconButton("share-2", uiText("\u5206\u4EAB/\u5BFC\u51FA", "Share/export"));
     exportPdf.classList.add("pdftion-share-button");
     exportPdf.addEventListener("click", (event) => {
       event.preventDefault();
@@ -53250,14 +53266,14 @@ var InkSession = class {
       this.toggleShareMenu();
     });
     toolbar.appendChild(exportPdf);
-    const navigator2 = createIconButton("list", "\u9875\u9762/\u6807\u6CE8\u5BFC\u822A");
+    const navigator2 = createIconButton("list", uiText("\u9875\u9762/\u6807\u6CE8\u5BFC\u822A", "Page/annotation navigator"));
     navigator2.addEventListener("click", (event) => {
       event.preventDefault();
       event.stopPropagation();
       this.showPageNavigator();
     });
     toolbar.appendChild(navigator2);
-    const clear = createIconButton("trash-2", "\u5220\u9664\u9009\u4E2D/\u6E05\u7A7A\u63D2\u4EF6\u6807\u6CE8");
+    const clear = createIconButton("trash-2", uiText("\u5220\u9664\u9009\u4E2D/\u6E05\u7A7A\u6807\u6CE8", "Delete selection/clear annotations"));
     clear.addEventListener("click", () => void this.clearUnsavedInk());
     toolbar.appendChild(clear);
     (this.ensureToolbarHost() ?? activeDocument.body).appendChild(toolbar);
@@ -53362,13 +53378,47 @@ var InkSession = class {
       button.classList.toggle("is-active", button.dataset.tool === this.tool);
     }
     this.toolbar.querySelector(".pdftion-image-button")?.classList.toggle("is-active", this.tool === "image-crop");
+    this.setToolbarIconColor(".pdftion-pen-button", this.penColor);
+    this.setToolbarIconColor(".pdftion-highlight-button", this.highlightColor);
+    this.setToolbarIconColor(".pdftion-text-button", this.getTextPaletteColor());
+    this.setToolbarIconColor(".pdftion-palette-button", this.getCurrentPaletteColor());
     const colorButtons = this.palette ? Array.from(this.palette.querySelectorAll(".pdftion-color")).filter(isHTMLElement) : [];
     for (const colorButton of colorButtons) {
       const target = colorButton.dataset.target;
-      const activeColor = target === "highlight" ? this.highlightColor : target === "text" ? this.getTextPaletteColor() : this.penColor;
-      colorButton.classList.toggle("is-active", colorButton.title === activeColor);
+      const activeColor = this.getPaletteColorForTarget(target);
+      const colorInput = colorButton.querySelector("input[type='color']");
+      colorButton.setCssProps({ "--pdftion-current-color": activeColor });
+      if (colorInput) {
+        colorInput.value = activeColor;
+      }
+      const isAdvanced = colorButton.classList.contains("pdftion-color-advanced");
+      const swatchColor = normalizeHexColor(colorButton.dataset.color ?? colorButton.title);
+      colorButton.classList.toggle("is-active", isAdvanced ? !PALETTE_COLORS.includes(activeColor) : swatchColor === activeColor);
     }
     this.updatePaletteState();
+  }
+  setToolbarIconColor(selector, color) {
+    this.toolbar?.querySelector(selector)?.setCssProps({
+      "--pdftion-tool-color": normalizeHexColor(color)
+    });
+  }
+  getCurrentPaletteColor() {
+    if (this.tool === "highlight") {
+      return normalizeHexColor(this.highlightColor);
+    }
+    if (this.tool === "text" || this.hasSelectedText()) {
+      return normalizeHexColor(this.getTextPaletteColor());
+    }
+    return normalizeHexColor(this.penColor);
+  }
+  getPaletteColorForTarget(target) {
+    if (target === "highlight") {
+      return normalizeHexColor(this.highlightColor);
+    }
+    if (target === "text") {
+      return normalizeHexColor(this.getTextPaletteColor());
+    }
+    return normalizeHexColor(this.penColor);
   }
   setTool(tool) {
     this.tool = tool;
@@ -53384,7 +53434,7 @@ var InkSession = class {
       this.palette?.remove();
       this.palette = null;
       if (tool === "image-crop") {
-        new import_obsidian.Notice("\u62D6\u62FD\u6846\u9009 PDF \u533A\u57DF\u4EE5\u622A\u53D6\u4E3A\u53EF\u7F16\u8F91\u56FE\u7247\u3002");
+        new import_obsidian.Notice(uiText("\u62D6\u62FD\u6846\u9009 PDF \u533A\u57DF\uFF0C\u622A\u53D6\u4E3A\u53EF\u7F16\u8F91\u56FE\u7247\u3002", "Drag a PDF region to capture it as an editable image."));
       }
       this.updateToolbarState();
       return;
@@ -53413,7 +53463,7 @@ var InkSession = class {
     const button = this.toolbar?.querySelector(".pdftion-image-button");
     const panel = activeDocument.createElement("div");
     panel.className = "pdftion-image-menu";
-    const capture = createIconButton("scan-line", "\u622A\u53D6\u56FE\u7247\u7F16\u8F91");
+    const capture = createIconButton("scan-line", uiText("\u622A\u53D6\u56FE\u7247", "Capture image"));
     capture.classList.add("pdftion-image-menu-button");
     capture.addEventListener("click", () => {
       panel.remove();
@@ -53421,7 +53471,7 @@ var InkSession = class {
       this.setTool("image-crop");
     });
     panel.appendChild(capture);
-    const insert = createIconButton("image-plus", "\u4ECE\u6587\u4EF6\u63D2\u5165\u56FE\u7247");
+    const insert = createIconButton("image-plus", uiText("\u63D2\u5165\u56FE\u7247", "Insert image"));
     insert.classList.add("pdftion-image-menu-button");
     insert.addEventListener("click", () => {
       panel.remove();
@@ -53453,7 +53503,7 @@ var InkSession = class {
     const button = this.toolbar?.querySelector(".pdftion-share-button");
     const panel = activeDocument.createElement("div");
     panel.className = "pdftion-share-menu";
-    const pdf = createIconButton("file-output", "\u5BFC\u51FA\u70E7\u5F55 PDF");
+    const pdf = createIconButton("file-output", uiText("\u5BFC\u51FA PDF", "Export PDF"));
     pdf.classList.add("pdftion-share-menu-button");
     pdf.addEventListener("click", () => {
       panel.remove();
@@ -53461,7 +53511,7 @@ var InkSession = class {
       void this.exportAnnotatedPdf();
     });
     panel.appendChild(pdf);
-    const docx = createIconButton("file-type-2", "\u8F6C\u6362 DOCX \u6587\u6863");
+    const docx = createIconButton("file-type-2", uiText("\u5BFC\u51FA DOCX", "Export DOCX"));
     docx.classList.add("pdftion-share-menu-button");
     docx.addEventListener("click", () => {
       panel.remove();
@@ -53469,7 +53519,7 @@ var InkSession = class {
       void this.exportConvertedDocx();
     });
     panel.appendChild(docx);
-    const md = createIconButton("file-text", "\u8F6C\u6362 MD \u6587\u4EF6");
+    const md = createIconButton("file-text", uiText("\u5BFC\u51FA MD", "Export MD"));
     md.classList.add("pdftion-share-menu-button");
     md.addEventListener("click", () => {
       panel.remove();
@@ -53968,18 +54018,18 @@ var InkSession = class {
     panel.addEventListener("click", (event) => event.stopPropagation());
     if (this.tool === "eraser") {
       panel.appendChild(
-        this.createPaletteRange("\u6A61\u76AE\u5927\u5C0F", "pdftion-width-eraser", 2, 120, 1, this.eraserWidth, (value) => {
+        this.createPaletteRange(uiText("\u6A61\u76AE", "Eraser"), "eraser", "pdftion-width-eraser", 2, 120, 1, this.eraserWidth, (value) => {
           this.eraserWidth = value;
         })
       );
     } else if (this.tool === "highlight") {
-      panel.appendChild(this.createPaletteToolGroup("highlight", "\u6C34\u5F69"));
+      panel.appendChild(this.createPaletteToolGroup("highlight", uiText("\u6C34\u5F69", "Highlighter")));
     } else if (this.hasSelectedText()) {
       panel.appendChild(this.createPaletteTextGroup());
     } else if (this.tool === "text") {
       panel.appendChild(this.createPaletteTextGroup());
     } else {
-      panel.appendChild(this.createPaletteToolGroup("pen", "\u7B14"));
+      panel.appendChild(this.createPaletteToolGroup("pen", uiText("\u7B14", "Pen")));
     }
     activeDocument.body.appendChild(panel);
     this.palette = panel;
@@ -54014,19 +54064,12 @@ var InkSession = class {
   createPaletteToolGroup(tool, title2) {
     const group = activeDocument.createElement("div");
     group.className = "pdftion-palette-group";
-    const heading = activeDocument.createElement("div");
-    heading.className = "pdftion-palette-heading";
-    heading.textContent = title2;
-    group.appendChild(heading);
+    group.setAttribute("aria-label", title2);
+    group.title = title2;
     const colorRow = activeDocument.createElement("div");
     colorRow.className = "pdftion-palette-colors";
-    for (const swatch of INK_COLORS) {
-      const colorButton = activeDocument.createElement("button");
-      colorButton.className = "pdftion-color";
-      colorButton.dataset.target = tool;
-      colorButton.setCssProps({ "--pdftion-swatch-color": swatch });
-      colorButton.title = swatch;
-      colorButton.type = "button";
+    for (const swatch of PALETTE_COLORS) {
+      const colorButton = this.createPaletteColorButton(swatch, tool);
       colorButton.addEventListener("click", () => {
         this.setToolColor(tool, swatch);
         this.updateToolbarState();
@@ -54036,12 +54079,12 @@ var InkSession = class {
     colorRow.appendChild(this.createAdvancedColorInput(tool, this.getToolColor(tool), (color) => this.setToolColor(tool, color)));
     group.appendChild(colorRow);
     group.appendChild(
-      this.createPaletteRange(`${title2}\u5927\u5C0F`, `pdftion-width-${tool}`, tool === "highlight" ? 2 : 0.5, tool === "highlight" ? 96 : 72, 0.5, this.getToolWidth(tool), (value) => {
+      this.createPaletteRange(uiText("\u5927\u5C0F", "Size"), "maximize-2", `pdftion-width-${tool}`, tool === "highlight" ? 2 : 0.5, tool === "highlight" ? 96 : 72, 0.5, this.getToolWidth(tool), (value) => {
         this.setToolWidth(tool, value);
       })
     );
     group.appendChild(
-      this.createPaletteRange(`${title2}\u900F\u660E\u5EA6`, `pdftion-opacity-${tool}`, 0.05, 1, 0.05, this.getToolOpacity(tool), (value) => {
+      this.createPaletteRange(uiText("\u900F\u660E", "Alpha"), "droplet", `pdftion-opacity-${tool}`, 0.05, 1, 0.05, this.getToolOpacity(tool), (value) => {
         this.setToolOpacity(tool, value);
       })
     );
@@ -54050,19 +54093,12 @@ var InkSession = class {
   createPaletteTextGroup() {
     const group = activeDocument.createElement("div");
     group.className = "pdftion-palette-group";
-    const heading = activeDocument.createElement("div");
-    heading.className = "pdftion-palette-heading";
-    heading.textContent = "\u6587\u5B57";
-    group.appendChild(heading);
+    group.setAttribute("aria-label", uiText("\u6587\u5B57", "Text"));
+    group.title = uiText("\u6587\u5B57", "Text");
     const colorRow = activeDocument.createElement("div");
     colorRow.className = "pdftion-palette-colors";
-    for (const swatch of INK_COLORS) {
-      const colorButton = activeDocument.createElement("button");
-      colorButton.className = "pdftion-color";
-      colorButton.dataset.target = "text";
-      colorButton.setCssProps({ "--pdftion-swatch-color": swatch });
-      colorButton.title = swatch;
-      colorButton.type = "button";
+    for (const swatch of PALETTE_COLORS) {
+      const colorButton = this.createPaletteColorButton(swatch, "text");
       colorButton.addEventListener("click", () => {
         this.setTextPaletteColor(swatch);
         this.updateToolbarState();
@@ -54073,34 +54109,62 @@ var InkSession = class {
     group.appendChild(colorRow);
     const fontRow = activeDocument.createElement("label");
     fontRow.className = "pdftion-palette-range";
-    fontRow.title = "\u5B57\u4F53";
+    fontRow.title = uiText("\u5B57\u4F53", "Font");
     const fontLabel = activeDocument.createElement("span");
-    fontLabel.textContent = "\u5B57\u4F53";
+    fontLabel.className = "pdftion-palette-icon";
+    fontLabel.setAttribute("aria-hidden", "true");
+    (0, import_obsidian.setIcon)(fontLabel, "type");
     fontRow.appendChild(fontLabel);
-    const select = activeDocument.createElement("select");
-    select.className = "pdftion-font-family";
-    for (const font of TEXT_FONTS) {
-      const option = activeDocument.createElement("option");
-      option.value = font.value;
-      option.textContent = font.label;
-      select.appendChild(option);
-    }
-    select.value = this.getTextPaletteFontFamily();
-    select.addEventListener("change", () => this.setTextPaletteFontFamily(select.value));
-    fontRow.appendChild(select);
+    const fontButton = createIconButton("case-sensitive", uiText("\u5B57\u4F53", "Font"));
+    fontButton.classList.add("pdftion-font-family");
+    this.updateFontButtonTitle(fontButton);
+    fontButton.addEventListener("click", () => {
+      const current = this.getTextPaletteFontFamily();
+      const index = TEXT_FONTS.findIndex((font) => font.value === current);
+      const next = TEXT_FONTS[(index + 1) % TEXT_FONTS.length] ?? TEXT_FONTS[0];
+      this.setTextPaletteFontFamily(next.value);
+      this.updateFontButtonTitle(fontButton);
+      this.updateToolbarState();
+    });
+    fontRow.appendChild(fontButton);
     group.appendChild(fontRow);
     group.appendChild(
-      this.createPaletteRange("\u6587\u5B57\u5927\u5C0F", "pdftion-size-text", 6, 120, 1, this.getTextPaletteFontSize(), (value) => this.setTextPaletteFontSize(value))
+      this.createPaletteRange(uiText("\u5927\u5C0F", "Size"), "maximize-2", "pdftion-size-text", 6, 120, 1, this.getTextPaletteFontSize(), (value) => this.setTextPaletteFontSize(value))
     );
     group.appendChild(
-      this.createPaletteRange("\u6587\u5B57\u900F\u660E\u5EA6", "pdftion-opacity-text", 0.05, 1, 0.05, this.getTextPaletteOpacity(), (value) => this.setTextPaletteOpacity(value))
+      this.createPaletteRange(uiText("\u900F\u660E", "Alpha"), "droplet", "pdftion-opacity-text", 0.05, 1, 0.05, this.getTextPaletteOpacity(), (value) => this.setTextPaletteOpacity(value))
     );
     return group;
+  }
+  updateFontButtonTitle(button) {
+    const current = this.getTextPaletteFontFamily();
+    const font = TEXT_FONTS.find((item) => item.value === current) ?? TEXT_FONTS[0];
+    const title2 = `${uiText("\u5B57\u4F53", "Font")}: ${uiText(font.labelZh, font.labelEn)}`;
+    button.title = title2;
+    button.setAttribute("aria-label", title2);
+  }
+  createPaletteColorButton(swatch, target) {
+    const colorButton = activeDocument.createElement("button");
+    colorButton.className = "pdftion-color";
+    colorButton.dataset.color = swatch;
+    colorButton.dataset.target = target;
+    colorButton.setCssProps({ "--pdftion-swatch-color": swatch });
+    colorButton.title = swatch;
+    colorButton.type = "button";
+    colorButton.setAttribute("aria-label", swatch);
+    const chip = activeDocument.createElement("span");
+    chip.className = "pdftion-color-swatch";
+    chip.setCssProps({ "--pdftion-swatch-color": swatch });
+    chip.setAttribute("aria-hidden", "true");
+    colorButton.appendChild(chip);
+    return colorButton;
   }
   createAdvancedColorInput(target, value, onInput) {
     const row = activeDocument.createElement("button");
     row.className = "pdftion-color pdftion-color-advanced";
-    row.title = "\u81EA\u5B9A\u4E49\u989C\u8272";
+    row.dataset.target = target;
+    row.setCssProps({ "--pdftion-current-color": normalizeHexColor(value) });
+    row.title = uiText("\u81EA\u5B9A\u4E49\u989C\u8272", "Custom color");
     row.type = "button";
     const input = activeDocument.createElement("input");
     input.dataset.target = target;
@@ -54117,15 +54181,19 @@ var InkSession = class {
     row.appendChild(input);
     return row;
   }
-  createPaletteRange(title2, className, min, max2, step, value, onInput) {
+  createPaletteRange(title2, icon, className, min, max2, step, value, onInput) {
     const row = activeDocument.createElement("label");
     row.className = "pdftion-palette-range";
     row.title = title2;
     const label = activeDocument.createElement("span");
-    label.textContent = title2;
+    label.className = "pdftion-palette-icon";
+    label.setAttribute("aria-hidden", "true");
+    (0, import_obsidian.setIcon)(label, icon);
     row.appendChild(label);
     const input = activeDocument.createElement("input");
     input.className = className;
+    input.title = title2;
+    input.setAttribute("aria-label", title2);
     input.max = String(max2);
     input.min = String(min);
     input.step = String(step);
@@ -54161,9 +54229,9 @@ var InkSession = class {
     if (textOpacityInput) {
       textOpacityInput.value = String(this.getTextPaletteOpacity());
     }
-    const textFontInput = this.palette.querySelector(".pdftion-font-family");
-    if (textFontInput) {
-      textFontInput.value = this.getTextPaletteFontFamily();
+    const textFontButton = this.palette.querySelector(".pdftion-font-family");
+    if (textFontButton) {
+      this.updateFontButtonTitle(textFontButton);
     }
   }
   hasSelectedText() {
@@ -54185,6 +54253,7 @@ var InkSession = class {
     return this.getSelectedTextElements()[0]?.opacity ?? this.textOpacity;
   }
   setTextPaletteColor(color) {
+    color = normalizeHexColor(color);
     this.textColor = color;
     this.updateSelectedTextElements((text) => {
       text.color = color;
@@ -54233,8 +54302,8 @@ var InkSession = class {
     panel.addEventListener("click", (event) => event.stopPropagation());
     const header = activeDocument.createElement("div");
     header.className = "pdftion-panel-header";
-    header.textContent = "pdftion";
-    const close = createIconButton("x", "\u5173\u95ED");
+    header.textContent = "Pdftion";
+    const close = createIconButton("x", uiText("\u5173\u95ED", "Close"));
     close.addEventListener("click", () => {
       panel.remove();
       this.pageNavigator = null;
@@ -54244,62 +54313,42 @@ var InkSession = class {
     const stats = this.aiGetStats();
     const summary = activeDocument.createElement("div");
     summary.className = "pdftion-panel-summary";
-    summary.textContent = `\u8BFB\u53D6\u9875\u9762... | \u7B14\u8FF9 ${stats.strokes} | \u6587\u5B57 ${stats.texts} | \u56FE\u7247 ${stats.images} | \u906E\u6321 ${stats.covers}`;
+    summary.textContent = this.getPageNavigatorSummary(null, stats);
     panel.appendChild(summary);
     const list = activeDocument.createElement("div");
     list.className = "pdftion-page-list";
-    list.textContent = "\u8BFB\u53D6\u9875\u9762...";
+    list.textContent = uiText("\u8BFB\u53D6\u9875\u9762...", "Loading pages...");
     panel.appendChild(list);
     const actions = activeDocument.createElement("div");
     actions.className = "pdftion-panel-actions";
-    const up = activeDocument.createElement("button");
-    up.type = "button";
-    up.textContent = "\u4E0A\u79FB";
+    const up = createIconButton("arrow-up", uiText("\u4E0A\u79FB", "Move up"));
     up.addEventListener("click", () => void this.moveSelectedPages(-1));
     actions.appendChild(up);
-    const down = activeDocument.createElement("button");
-    down.type = "button";
-    down.textContent = "\u4E0B\u79FB";
+    const down = createIconButton("arrow-down", uiText("\u4E0B\u79FB", "Move down"));
     down.addEventListener("click", () => void this.moveSelectedPages(1));
     actions.appendChild(down);
-    const reorder2 = activeDocument.createElement("button");
-    reorder2.type = "button";
-    reorder2.textContent = "\u91CD\u6392";
+    const reorder2 = createIconButton("shuffle", uiText("\u91CD\u6392", "Reorder"));
     reorder2.addEventListener("click", () => void this.reorderPagesByPrompt());
     actions.appendChild(reorder2);
-    const rotate = activeDocument.createElement("button");
-    rotate.type = "button";
-    rotate.textContent = "\u65CB\u8F6C";
+    const rotate = createIconButton("rotate-cw", uiText("\u65CB\u8F6C", "Rotate"));
     rotate.addEventListener("click", () => void this.rotateSelectedPagesClockwise());
     actions.appendChild(rotate);
-    const crop = activeDocument.createElement("button");
-    crop.type = "button";
-    crop.textContent = "\u88C1\u5207";
+    const crop = createIconButton("crop", uiText("\u88C1\u5207", "Crop"));
     crop.addEventListener("click", () => void this.cropSelectedPagesByPrompt());
     actions.appendChild(crop);
-    const deletePages = activeDocument.createElement("button");
-    deletePages.type = "button";
-    deletePages.textContent = "\u5220\u9875";
+    const deletePages = createIconButton("file-minus", uiText("\u5220\u9875", "Delete pages"));
     deletePages.addEventListener("click", () => void this.deleteSelectedPages());
     actions.appendChild(deletePages);
-    const importPdf = activeDocument.createElement("button");
-    importPdf.type = "button";
-    importPdf.textContent = "\u5BFC\u5165PDF";
+    const importPdf = createIconButton("file-plus", uiText("\u5BFC\u5165 PDF", "Import PDF"));
     importPdf.addEventListener("click", () => void this.importPdfByPrompt());
     actions.appendChild(importPdf);
-    const exportMd = activeDocument.createElement("button");
-    exportMd.type = "button";
-    exportMd.textContent = "\u5BFC\u51FA MD";
+    const exportMd = createIconButton("file-text", uiText("\u5BFC\u51FA MD", "Export MD"));
     exportMd.addEventListener("click", () => void this.exportAnnotationsMarkdown());
     actions.appendChild(exportMd);
-    const insertLink = activeDocument.createElement("button");
-    insertLink.type = "button";
-    insertLink.textContent = "OB\u94FE\u63A5";
+    const insertLink = createIconButton("link", uiText("\u63D2\u5165\u94FE\u63A5", "Insert link"));
     insertLink.addEventListener("click", () => void this.insertObsidianLinkInteractive());
     actions.appendChild(insertLink);
-    const convert = activeDocument.createElement("button");
-    convert.type = "button";
-    convert.textContent = "MD/DOCX";
+    const convert = createIconButton("files", uiText("\u8F6C\u6362\u6587\u6863", "Convert docs"));
     convert.addEventListener("click", () => void this.exportMarkdownDocxBridge());
     actions.appendChild(convert);
     panel.appendChild(actions);
@@ -54315,7 +54364,7 @@ var InkSession = class {
   async populatePageNavigatorList(list, summary) {
     const pageCount = await this.getCurrentPdfPageCount();
     const stats = this.aiGetStats();
-    summary.textContent = `\u9875 ${pageCount} | \u7B14\u8FF9 ${stats.strokes} | \u6587\u5B57 ${stats.texts} | \u56FE\u7247 ${stats.images} | \u906E\u6321 ${stats.covers}`;
+    summary.textContent = this.getPageNavigatorSummary(pageCount, stats);
     list.textContent = "";
     if (this.selectedPageIndexes.size === 0) {
       this.selectedPageIndexes.add(clamp(Math.floor(this.getVisibleOverlay()?.pageIndex ?? 0), 0, Math.max(0, pageCount - 1)));
@@ -54338,7 +54387,8 @@ var InkSession = class {
       item.type = "button";
       item.className = "pdftion-page-item";
       const count = this.getEditableElements().filter((element) => element.pageIndex === pageIndex).length;
-      item.textContent = `\u7B2C ${pageIndex + 1} \u9875 (${count})`;
+      item.textContent = `${pageIndex + 1} (${count})`;
+      item.title = uiText(`\u7B2C ${pageIndex + 1} \u9875\uFF0C${count} \u4E2A\u5143\u7D20`, `Page ${pageIndex + 1}, ${count} elements`);
       item.addEventListener("click", () => {
         checkbox.checked = true;
         this.selectedPageIndexes.add(pageIndex);
@@ -54347,6 +54397,13 @@ var InkSession = class {
       row.appendChild(item);
       list.appendChild(row);
     }
+  }
+  getPageNavigatorSummary(pageCount, stats) {
+    const pages = pageCount === null ? "..." : String(pageCount);
+    return uiText(
+      `\u9875 ${pages} | \u7B14 ${stats.strokes} | \u6587 ${stats.texts} | \u56FE ${stats.images} | \u906E ${stats.covers}`,
+      `P ${pages} | ink ${stats.strokes} | text ${stats.texts} | img ${stats.images} | cover ${stats.covers}`
+    );
   }
   async getCurrentPdfPageCount() {
     const binary = await this.plugin.app.vault.readBinary(this.file);
@@ -54393,37 +54450,37 @@ var InkSession = class {
   async reorderPagesByPrompt() {
     const pageCount = await this.getCurrentPdfPageCount();
     const raw = await showPromptModal({
-      actionLabel: "\u91CD\u6392",
+      actionLabel: uiText("\u91CD\u6392", "Reorder"),
       defaultValue: "",
-      message: `\u8F93\u5165\u65B0\u7684\u9875\u7801\u987A\u5E8F\uFF0C\u4F8B\u5982 3,1,2 \u6216 1-3,5\u3002\u5F53\u524D\u5171 ${pageCount} \u9875\u3002`,
-      title: "\u91CD\u7EC4\u9875\u9762"
+      message: uiText(`\u8F93\u5165\u65B0\u7684\u9875\u7801\u987A\u5E8F\uFF0C\u4F8B\u5982 3,1,2 \u6216 1-3,5\u3002\u5F53\u524D\u5171 ${pageCount} \u9875\u3002`, `Enter a new page order, for example 3,1,2 or 1-3,5. Current pages: ${pageCount}.`),
+      title: uiText("\u91CD\u7EC4\u9875\u9762", "Reorder pages")
     });
     if (!raw) {
       return;
     }
     const order = parsePageOrder(raw, pageCount);
     if (!order) {
-      new import_obsidian.Notice("\u9875\u7801\u987A\u5E8F\u65E0\u6548\u3002");
+      new import_obsidian.Notice(uiText("\u9875\u7801\u987A\u5E8F\u65E0\u6548\u3002", "Invalid page order."));
       return;
     }
-    await this.rewritePdfWithPageOrder(order, "\u9875\u7801\u5DF2\u91CD\u7EC4");
+    await this.rewritePdfWithPageOrder(order, uiText("\u9875\u7801\u5DF2\u91CD\u7EC4", "Pages reordered"));
   }
   async deleteSelectedPages() {
     const pageCount = await this.getCurrentPdfPageCount();
     const selected = new Set(this.getSelectedPageIndexes(pageCount));
     if (selected.size >= pageCount) {
-      new import_obsidian.Notice("\u4E0D\u80FD\u5220\u9664\u5168\u90E8\u9875\u9762\u3002");
+      new import_obsidian.Notice(uiText("\u4E0D\u80FD\u5220\u9664\u5168\u90E8\u9875\u9762\u3002", "Cannot delete all pages."));
       return;
     }
     if (!await showConfirmModal({
-      confirmLabel: "\u5220\u9664",
-      message: `\u5220\u9664 ${selected.size} \u9875\uFF1F\u6B64\u64CD\u4F5C\u4F1A\u4FEE\u6539\u5F53\u524D PDF\u3002`,
-      title: "\u5220\u9664\u9875\u9762"
+      confirmLabel: uiText("\u5220\u9664", "Delete"),
+      message: uiText(`\u5220\u9664 ${selected.size} \u9875\uFF1F\u6B64\u64CD\u4F5C\u4F1A\u4FEE\u6539\u5F53\u524D PDF\u3002`, `Delete ${selected.size} pages? This will modify the current PDF.`),
+      title: uiText("\u5220\u9664\u9875\u9762", "Delete pages")
     })) {
       return;
     }
     const order = Array.from({ length: pageCount }, (_2, index) => index).filter((pageIndex) => !selected.has(pageIndex));
-    await this.rewritePdfWithPageOrder(order, "\u5DF2\u5220\u9664\u9875\u9762");
+    await this.rewritePdfWithPageOrder(order, uiText("\u5DF2\u5220\u9664\u9875\u9762", "Pages deleted"));
   }
   async rotateSelectedPagesClockwise() {
     const pageCount = await this.getCurrentPdfPageCount();
@@ -54437,22 +54494,22 @@ var InkSession = class {
     }
     const rotated = this.getEditableElements().map((element) => selected.includes(element.pageIndex) ? rotateElementClockwise(element) : cloneElement(element));
     const saved = await pdf.save({ useObjectStreams: true });
-    await this.persistPdfRewrite(saved, rotated, "\u5DF2\u65CB\u8F6C\u9009\u4E2D\u9875\u9762");
+    await this.persistPdfRewrite(saved, rotated, uiText("\u5DF2\u65CB\u8F6C\u9009\u4E2D\u9875\u9762", "Selected pages rotated"));
   }
   async cropSelectedPagesByPrompt() {
     const pageCount = await this.getCurrentPdfPageCount();
     const selected = this.getSelectedPageIndexes(pageCount);
     const raw = await showPromptModal({
-      actionLabel: "\u88C1\u5207",
-      message: "\u8F93\u5165\u88C1\u5207\u6BD4\u4F8B\uFF1A\u5DE6,\u4E0A,\u53F3,\u4E0B\u3002\u53EF\u586B 0.05 \u6216 5%\uFF0C\u4F8B\u5982 0.03,0.04,0.03,0.04",
-      title: "\u88C1\u5207\u9875\u9762"
+      actionLabel: uiText("\u88C1\u5207", "Crop"),
+      message: uiText("\u8F93\u5165\u88C1\u5207\u6BD4\u4F8B\uFF1A\u5DE6,\u4E0A,\u53F3,\u4E0B\u3002\u53EF\u586B 0.05 \u6216 5%\uFF0C\u4F8B\u5982 0.03,0.04,0.03,0.04", "Enter crop margins: left,top,right,bottom. Use 0.05 or 5%, for example 0.03,0.04,0.03,0.04."),
+      title: uiText("\u88C1\u5207\u9875\u9762", "Crop pages")
     });
     if (!raw) {
       return;
     }
     const crop = parseCropInput(raw);
     if (!crop) {
-      new import_obsidian.Notice("\u88C1\u5207\u53C2\u6570\u65E0\u6548\u3002");
+      new import_obsidian.Notice(uiText("\u88C1\u5207\u53C2\u6570\u65E0\u6548\u3002", "Invalid crop values."));
       return;
     }
     const binary = await this.plugin.app.vault.readBinary(this.file);
@@ -54466,7 +54523,7 @@ var InkSession = class {
     }
     const cropped = this.getEditableElements().map((element) => selected.includes(element.pageIndex) ? cropElement(element, crop) : cloneElement(element));
     const saved = await pdf.save({ useObjectStreams: true });
-    await this.persistPdfRewrite(saved, cropped, "\u5DF2\u88C1\u5207\u9009\u4E2D\u9875\u9762");
+    await this.persistPdfRewrite(saved, cropped, uiText("\u5DF2\u88C1\u5207\u9009\u4E2D\u9875\u9762", "Selected pages cropped"));
   }
   async importPdfByPrompt() {
     const file = await pickPdfFile();
@@ -54476,10 +54533,10 @@ var InkSession = class {
     const pageCount = await this.getCurrentPdfPageCount();
     const defaultInsert = this.getSelectedPageIndexes(pageCount).at(-1) ?? pageCount - 1;
     const raw = await showPromptModal({
-      actionLabel: "\u63D2\u5165",
+      actionLabel: uiText("\u63D2\u5165", "Insert"),
       defaultValue: String(defaultInsert + 1),
-      message: "\u63D2\u5165\u5230\u7B2C\u51E0\u9875\u4E4B\u540E\uFF1F\u586B 0 \u8868\u793A\u63D2\u5230\u6700\u524D\uFF0C\u7559\u7A7A\u8868\u793A\u63D2\u5230\u9009\u4E2D\u9875\u4E4B\u540E\u3002",
-      title: "\u5BFC\u5165 PDF"
+      message: uiText("\u63D2\u5165\u5230\u7B2C\u51E0\u9875\u4E4B\u540E\uFF1F\u586B 0 \u8868\u793A\u63D2\u5230\u6700\u524D\uFF0C\u7559\u7A7A\u8868\u793A\u63D2\u5230\u9009\u4E2D\u9875\u4E4B\u540E\u3002", "Insert after which page? Use 0 for the beginning, or leave blank to insert after the selected page."),
+      title: uiText("\u5BFC\u5165 PDF", "Import PDF")
     });
     const insertAfter = raw?.trim() ? Math.max(0, Math.floor(Number(raw)) || 0) : defaultInsert + 1;
     const insertIndex = clamp(insertAfter, 0, pageCount);
@@ -54508,13 +54565,13 @@ var InkSession = class {
       return clone;
     });
     const saved = await output.save({ useObjectStreams: true });
-    await this.persistPdfRewrite(saved, shifted, `\u5DF2\u5BFC\u5165\u5E76\u5408\u5E76 ${file.name}`);
+    await this.persistPdfRewrite(saved, shifted, uiText(`\u5DF2\u5BFC\u5165\u5E76\u5408\u5E76 ${file.name}`, `Imported and merged ${file.name}`));
   }
   async rewritePdfWithPageOrder(order, message) {
     const binary = await this.plugin.app.vault.readBinary(this.file);
     const source = await PDFDocument_default.load(binary, { ignoreEncryption: true });
     if (order.length === 0 || order.some((pageIndex) => pageIndex < 0 || pageIndex >= source.getPageCount())) {
-      new import_obsidian.Notice("\u9875\u7801\u987A\u5E8F\u65E0\u6548\u3002");
+      new import_obsidian.Notice(uiText("\u9875\u7801\u987A\u5E8F\u65E0\u6548\u3002", "Invalid page order."));
       return;
     }
     const output = await PDFDocument_default.create();
@@ -54563,6 +54620,7 @@ var InkSession = class {
     return tool === "highlight" ? this.highlightColor : this.penColor;
   }
   setToolColor(tool, color) {
+    color = normalizeHexColor(color);
     if (tool === "highlight") {
       this.highlightColor = color;
     } else {
@@ -55020,9 +55078,9 @@ var InkSession = class {
       return;
     }
     if (!await showConfirmModal({
-      confirmLabel: "\u6E05\u7A7A",
-      message: "\u6E05\u7A7A\u672C\u63D2\u4EF6\u53EF\u7F16\u8F91\u6807\u6CE8\uFF1F\u4E0D\u4F1A\u76F4\u63A5\u5220\u9664\u539F PDF \u5185\u5BB9\uFF0C\u4F46\u4F1A\u79FB\u9664\u8986\u76D6\u5C42\u548C\u672C\u63D2\u4EF6\u6807\u6CE8\u3002",
-      title: "\u6E05\u7A7A\u6807\u6CE8"
+      confirmLabel: uiText("\u6E05\u7A7A", "Clear"),
+      message: uiText("\u6E05\u7A7A\u53EF\u7F16\u8F91\u6807\u6CE8\uFF1F\u4E0D\u4F1A\u76F4\u63A5\u5220\u9664\u539F PDF \u5185\u5BB9\uFF0C\u4F46\u4F1A\u79FB\u9664\u8986\u76D6\u5C42\u548C\u672C\u63D2\u4EF6\u6807\u6CE8\u3002", "Clear editable annotations? This will not delete original PDF content, but it will remove overlays and plugin annotations."),
+      title: uiText("\u6E05\u7A7A\u6807\u6CE8", "Clear annotations")
     })) {
       return;
     }
@@ -55117,7 +55175,7 @@ var InkSession = class {
     const targetPath = targetFile.path;
     if (!this.dirty && elements.every((element) => element.saved)) {
       if (!auto) {
-        new import_obsidian.Notice("No new ink to save.");
+        new import_obsidian.Notice(uiText("\u6CA1\u6709\u65B0\u7684\u6807\u6CE8\u9700\u8981\u4FDD\u5B58\u3002", "No new annotations to save."));
       }
       return;
     }
@@ -55151,11 +55209,11 @@ var InkSession = class {
       this.dirty = false;
       this.redrawAll();
       if (!auto) {
-        new import_obsidian.Notice(`Saved ink into ${targetFile.name}.`);
+        new import_obsidian.Notice(uiText(`\u5DF2\u4FDD\u5B58\u5230 ${targetFile.name}\u3002`, `Saved into ${targetFile.name}.`));
       }
     } catch (error2) {
       console.error(error2);
-      new import_obsidian.Notice("Could not auto-save ink into this PDF. Check the console for details.");
+      new import_obsidian.Notice(uiText("\u81EA\u52A8\u4FDD\u5B58\u5931\u8D25\uFF0C\u8BF7\u67E5\u770B\u63A7\u5236\u53F0\u3002", "Could not auto-save into this PDF. Check the console for details."));
     } finally {
       this.saving = false;
       if (this.pendingSaveAfterCurrentSave) {
@@ -55192,7 +55250,7 @@ var InkSession = class {
       this.dirty = false;
     } catch (error2) {
       console.error(error2);
-      new import_obsidian.Notice("Could not save pdftion editable annotations. Check the console for details.");
+      new import_obsidian.Notice(uiText("\u4FDD\u5B58 Pdftion \u53EF\u7F16\u8F91\u6807\u6CE8\u5931\u8D25\uFF0C\u8BF7\u67E5\u770B\u63A7\u5236\u53F0\u3002", "Could not save Pdftion editable annotations. Check the console for details."));
     } finally {
       this.saving = false;
       if (this.pendingSaveAfterCurrentSave) {
@@ -55213,7 +55271,7 @@ var InkSession = class {
     }
     const markdown = await this.getPdfContentMarkdown();
     await this.plugin.app.vault.adapter.write(targetPath, markdown);
-    new import_obsidian.Notice(`\u5DF2\u5BFC\u51FA PDF \u5185\u5BB9 Markdown\uFF1A${targetPath}`);
+    new import_obsidian.Notice(uiText(`\u5DF2\u5BFC\u51FA Markdown\uFF1A${targetPath}`, `Exported Markdown: ${targetPath}`));
     return targetPath;
   }
   async exportAnnotationsDocx() {
@@ -55229,7 +55287,7 @@ var InkSession = class {
     const docx = buildDocxFromParagraphs(markdownToDocxParagraphs(await this.getPdfContentMarkdown()), targetFile.basename);
     const buffer2 = docx.buffer.slice(docx.byteOffset, docx.byteOffset + docx.byteLength);
     await this.plugin.app.vault.adapter.writeBinary(targetPath, buffer2);
-    new import_obsidian.Notice(`\u5DF2\u5BFC\u51FA PDF \u5185\u5BB9 DOCX\uFF1A${targetPath}`);
+    new import_obsidian.Notice(uiText(`\u5DF2\u5BFC\u51FA DOCX\uFF1A${targetPath}`, `Exported DOCX: ${targetPath}`));
     return targetPath;
   }
   async getPdfContentMarkdown() {
@@ -55262,7 +55320,7 @@ var InkSession = class {
     const mdPath = await this.exportConvertedMarkdown({ notice: false });
     const docxPath = await this.exportConvertedDocx({ notice: false });
     if (mdPath || docxPath) {
-      new import_obsidian.Notice(`\u5DF2\u5BFC\u51FA\u8F6C\u6362\u6587\u6863\uFF1A${[mdPath, docxPath].filter(Boolean).join(", ")}`);
+      new import_obsidian.Notice(uiText(`\u5DF2\u5BFC\u51FA\u8F6C\u6362\u6587\u6863\uFF1A${[mdPath, docxPath].filter(Boolean).join(", ")}`, `Exported converted documents: ${[mdPath, docxPath].filter(Boolean).join(", ")}`));
     }
     return mdPath ?? docxPath;
   }
@@ -55281,12 +55339,12 @@ var InkSession = class {
       const markdown = buildVisualConversionMarkdown(this.file, pages, folderPath);
       await this.plugin.app.vault.adapter.write(targetPath, markdown);
       if (options.notice !== false) {
-        new import_obsidian.Notice(`\u5DF2\u8F6C\u6362 MD\uFF1A${targetPath}`);
+        new import_obsidian.Notice(uiText(`\u5DF2\u8F6C\u6362 MD\uFF1A${targetPath}`, `Converted MD: ${targetPath}`));
       }
       return targetPath;
     } catch (error2) {
       console.error(error2);
-      new import_obsidian.Notice("\u8F6C\u6362 MD \u5931\u8D25\uFF0C\u67E5\u770B\u63A7\u5236\u53F0\u3002");
+      new import_obsidian.Notice(uiText("\u8F6C\u6362 MD \u5931\u8D25\uFF0C\u8BF7\u67E5\u770B\u63A7\u5236\u53F0\u3002", "MD conversion failed. Check the console."));
       return null;
     }
   }
@@ -55299,12 +55357,12 @@ var InkSession = class {
       const buffer2 = docx.buffer.slice(docx.byteOffset, docx.byteOffset + docx.byteLength);
       await this.plugin.app.vault.adapter.writeBinary(targetPath, buffer2);
       if (options.notice !== false) {
-        new import_obsidian.Notice(`\u5DF2\u8F6C\u6362 DOCX\uFF1A${targetPath}`);
+        new import_obsidian.Notice(uiText(`\u5DF2\u8F6C\u6362 DOCX\uFF1A${targetPath}`, `Converted DOCX: ${targetPath}`));
       }
       return targetPath;
     } catch (error2) {
       console.error(error2);
-      new import_obsidian.Notice("\u8F6C\u6362 DOCX \u5931\u8D25\uFF0C\u67E5\u770B\u63A7\u5236\u53F0\u3002");
+      new import_obsidian.Notice(uiText("\u8F6C\u6362 DOCX \u5931\u8D25\uFF0C\u8BF7\u67E5\u770B\u63A7\u5236\u53F0\u3002", "DOCX conversion failed. Check the console."));
       return null;
     }
   }
@@ -55416,7 +55474,7 @@ var InkSession = class {
   async exportAnnotatedPdf(options = {}) {
     try {
       if (options.notice !== false) {
-        new import_obsidian.Notice("\u6B63\u5728\u5BFC\u51FA\u70E7\u5F55 PDF...");
+        new import_obsidian.Notice(uiText("\u6B63\u5728\u5BFC\u51FA PDF...", "Exporting PDF..."));
       }
       this.commitNativeTextEditor();
       this.redrawAll();
@@ -55432,18 +55490,18 @@ var InkSession = class {
       const buffer2 = new ArrayBuffer(saved.byteLength);
       new Uint8Array(buffer2).set(saved);
       if (options.notice !== false) {
-        new import_obsidian.Notice(`\u6B63\u5728\u5199\u5165\u70E7\u5F55 PDF\uFF1A${targetPath}`);
+        new import_obsidian.Notice(uiText(`\u6B63\u5728\u5199\u5165 PDF\uFF1A${targetPath}`, `Writing PDF: ${targetPath}`));
       }
       await this.plugin.app.vault.adapter.writeBinary(targetPath, buffer2);
       const shared = options.share === false ? false : await trySharePdf(targetPath.split("/").pop() ?? targetFile.name, saved);
       if (options.notice !== false) {
-        new import_obsidian.Notice(shared ? `\u5DF2\u751F\u6210\u5E76\u5206\u4EAB ${targetPath}` : `\u5DF2\u751F\u6210\u70E7\u5F55 PDF\uFF1A${targetPath}`);
+        new import_obsidian.Notice(shared ? uiText(`\u5DF2\u751F\u6210\u5E76\u5206\u4EAB ${targetPath}`, `Generated and shared ${targetPath}`) : uiText(`\u5DF2\u751F\u6210 PDF\uFF1A${targetPath}`, `Generated PDF: ${targetPath}`));
       }
       return targetPath;
     } catch (error2) {
       console.error(error2);
       const message = error2 instanceof Error ? error2.message : String(error2);
-      new import_obsidian.Notice(`\u5BFC\u51FA\u70E7\u5F55 PDF \u5931\u8D25\uFF1A${message}`);
+      new import_obsidian.Notice(uiText(`\u5BFC\u51FA PDF \u5931\u8D25\uFF1A${message}`, `PDF export failed: ${message}`));
       return null;
     }
   }
@@ -55451,24 +55509,24 @@ var InkSession = class {
     this.commitNativeTextEditor();
     const elements = this.getEditableElements().map(cloneElement);
     if (!elements.some((element) => element.kind === "cover")) {
-      new import_obsidian.Notice("\u6CA1\u6709\u906E\u6321\u533A\u57DF\u53EF\u56FA\u5316\u3002");
+      new import_obsidian.Notice(uiText("\u6CA1\u6709\u906E\u6321\u533A\u57DF\u53EF\u56FA\u5316\u3002", "No cover regions to flatten."));
       return;
     }
     if (!await showConfirmModal({
-      confirmLabel: "\u56FA\u5316",
-      message: "\u56FA\u5316\u906E\u6321\u4F1A\u4FEE\u6539\u5F53\u524D PDF\uFF1A\u6709\u906E\u6321\u7684\u5DF2\u6E32\u67D3\u9875\u9762\u4F1A\u91CD\u5EFA\u4E3A\u56FE\u7247\u9875\uFF0C\u4ECE\u800C\u5220\u9664\u5E95\u5C42\u88AB\u906E\u6321\u6587\u5B57/\u56FE\u7247\u5BF9\u8C61\u3002\u7EE7\u7EED\uFF1F",
-      title: "\u56FA\u5316\u906E\u6321"
+      confirmLabel: uiText("\u56FA\u5316", "Flatten"),
+      message: uiText("\u56FA\u5316\u906E\u6321\u4F1A\u4FEE\u6539\u5F53\u524D PDF\uFF1A\u6709\u906E\u6321\u7684\u5DF2\u6E32\u67D3\u9875\u9762\u4F1A\u91CD\u5EFA\u4E3A\u56FE\u7247\u9875\uFF0C\u4ECE\u800C\u5220\u9664\u5E95\u5C42\u88AB\u906E\u6321\u6587\u5B57/\u56FE\u7247\u5BF9\u8C61\u3002\u7EE7\u7EED\uFF1F", "Flattening covers will modify the current PDF by rebuilding rendered covered pages as images. Continue?"),
+      title: uiText("\u56FA\u5316\u906E\u6321", "Flatten covers")
     })) {
       return;
     }
     const binary = await this.plugin.app.vault.readBinary(this.file);
     const { flattenedPages, pdf } = await this.buildPdfWithFlattenedCoveredPages(binary, elements, "covers-only");
     if (flattenedPages.size === 0) {
-      new import_obsidian.Notice("\u5F53\u524D\u6CA1\u6709\u53EF\u56FA\u5316\u7684\u5DF2\u6E32\u67D3\u906E\u6321\u9875\u3002\u8BF7\u5148\u6EDA\u5230\u6709\u906E\u6321\u7684\u9875\u9762\u518D\u8BD5\u3002");
+      new import_obsidian.Notice(uiText("\u5F53\u524D\u6CA1\u6709\u53EF\u56FA\u5316\u7684\u5DF2\u6E32\u67D3\u906E\u6321\u9875\u3002\u8BF7\u5148\u6EDA\u5230\u6709\u906E\u6321\u7684\u9875\u9762\u518D\u8BD5\u3002", "No rendered covered pages are available. Scroll to covered pages and try again."));
       return;
     }
     const saved = await pdf.save({ useObjectStreams: true });
-    await this.persistPdfRewrite(saved, elements, `\u5DF2\u56FA\u5316 ${flattenedPages.size} \u9875\u906E\u6321`);
+    await this.persistPdfRewrite(saved, elements, uiText(`\u5DF2\u56FA\u5316 ${flattenedPages.size} \u9875\u906E\u6321`, `Flattened covers on ${flattenedPages.size} pages`));
   }
   async buildPdfWithFlattenedCoveredPages(sourceBytes, elements, mode) {
     const source = await PDFDocument_default.load(sourceBytes, { ignoreEncryption: true });
@@ -55774,7 +55832,7 @@ var InkSession = class {
     const size = await getImageDataUrlSize(dataUrl);
     const overlay = this.getVisibleOverlay() ?? Array.from(this.overlays.values())[0];
     if (!overlay) {
-      new import_obsidian.Notice("\u6CA1\u6709\u53EF\u63D2\u5165\u56FE\u7247\u7684 PDF \u9875\u9762\u3002");
+      new import_obsidian.Notice(uiText("\u6CA1\u6709\u53EF\u63D2\u5165\u56FE\u7247\u7684 PDF \u9875\u9762\u3002", "No PDF page is available for image insertion."));
       return;
     }
     const maxWidth = 0.42;
@@ -55811,9 +55869,9 @@ var InkSession = class {
   }
   async insertObsidianLinkInteractive() {
     const raw = await showPromptModal({
-      actionLabel: "\u63D2\u5165",
-      message: "\u8F93\u5165 OB \u94FE\u63A5\u6216\u7B14\u8BB0\u540D\uFF0C\u4F8B\u5982 [[\u7B14\u8BB0]] / ![[\u56FE\u7247.png]]",
-      title: "\u63D2\u5165 OB \u94FE\u63A5"
+      actionLabel: uiText("\u63D2\u5165", "Insert"),
+      message: uiText("\u8F93\u5165\u94FE\u63A5\u6216\u7B14\u8BB0\u540D\uFF0C\u4F8B\u5982 [[\u7B14\u8BB0]] / ![[\u56FE\u7247.png]]", "Enter a link or note name, for example [[Note]] / ![[image.png]]"),
+      title: uiText("\u63D2\u5165\u94FE\u63A5", "Insert link")
     });
     if (!raw) {
       return;
@@ -55838,7 +55896,7 @@ var InkSession = class {
     }
     const overlay = this.resolveTargetOverlay(input.pageIndex);
     if (!overlay) {
-      new import_obsidian.Notice("\u6CA1\u6709\u53EF\u63D2\u5165 OB \u94FE\u63A5\u7684 PDF \u9875\u9762\u3002");
+      new import_obsidian.Notice(uiText("\u6CA1\u6709\u53EF\u63D2\u5165\u94FE\u63A5\u7684 PDF \u9875\u9762\u3002", "No PDF page is available for link insertion."));
       return null;
     }
     return this.aiAddText({
@@ -55857,7 +55915,7 @@ var InkSession = class {
   async insertVaultImage(input) {
     const file = this.resolveVaultFile(input.path);
     if (!(file instanceof import_obsidian.TFile) || !isImageExtension(file.extension)) {
-      new import_obsidian.Notice("\u672A\u627E\u5230\u53EF\u63D2\u5165\u7684 Vault \u56FE\u7247\u3002");
+      new import_obsidian.Notice(uiText("\u672A\u627E\u5230\u53EF\u63D2\u5165\u7684\u56FE\u7247\u3002", "No insertable image was found."));
       return null;
     }
     const binary = await this.plugin.app.vault.readBinary(file);
@@ -55865,7 +55923,7 @@ var InkSession = class {
     const size = await getImageDataUrlSize(dataUrl);
     const overlay = this.resolveTargetOverlay(input.pageIndex);
     if (!overlay) {
-      new import_obsidian.Notice("\u6CA1\u6709\u53EF\u63D2\u5165\u56FE\u7247\u7684 PDF \u9875\u9762\u3002");
+      new import_obsidian.Notice(uiText("\u6CA1\u6709\u53EF\u63D2\u5165\u56FE\u7247\u7684 PDF \u9875\u9762\u3002", "No PDF page is available for image insertion."));
       return null;
     }
     const dimensions = fitImageToOverlay(size, overlay, input.width, input.height);
@@ -56477,7 +56535,7 @@ var InkSession = class {
       right: clamp(Number(crop.right ?? 0), 0, 0.45),
       top: clamp(Number(crop.top ?? 0), 0, 0.45)
     });
-    new import_obsidian.Notice("\u9875\u9762\u88C1\u526A\u53C2\u6570\u5DF2\u8BB0\u5F55\uFF1B\u5F53\u524D\u7248\u672C\u5148\u5F00\u653E\u7ED9 AI/API\uFF0C\u540E\u7EED\u63A5\u5165\u5BFC\u51FA\u88C1\u526A\u3002");
+    new import_obsidian.Notice(uiText("\u9875\u9762\u88C1\u526A\u53C2\u6570\u5DF2\u8BB0\u5F55\u3002", "Page crop values recorded."));
     return true;
   }
   getPageCrops() {

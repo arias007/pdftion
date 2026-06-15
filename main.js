@@ -52645,8 +52645,8 @@ var NATIVE_TEXT_SELECTION_TOUCH_LIMITS = {
   maxHeightRatio: 0.34,
   maxRects: 36
 };
-var BUILTIN_ALIPAY_QR_PATH = ".obsidian/plugins/pdftion/assets/alipay.png";
-var BUILTIN_BINANCE_QR_PATH = ".obsidian/plugins/pdftion/assets/binance.png";
+var BUILTIN_ALIPAY_QR_FILE = "alipay.png";
+var BUILTIN_BINANCE_QR_FILE = "binance.png";
 var DEFAULT_SETTINGS = {
   autoEnableAnnotationToolbar: false,
   boostPdfMenus: true,
@@ -53468,7 +53468,7 @@ var PdftionSettingTab = class extends import_obsidian.PluginSettingTab {
   display() {
     const { containerEl } = this;
     containerEl.replaceChildren();
-    containerEl.createEl("h2", { text: uiText("Pdftion \u8BBE\u7F6E", "Pdftion settings") });
+    new import_obsidian.Setting(containerEl).setName(uiText("Pdftion \u8BBE\u7F6E", "Pdftion settings")).setHeading();
     this.addSection(uiText("\u5BFC\u51FA", "Export"));
     new import_obsidian.Setting(containerEl).setName(uiText("\u5BFC\u51FA\u540E\u81EA\u52A8\u6253\u5F00", "Open after PDF export")).setDesc(uiText("\u5BFC\u51FA\u70E7\u5F55 PDF \u540E\u81EA\u52A8\u6253\u5F00\u751F\u6210\u7684 PDF\u3002", "Automatically open the generated burned-in PDF after export.")).addToggle((toggle) => {
       toggle.setValue(this.plugin.settings.openBurnedPdfAfterExport).onChange(async (value) => {
@@ -53524,7 +53524,7 @@ var PdftionSettingTab = class extends import_obsidian.PluginSettingTab {
     this.renderPaymentQrCodes(containerEl);
   }
   addSection(title2) {
-    this.containerEl.createEl("h3", { cls: "pdftion-settings-section", text: title2 });
+    new import_obsidian.Setting(this.containerEl).setName(title2).setHeading().settingEl.classList.add("pdftion-settings-section");
   }
   addToggleSetting(name5, desc, key2) {
     new import_obsidian.Setting(this.containerEl).setName(name5).setDesc(desc).addToggle((toggle) => {
@@ -53595,10 +53595,10 @@ var PdftionSettingTab = class extends import_obsidian.PluginSettingTab {
       return null;
     }
     if (path === "builtin:alipay") {
-      return this.plugin.app.vault.adapter.getResourcePath(BUILTIN_ALIPAY_QR_PATH);
+      return this.getBundledAssetSource(BUILTIN_ALIPAY_QR_FILE);
     }
     if (path === "builtin:binance") {
-      return this.plugin.app.vault.adapter.getResourcePath(BUILTIN_BINANCE_QR_PATH);
+      return this.getBundledAssetSource(BUILTIN_BINANCE_QR_FILE);
     }
     if (/^(https?:|data:image\/)/i.test(path)) {
       return path;
@@ -53607,6 +53607,9 @@ var PdftionSettingTab = class extends import_obsidian.PluginSettingTab {
       return `file:///${path.replace(/\\/g, "/")}`;
     }
     return this.plugin.app.vault.adapter.getResourcePath(path.replace(/\\/g, "/").replace(/^\/+/, ""));
+  }
+  getBundledAssetSource(fileName) {
+    return this.plugin.app.vault.adapter.getResourcePath(`${this.plugin.app.vault.configDir}/plugins/${this.plugin.manifest.id}/assets/${fileName}`);
   }
 };
 function normalizeSettings(data2) {

@@ -1,4 +1,4 @@
-import { Notice, Plugin, TFile, WorkspaceLeaf, setIcon } from "obsidian";
+import { Notice, Plugin, PluginSettingTab, Setting, TFile, WorkspaceLeaf, setIcon } from "obsidian";
 import * as fontkitModule from "@pdf-lib/fontkit";
 import { PDFDocument, degrees, rgb } from "pdf-lib";
 
@@ -24,6 +24,14 @@ const TEXT_FONTS = [
   { labelEn: "Serif", labelZh: "衬线", value: "Georgia, serif" }
 ];
 const TEXT_SELECTION_HIGHLIGHT_COLORS = ["#ffe066", "#ff8787", "#69db7c", "#74c0fc"];
+
+interface PdftionSettings {
+  openBurnedPdfAfterExport: boolean;
+}
+
+const DEFAULT_SETTINGS: PdftionSettings = {
+  openBurnedPdfAfterExport: true
+};
 
 function isChineseUi(): boolean {
   const languages = new Set<string>();
@@ -54,6 +62,14 @@ function appendToActiveBody(element: HTMLElement): void {
 
 function getActiveBody(): HTMLElement {
   return activeDocument.body;
+}
+
+function waitForUiPaint(): Promise<void> {
+  return new Promise((resolve) => {
+    window.requestAnimationFrame(() => {
+      window.setTimeout(resolve, 0);
+    });
+  });
 }
 
 type CrossWindowNode = Node & {
@@ -475,9 +491,12 @@ export default class PdftionPlugin extends Plugin {
   private annotationFontBytes: Uint8Array | null = null;
   private sessions = new Map<HTMLElement, InkSession>();
   private surfaceScanTimers: number[] = [];
+  settings: PdftionSettings = { ...DEFAULT_SETTINGS };
 
   async onload(): Promise<void> {
+    await this.loadSettings();
     getActiveBody().classList.add("pdftion-menu-boost");
+    this.addSettingTab(new PdftionSettingTab(this));
 
     this.addCommand({
       id: "toggle",
@@ -555,6 +574,14 @@ export default class PdftionPlugin extends Plugin {
 
     this.queuePdfSurfaceScans();
     this.installAiApi();
+  }
+
+  async loadSettings(): Promise<void> {
+    this.settings = normalizeSettings(await this.loadData());
+  }
+
+  async saveSettings(): Promise<void> {
+    await this.saveData(this.settings);
   }
 
   onunload(): void {
@@ -976,6 +1003,38 @@ export default class PdftionPlugin extends Plugin {
     activeWindow.PdftionAI = api;
     (window as unknown as Record<string, PdftionAiApi | undefined>)[PDFTION_AI_API_NAME] = api;
   }
+}
+
+class PdftionSettingTab extends PluginSettingTab {
+  constructor(private readonly plugin: PdftionPlugin) {
+    super(plugin.app, plugin);
+  }
+
+  display(): void {
+    const { containerEl } = this;
+    containerEl.replaceChildren();
+
+    new Setting(containerEl)
+      .setName(uiText("导出后自动打开", "Open after PDF export"))
+      .setDesc(uiText("导出烧录 PDF 后自动打开生成的 PDF。", "Automatically open the generated burned-in PDF after export."))
+      .addToggle((toggle) => {
+        toggle
+          .setValue(this.plugin.settings.openBurnedPdfAfterExport)
+          .onChange(async (value) => {
+            this.plugin.settings.openBurnedPdfAfterExport = value;
+            await this.plugin.saveSettings();
+          });
+      });
+  }
+}
+
+function normalizeSettings(data: unknown): PdftionSettings {
+  const record = data && typeof data === "object" ? data as Partial<PdftionSettings> : {};
+  return {
+    openBurnedPdfAfterExport: typeof record.openBurnedPdfAfterExport === "boolean"
+      ? record.openBurnedPdfAfterExport
+      : DEFAULT_SETTINGS.openBurnedPdfAfterExport
+  };
 }
 
 class InkSession {
@@ -2435,8 +2494,14 @@ class InkSession {
 
     const actionRow = activeDocument.createElement("div");
     actionRow.className = "pdftion-native-selection-actions";
-    const copyLink = createIconButton("copy", uiText("复制 OB 链接", "Copy note link"));
-    copyLink.classList.add("pdftion-native-selection-copy");
+
+    const copyText = createIconButton("type", uiText("复制文字", "Copy text"));
+    copyText.classList.add("pdftion-native-selection-action", "pdftion-native-selection-copy-text");
+    copyText.addEventListener("click", () => void this.copyNativeTextSelectionText());
+    actionRow.appendChild(copyText);
+
+    const copyLink = createIconButton("link", uiText("复制 PDF 链接", "Copy PDF link"));
+    copyLink.classList.add("pdftion-native-selection-action", "pdftion-native-selection-copy-link");
     copyLink.addEventListener("click", () => void this.copyNativeTextSelectionLink());
     actionRow.appendChild(copyLink);
     panel.appendChild(actionRow);
@@ -2539,6 +2604,22 @@ class InkSession {
       new Notice(uiText("已复制 PDF 文字链接。", "Copied PDF text link."));
     } else {
       new Notice(uiText("复制失败。", "Could not copy link."));
+    }
+    activeDocument.getSelection()?.removeAllRanges();
+    this.hideNativeTextSelectionMenu();
+  }
+
+  private async copyNativeTextSelectionText(): Promise<void> {
+    const info = this.nativeTextSelectionInfo;
+    if (!info) {
+      return;
+    }
+
+    const copied = await writeClipboardText(info.text);
+    if (copied) {
+      new Notice(uiText("已复制 PDF 文字。", "Copied PDF text."));
+    } else {
+      new Notice(uiText("复制失败。", "Could not copy text."));
     }
     activeDocument.getSelection()?.removeAllRanges();
     this.hideNativeTextSelectionMenu();
@@ -4427,9 +4508,12 @@ class InkSession {
   }
 
   async exportAnnotatedPdf(options: { notice?: boolean; share?: boolean } = {}): Promise<string | null> {
+    const progressNotice = options.notice !== false
+      ? new Notice(uiText("正在导出烧录 PDF...", "Exporting burned-in PDF..."), 0)
+      : null;
     try {
-      if (options.notice !== false) {
-        new Notice(uiText("正在导出 PDF...", "Exporting PDF..."));
+      if (progressNotice) {
+        await waitForUiPaint();
       }
       this.commitNativeTextEditor();
       this.redrawAll();
@@ -4446,21 +4530,45 @@ class InkSession {
       const saved = await pdf.save({ useObjectStreams: true });
       const buffer = new ArrayBuffer(saved.byteLength);
       new Uint8Array(buffer).set(saved);
-      if (options.notice !== false) {
-        new Notice(uiText(`正在写入 PDF：${targetPath}`, `Writing PDF: ${targetPath}`));
-      }
-      await this.plugin.app.vault.adapter.writeBinary(targetPath, buffer);
+      const exportedFile = await this.plugin.app.vault.createBinary(targetPath, buffer);
+      const opened = await this.openExportedPdfIfEnabled(exportedFile);
 
       const shared = options.share === false ? false : await trySharePdf(targetPath.split("/").pop() ?? targetFile.name, saved);
-      if (options.notice !== false) {
-        new Notice(shared ? uiText(`已生成并分享 ${targetPath}`, `Generated and shared ${targetPath}`) : uiText(`已生成 PDF：${targetPath}`, `Generated PDF: ${targetPath}`));
+      if (progressNotice) {
+        progressNotice.setMessage(
+          opened
+            ? uiText(`已导出并打开：${targetPath}`, `Exported and opened: ${targetPath}`)
+            : shared
+              ? uiText(`已导出并分享：${targetPath}`, `Exported and shared: ${targetPath}`)
+              : uiText(`已导出：${targetPath}`, `Exported: ${targetPath}`)
+        );
+        window.setTimeout(() => progressNotice.hide(), 4500);
       }
       return targetPath;
     } catch (error) {
       console.error(error);
       const message = error instanceof Error ? error.message : String(error);
-      new Notice(uiText(`导出 PDF 失败：${message}`, `PDF export failed: ${message}`));
+      if (progressNotice) {
+        progressNotice.setMessage(uiText(`导出 PDF 失败：${message}`, `PDF export failed: ${message}`));
+        window.setTimeout(() => progressNotice.hide(), 7000);
+      } else {
+        new Notice(uiText(`导出 PDF 失败：${message}`, `PDF export failed: ${message}`));
+      }
       return null;
+    }
+  }
+
+  private async openExportedPdfIfEnabled(file: TFile): Promise<boolean> {
+    if (!this.plugin.settings.openBurnedPdfAfterExport) {
+      return false;
+    }
+
+    try {
+      await this.plugin.app.workspace.getLeaf(false).openFile(file);
+      return true;
+    } catch (error) {
+      console.error(error);
+      return false;
     }
   }
 
@@ -6048,8 +6156,13 @@ function normalizeObsidianLink(raw: string): { embed: boolean; target: string; w
 
 function buildPdfSelectionWikilink(file: TFile, pageIndex: number, text: string): string {
   const target = sanitizeWikilinkTarget(`${file.path}#page=${pageIndex + 1}`);
-  const alias = sanitizeWikilinkAlias(`${truncateForLinkAlias(text)} - ${file.basename}`);
+  const alias = sanitizeWikilinkAlias(`${truncateForLinkAlias(text)} - ${getPdfDisplayName(file)}`);
   return `[[${target}|${alias}]]`;
+}
+
+function getPdfDisplayName(file: TFile): string {
+  const name = file.name.trim() || file.basename;
+  return /\.pdf$/i.test(name) ? name : `${file.basename || name}.pdf`;
 }
 
 function sanitizeWikilinkTarget(value: string): string {

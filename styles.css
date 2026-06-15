@@ -303,10 +303,10 @@ body.pdftion-menu-boost .pdftion-embed-actions .clickable-icon {
   width: 8px;
 }
 
-.pdftion-native-selection-copy {
+.pdftion-native-selection-action {
   border-radius: 6px;
   color: var(--text-normal);
-  width: 88px;
+  width: 34px;
 }
 
 .pdftion-panel {

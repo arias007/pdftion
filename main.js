@@ -52134,6 +52134,9 @@ var TEXT_FONTS = [
   { labelEn: "Serif", labelZh: "\u886C\u7EBF", value: "Georgia, serif" }
 ];
 var TEXT_SELECTION_HIGHLIGHT_COLORS = ["#ffe066", "#ff8787", "#69db7c", "#74c0fc"];
+var DEFAULT_SETTINGS = {
+  openBurnedPdfAfterExport: true
+};
 function isChineseUi() {
   const languages = /* @__PURE__ */ new Set();
   languages.add(activeWindow.navigator.language);
@@ -52158,6 +52161,13 @@ function appendToActiveBody(element) {
 }
 function getActiveBody() {
   return activeDocument.body;
+}
+function waitForUiPaint() {
+  return new Promise((resolve) => {
+    window.requestAnimationFrame(() => {
+      window.setTimeout(resolve, 0);
+    });
+  });
 }
 function hasCrossWindowInstanceCheck(value) {
   return typeof value === "object" && value !== null && "instanceOf" in value;
@@ -52276,8 +52286,11 @@ var PdftionPlugin = class extends import_obsidian.Plugin {
   annotationFontBytes = null;
   sessions = /* @__PURE__ */ new Map();
   surfaceScanTimers = [];
+  settings = { ...DEFAULT_SETTINGS };
   async onload() {
+    await this.loadSettings();
     getActiveBody().classList.add("pdftion-menu-boost");
+    this.addSettingTab(new PdftionSettingTab(this));
     this.addCommand({
       id: "toggle",
       name: uiText("\u5207\u6362 PDF \u6279\u6CE8", "Toggle PDF annotation"),
@@ -52348,6 +52361,12 @@ var PdftionPlugin = class extends import_obsidian.Plugin {
     this.register(() => this.clearSurfaceScanTimers());
     this.queuePdfSurfaceScans();
     this.installAiApi();
+  }
+  async loadSettings() {
+    this.settings = normalizeSettings(await this.loadData());
+  }
+  async saveSettings() {
+    await this.saveData(this.settings);
   }
   onunload() {
     if (activeWindow.PdftionAI) {
@@ -52710,6 +52729,29 @@ var PdftionPlugin = class extends import_obsidian.Plugin {
     window[PDFTION_AI_API_NAME] = api;
   }
 };
+var PdftionSettingTab = class extends import_obsidian.PluginSettingTab {
+  constructor(plugin) {
+    super(plugin.app, plugin);
+    this.plugin = plugin;
+  }
+  plugin;
+  display() {
+    const { containerEl } = this;
+    containerEl.replaceChildren();
+    new import_obsidian.Setting(containerEl).setName(uiText("\u5BFC\u51FA\u540E\u81EA\u52A8\u6253\u5F00", "Open after PDF export")).setDesc(uiText("\u5BFC\u51FA\u70E7\u5F55 PDF \u540E\u81EA\u52A8\u6253\u5F00\u751F\u6210\u7684 PDF\u3002", "Automatically open the generated burned-in PDF after export.")).addToggle((toggle) => {
+      toggle.setValue(this.plugin.settings.openBurnedPdfAfterExport).onChange(async (value) => {
+        this.plugin.settings.openBurnedPdfAfterExport = value;
+        await this.plugin.saveSettings();
+      });
+    });
+  }
+};
+function normalizeSettings(data2) {
+  const record = data2 && typeof data2 === "object" ? data2 : {};
+  return {
+    openBurnedPdfAfterExport: typeof record.openBurnedPdfAfterExport === "boolean" ? record.openBurnedPdfAfterExport : DEFAULT_SETTINGS.openBurnedPdfAfterExport
+  };
+}
 var InkSession = class {
   constructor(plugin, leaf, file, rootEl) {
     this.plugin = plugin;
@@ -53960,8 +54002,12 @@ var InkSession = class {
     panel.appendChild(colorRow);
     const actionRow = activeDocument.createElement("div");
     actionRow.className = "pdftion-native-selection-actions";
-    const copyLink = createIconButton("copy", uiText("\u590D\u5236 OB \u94FE\u63A5", "Copy note link"));
-    copyLink.classList.add("pdftion-native-selection-copy");
+    const copyText = createIconButton("type", uiText("\u590D\u5236\u6587\u5B57", "Copy text"));
+    copyText.classList.add("pdftion-native-selection-action", "pdftion-native-selection-copy-text");
+    copyText.addEventListener("click", () => void this.copyNativeTextSelectionText());
+    actionRow.appendChild(copyText);
+    const copyLink = createIconButton("link", uiText("\u590D\u5236 PDF \u94FE\u63A5", "Copy PDF link"));
+    copyLink.classList.add("pdftion-native-selection-action", "pdftion-native-selection-copy-link");
     copyLink.addEventListener("click", () => void this.copyNativeTextSelectionLink());
     actionRow.appendChild(copyLink);
     panel.appendChild(actionRow);
@@ -54052,6 +54098,20 @@ var InkSession = class {
       new import_obsidian.Notice(uiText("\u5DF2\u590D\u5236 PDF \u6587\u5B57\u94FE\u63A5\u3002", "Copied PDF text link."));
     } else {
       new import_obsidian.Notice(uiText("\u590D\u5236\u5931\u8D25\u3002", "Could not copy link."));
+    }
+    activeDocument.getSelection()?.removeAllRanges();
+    this.hideNativeTextSelectionMenu();
+  }
+  async copyNativeTextSelectionText() {
+    const info = this.nativeTextSelectionInfo;
+    if (!info) {
+      return;
+    }
+    const copied = await writeClipboardText(info.text);
+    if (copied) {
+      new import_obsidian.Notice(uiText("\u5DF2\u590D\u5236 PDF \u6587\u5B57\u3002", "Copied PDF text."));
+    } else {
+      new import_obsidian.Notice(uiText("\u590D\u5236\u5931\u8D25\u3002", "Could not copy text."));
     }
     activeDocument.getSelection()?.removeAllRanges();
     this.hideNativeTextSelectionMenu();
@@ -55693,9 +55753,10 @@ var InkSession = class {
     }
   }
   async exportAnnotatedPdf(options = {}) {
+    const progressNotice = options.notice !== false ? new import_obsidian.Notice(uiText("\u6B63\u5728\u5BFC\u51FA\u70E7\u5F55 PDF...", "Exporting burned-in PDF..."), 0) : null;
     try {
-      if (options.notice !== false) {
-        new import_obsidian.Notice(uiText("\u6B63\u5728\u5BFC\u51FA PDF...", "Exporting PDF..."));
+      if (progressNotice) {
+        await waitForUiPaint();
       }
       this.commitNativeTextEditor();
       this.redrawAll();
@@ -55710,20 +55771,38 @@ var InkSession = class {
       const saved = await pdf.save({ useObjectStreams: true });
       const buffer2 = new ArrayBuffer(saved.byteLength);
       new Uint8Array(buffer2).set(saved);
-      if (options.notice !== false) {
-        new import_obsidian.Notice(uiText(`\u6B63\u5728\u5199\u5165 PDF\uFF1A${targetPath}`, `Writing PDF: ${targetPath}`));
-      }
-      await this.plugin.app.vault.adapter.writeBinary(targetPath, buffer2);
+      const exportedFile = await this.plugin.app.vault.createBinary(targetPath, buffer2);
+      const opened = await this.openExportedPdfIfEnabled(exportedFile);
       const shared = options.share === false ? false : await trySharePdf(targetPath.split("/").pop() ?? targetFile.name, saved);
-      if (options.notice !== false) {
-        new import_obsidian.Notice(shared ? uiText(`\u5DF2\u751F\u6210\u5E76\u5206\u4EAB ${targetPath}`, `Generated and shared ${targetPath}`) : uiText(`\u5DF2\u751F\u6210 PDF\uFF1A${targetPath}`, `Generated PDF: ${targetPath}`));
+      if (progressNotice) {
+        progressNotice.setMessage(
+          opened ? uiText(`\u5DF2\u5BFC\u51FA\u5E76\u6253\u5F00\uFF1A${targetPath}`, `Exported and opened: ${targetPath}`) : shared ? uiText(`\u5DF2\u5BFC\u51FA\u5E76\u5206\u4EAB\uFF1A${targetPath}`, `Exported and shared: ${targetPath}`) : uiText(`\u5DF2\u5BFC\u51FA\uFF1A${targetPath}`, `Exported: ${targetPath}`)
+        );
+        window.setTimeout(() => progressNotice.hide(), 4500);
       }
       return targetPath;
     } catch (error2) {
       console.error(error2);
       const message = error2 instanceof Error ? error2.message : String(error2);
-      new import_obsidian.Notice(uiText(`\u5BFC\u51FA PDF \u5931\u8D25\uFF1A${message}`, `PDF export failed: ${message}`));
+      if (progressNotice) {
+        progressNotice.setMessage(uiText(`\u5BFC\u51FA PDF \u5931\u8D25\uFF1A${message}`, `PDF export failed: ${message}`));
+        window.setTimeout(() => progressNotice.hide(), 7e3);
+      } else {
+        new import_obsidian.Notice(uiText(`\u5BFC\u51FA PDF \u5931\u8D25\uFF1A${message}`, `PDF export failed: ${message}`));
+      }
       return null;
+    }
+  }
+  async openExportedPdfIfEnabled(file) {
+    if (!this.plugin.settings.openBurnedPdfAfterExport) {
+      return false;
+    }
+    try {
+      await this.plugin.app.workspace.getLeaf(false).openFile(file);
+      return true;
+    } catch (error2) {
+      console.error(error2);
+      return false;
     }
   }
   async redactCoveredPagesIntoCurrentPdf() {
@@ -57142,8 +57221,12 @@ function normalizeObsidianLink(raw) {
 }
 function buildPdfSelectionWikilink(file, pageIndex, text) {
   const target = sanitizeWikilinkTarget(`${file.path}#page=${pageIndex + 1}`);
-  const alias = sanitizeWikilinkAlias(`${truncateForLinkAlias(text)} - ${file.basename}`);
+  const alias = sanitizeWikilinkAlias(`${truncateForLinkAlias(text)} - ${getPdfDisplayName(file)}`);
   return `[[${target}|${alias}]]`;
+}
+function getPdfDisplayName(file) {
+  const name5 = file.name.trim() || file.basename;
+  return /\.pdf$/i.test(name5) ? name5 : `${file.basename || name5}.pdf`;
 }
 function sanitizeWikilinkTarget(value) {
   return value.replace(/\|/g, "\\|").replace(/]/g, "");

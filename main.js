@@ -52645,6 +52645,8 @@ var NATIVE_TEXT_SELECTION_TOUCH_LIMITS = {
   maxHeightRatio: 0.34,
   maxRects: 36
 };
+var BUILTIN_ALIPAY_QR_PATH = ".obsidian/plugins/pdftion/assets/alipay.png";
+var BUILTIN_BINANCE_QR_PATH = ".obsidian/plugins/pdftion/assets/binance.png";
 var DEFAULT_SETTINGS = {
   autoEnableAnnotationToolbar: false,
   boostPdfMenus: true,
@@ -52654,6 +52656,10 @@ var DEFAULT_SETTINGS = {
   lastCropTop: 0.04,
   nativeTextSelectionMenuAttachedToText: true,
   openBurnedPdfAfterExport: true,
+  paymentQrOneLabel: "\u652F\u4ED8\u5B9D",
+  paymentQrOnePath: "builtin:alipay",
+  paymentQrTwoLabel: "\u5E01\u5B89",
+  paymentQrTwoPath: "builtin:binance",
   toolbarButtonSize: 25,
   toolbarMaxWidth: 640,
   toolbarTopOffset: 0
@@ -53462,7 +53468,7 @@ var PdftionSettingTab = class extends import_obsidian.PluginSettingTab {
   display() {
     const { containerEl } = this;
     containerEl.replaceChildren();
-    new import_obsidian.Setting(containerEl).setName(uiText("Pdftion \u8BBE\u7F6E", "Pdftion settings")).setHeading();
+    containerEl.createEl("h2", { text: uiText("Pdftion \u8BBE\u7F6E", "Pdftion settings") });
     this.addSection(uiText("\u5BFC\u51FA", "Export"));
     new import_obsidian.Setting(containerEl).setName(uiText("\u5BFC\u51FA\u540E\u81EA\u52A8\u6253\u5F00", "Open after PDF export")).setDesc(uiText("\u5BFC\u51FA\u70E7\u5F55 PDF \u540E\u81EA\u52A8\u6253\u5F00\u751F\u6210\u7684 PDF\u3002", "Automatically open the generated burned-in PDF after export.")).addToggle((toggle) => {
       toggle.setValue(this.plugin.settings.openBurnedPdfAfterExport).onChange(async (value) => {
@@ -53514,9 +53520,11 @@ var PdftionSettingTab = class extends import_obsidian.PluginSettingTab {
       "Pdftion \u4F1A\u81EA\u52A8\u4FDD\u5B58\u53EF\u7F16\u8F91\u6279\u6CE8\u6570\u636E\uFF0C\u5E76\u5728\u7A97\u53E3\u66B4\u9732 PdftionAI / __PDftionAI__\uFF0C\u65B9\u4FBF\u672C\u5730\u811A\u672C\u6216 AI \u8BFB\u53D6\u3001\u7EDF\u8BA1\u548C\u64CD\u4F5C\u5F53\u524D PDF \u6279\u6CE8\u3002",
       "Pdftion auto-saves editable annotation data and exposes PdftionAI / __PDftionAI__ on the window for local scripts or AI agents to inspect, summarize, and operate the active PDF annotations."
     );
+    this.addSection(uiText("\u652F\u6301\u4F5C\u8005", "Support the author"));
+    this.renderPaymentQrCodes(containerEl);
   }
   addSection(title2) {
-    new import_obsidian.Setting(this.containerEl).setName(title2).setHeading().settingEl.classList.add("pdftion-settings-section");
+    this.containerEl.createEl("h3", { cls: "pdftion-settings-section", text: title2 });
   }
   addToggleSetting(name5, desc, key2) {
     new import_obsidian.Setting(this.containerEl).setName(name5).setDesc(desc).addToggle((toggle) => {
@@ -53541,6 +53549,65 @@ var PdftionSettingTab = class extends import_obsidian.PluginSettingTab {
       text.inputEl.max = String(max2);
     });
   }
+  addTextSetting(name5, placeholder, key2) {
+    new import_obsidian.Setting(this.containerEl).setName(name5).addText((text) => {
+      text.setPlaceholder(placeholder).setValue(this.plugin.settings[key2]).onChange(async (value) => {
+        this.plugin.settings[key2] = value.trim();
+        await this.plugin.saveSettings();
+      });
+    });
+  }
+  renderPaymentQrCodes(containerEl) {
+    const wrap = containerEl.createDiv({ cls: "pdftion-payment-grid" });
+    this.renderPaymentQrCode(wrap, this.plugin.settings.paymentQrOneLabel, this.plugin.settings.paymentQrOnePath);
+    this.renderPaymentQrCode(wrap, this.plugin.settings.paymentQrTwoLabel, this.plugin.settings.paymentQrTwoPath);
+  }
+  renderPaymentQrCode(containerEl, label, rawPath) {
+    const card = containerEl.createDiv({ cls: "pdftion-payment-card" });
+    const title2 = card.createDiv({ cls: "pdftion-payment-title" });
+    title2.textContent = label || uiText("\u6536\u6B3E\u7801", "Payment QR");
+    const src2 = this.getPaymentImageSource(rawPath);
+    if (src2) {
+      const image = card.createEl("img", {
+        attr: {
+          alt: title2.textContent,
+          loading: "lazy",
+          src: src2
+        },
+        cls: "pdftion-payment-image"
+      });
+      image.addEventListener("error", () => {
+        image.remove();
+        this.renderPaymentPlaceholder(card, uiText("\u56FE\u7247\u65E0\u6CD5\u52A0\u8F7D", "Image could not be loaded"));
+      });
+      return;
+    }
+    this.renderPaymentPlaceholder(card, uiText("\u672A\u914D\u7F6E\u56FE\u7247", "No image configured"));
+  }
+  renderPaymentPlaceholder(card, message) {
+    const placeholder = card.createDiv({ cls: "pdftion-payment-placeholder" });
+    (0, import_obsidian.setIcon)(placeholder, "qr-code");
+    placeholder.createSpan({ text: message });
+  }
+  getPaymentImageSource(rawPath) {
+    const path = rawPath.trim();
+    if (!path) {
+      return null;
+    }
+    if (path === "builtin:alipay") {
+      return this.plugin.app.vault.adapter.getResourcePath(BUILTIN_ALIPAY_QR_PATH);
+    }
+    if (path === "builtin:binance") {
+      return this.plugin.app.vault.adapter.getResourcePath(BUILTIN_BINANCE_QR_PATH);
+    }
+    if (/^(https?:|data:image\/)/i.test(path)) {
+      return path;
+    }
+    if (/^[a-z]:[\\/]/i.test(path)) {
+      return `file:///${path.replace(/\\/g, "/")}`;
+    }
+    return this.plugin.app.vault.adapter.getResourcePath(path.replace(/\\/g, "/").replace(/^\/+/, ""));
+  }
 };
 function normalizeSettings(data2) {
   const record = data2 && typeof data2 === "object" ? data2 : {};
@@ -53553,6 +53620,10 @@ function normalizeSettings(data2) {
     lastCropTop: normalizeNumberSetting(record.lastCropTop, DEFAULT_SETTINGS.lastCropTop, 0, 0.45, 1e-3),
     nativeTextSelectionMenuAttachedToText: typeof record.nativeTextSelectionMenuAttachedToText === "boolean" ? record.nativeTextSelectionMenuAttachedToText : DEFAULT_SETTINGS.nativeTextSelectionMenuAttachedToText,
     openBurnedPdfAfterExport: typeof record.openBurnedPdfAfterExport === "boolean" ? record.openBurnedPdfAfterExport : DEFAULT_SETTINGS.openBurnedPdfAfterExport,
+    paymentQrOneLabel: normalizeStringSetting(record.paymentQrOneLabel, DEFAULT_SETTINGS.paymentQrOneLabel),
+    paymentQrOnePath: normalizeStringSetting(record.paymentQrOnePath, DEFAULT_SETTINGS.paymentQrOnePath),
+    paymentQrTwoLabel: normalizeStringSetting(record.paymentQrTwoLabel, DEFAULT_SETTINGS.paymentQrTwoLabel),
+    paymentQrTwoPath: normalizeStringSetting(record.paymentQrTwoPath, DEFAULT_SETTINGS.paymentQrTwoPath),
     toolbarButtonSize: normalizeNumberSetting(record.toolbarButtonSize, DEFAULT_SETTINGS.toolbarButtonSize, 18, 44),
     toolbarMaxWidth: normalizeNumberSetting(record.toolbarMaxWidth, DEFAULT_SETTINGS.toolbarMaxWidth, 360, 1200),
     toolbarTopOffset: normalizeNumberSetting(record.toolbarTopOffset, DEFAULT_SETTINGS.toolbarTopOffset, 0, 160)
@@ -53564,6 +53635,9 @@ function normalizeNumberSetting(value, fallback, min, max2, step = 1) {
     return fallback;
   }
   return clamp(Math.round(numeric / step) * step, min, max2);
+}
+function normalizeStringSetting(value, fallback) {
+  return typeof value === "string" && value.trim() ? value.trim() : fallback;
 }
 var InkSession = class {
   constructor(plugin, leaf, file, rootEl) {

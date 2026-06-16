@@ -537,6 +537,9 @@ const NATIVE_TEXT_SELECTION_TOUCH_LIMITS = {
   maxRects: 36
 };
 
+const BUILTIN_ALIPAY_QR_PATH = ".obsidian/plugins/pdftion/assets/alipay.png";
+const BUILTIN_BINANCE_QR_PATH = ".obsidian/plugins/pdftion/assets/binance.png";
+
 interface PdftionSettings {
   autoEnableAnnotationToolbar: boolean;
   boostPdfMenus: boolean;
@@ -546,6 +549,10 @@ interface PdftionSettings {
   lastCropTop: number;
   nativeTextSelectionMenuAttachedToText: boolean;
   openBurnedPdfAfterExport: boolean;
+  paymentQrOneLabel: string;
+  paymentQrOnePath: string;
+  paymentQrTwoLabel: string;
+  paymentQrTwoPath: string;
   toolbarButtonSize: number;
   toolbarMaxWidth: number;
   toolbarTopOffset: number;
@@ -560,6 +567,10 @@ const DEFAULT_SETTINGS: PdftionSettings = {
   lastCropTop: 0.04,
   nativeTextSelectionMenuAttachedToText: true,
   openBurnedPdfAfterExport: true,
+  paymentQrOneLabel: "支付宝",
+  paymentQrOnePath: "builtin:alipay",
+  paymentQrTwoLabel: "币安",
+  paymentQrTwoPath: "builtin:binance",
   toolbarButtonSize: 25,
   toolbarMaxWidth: 640,
   toolbarTopOffset: 0
@@ -1796,7 +1807,7 @@ class PdftionSettingTab extends PluginSettingTab {
     const { containerEl } = this;
     containerEl.replaceChildren();
 
-    new Setting(containerEl).setName(uiText("Pdftion 设置", "Pdftion settings")).setHeading();
+    containerEl.createEl("h2", { text: uiText("Pdftion 设置", "Pdftion settings") });
 
     this.addSection(uiText("导出", "Export"));
     new Setting(containerEl)
@@ -1857,10 +1868,13 @@ class PdftionSettingTab extends PluginSettingTab {
       "Pdftion 会自动保存可编辑批注数据，并在窗口暴露 PdftionAI / __PDftionAI__，方便本地脚本或 AI 读取、统计和操作当前 PDF 批注。",
       "Pdftion auto-saves editable annotation data and exposes PdftionAI / __PDftionAI__ on the window for local scripts or AI agents to inspect, summarize, and operate the active PDF annotations."
     );
+
+    this.addSection(uiText("支持作者", "Support the author"));
+    this.renderPaymentQrCodes(containerEl);
   }
 
   private addSection(title: string): void {
-    new Setting(this.containerEl).setName(title).setHeading().settingEl.classList.add("pdftion-settings-section");
+    this.containerEl.createEl("h3", { cls: "pdftion-settings-section", text: title });
   }
 
   private addToggleSetting(
@@ -1908,6 +1922,78 @@ class PdftionSettingTab extends PluginSettingTab {
       });
   }
 
+  private addTextSetting(
+    name: string,
+    placeholder: string,
+    key: { [K in keyof PdftionSettings]: PdftionSettings[K] extends string ? K : never }[keyof PdftionSettings]
+  ): void {
+    new Setting(this.containerEl)
+      .setName(name)
+      .addText((text) => {
+        text
+          .setPlaceholder(placeholder)
+          .setValue(this.plugin.settings[key])
+          .onChange(async (value) => {
+            this.plugin.settings[key] = value.trim();
+            await this.plugin.saveSettings();
+          });
+      });
+  }
+
+  private renderPaymentQrCodes(containerEl: HTMLElement): void {
+    const wrap = containerEl.createDiv({ cls: "pdftion-payment-grid" });
+    this.renderPaymentQrCode(wrap, this.plugin.settings.paymentQrOneLabel, this.plugin.settings.paymentQrOnePath);
+    this.renderPaymentQrCode(wrap, this.plugin.settings.paymentQrTwoLabel, this.plugin.settings.paymentQrTwoPath);
+  }
+
+  private renderPaymentQrCode(containerEl: HTMLElement, label: string, rawPath: string): void {
+    const card = containerEl.createDiv({ cls: "pdftion-payment-card" });
+    const title = card.createDiv({ cls: "pdftion-payment-title" });
+    title.textContent = label || uiText("收款码", "Payment QR");
+    const src = this.getPaymentImageSource(rawPath);
+    if (src) {
+      const image = card.createEl("img", {
+        attr: {
+          alt: title.textContent,
+          loading: "lazy",
+          src
+        },
+        cls: "pdftion-payment-image"
+      });
+      image.addEventListener("error", () => {
+        image.remove();
+        this.renderPaymentPlaceholder(card, uiText("图片无法加载", "Image could not be loaded"));
+      });
+      return;
+    }
+    this.renderPaymentPlaceholder(card, uiText("未配置图片", "No image configured"));
+  }
+
+  private renderPaymentPlaceholder(card: HTMLElement, message: string): void {
+    const placeholder = card.createDiv({ cls: "pdftion-payment-placeholder" });
+    setIcon(placeholder, "qr-code");
+    placeholder.createSpan({ text: message });
+  }
+
+  private getPaymentImageSource(rawPath: string): string | null {
+    const path = rawPath.trim();
+    if (!path) {
+      return null;
+    }
+    if (path === "builtin:alipay") {
+      return this.plugin.app.vault.adapter.getResourcePath(BUILTIN_ALIPAY_QR_PATH);
+    }
+    if (path === "builtin:binance") {
+      return this.plugin.app.vault.adapter.getResourcePath(BUILTIN_BINANCE_QR_PATH);
+    }
+    if (/^(https?:|data:image\/)/i.test(path)) {
+      return path;
+    }
+    if (/^[a-z]:[\\/]/i.test(path)) {
+      return `file:///${path.replace(/\\/g, "/")}`;
+    }
+    return this.plugin.app.vault.adapter.getResourcePath(path.replace(/\\/g, "/").replace(/^\/+/, ""));
+  }
 }
 
 function normalizeSettings(data: unknown): PdftionSettings {
@@ -1929,6 +2015,10 @@ function normalizeSettings(data: unknown): PdftionSettings {
     openBurnedPdfAfterExport: typeof record.openBurnedPdfAfterExport === "boolean"
       ? record.openBurnedPdfAfterExport
       : DEFAULT_SETTINGS.openBurnedPdfAfterExport,
+    paymentQrOneLabel: normalizeStringSetting(record.paymentQrOneLabel, DEFAULT_SETTINGS.paymentQrOneLabel),
+    paymentQrOnePath: normalizeStringSetting(record.paymentQrOnePath, DEFAULT_SETTINGS.paymentQrOnePath),
+    paymentQrTwoLabel: normalizeStringSetting(record.paymentQrTwoLabel, DEFAULT_SETTINGS.paymentQrTwoLabel),
+    paymentQrTwoPath: normalizeStringSetting(record.paymentQrTwoPath, DEFAULT_SETTINGS.paymentQrTwoPath),
     toolbarButtonSize: normalizeNumberSetting(record.toolbarButtonSize, DEFAULT_SETTINGS.toolbarButtonSize, 18, 44),
     toolbarMaxWidth: normalizeNumberSetting(record.toolbarMaxWidth, DEFAULT_SETTINGS.toolbarMaxWidth, 360, 1200),
     toolbarTopOffset: normalizeNumberSetting(record.toolbarTopOffset, DEFAULT_SETTINGS.toolbarTopOffset, 0, 160)
@@ -1941,6 +2031,10 @@ function normalizeNumberSetting(value: unknown, fallback: number, min: number, m
     return fallback;
   }
   return clamp(Math.round(numeric / step) * step, min, max);
+}
+
+function normalizeStringSetting(value: unknown, fallback: string): string {
+  return typeof value === "string" && value.trim() ? value.trim() : fallback;
 }
 
 class InkSession {
@@ -7583,6 +7677,22 @@ function parsePageOrder(raw: string, pageCount: number): number[] | null {
     return null;
   }
   return result;
+}
+
+function parseCropInput(raw: string): { bottom: number; left: number; right: number; top: number } | null {
+  const parts = raw.split(/[,\s]+/).map((part) => part.trim()).filter(Boolean);
+  if (parts.length !== 4) {
+    return null;
+  }
+  const values = parts.map(parseCropValue);
+  if (values.some((value) => value === null)) {
+    return null;
+  }
+  const [left, top, right, bottom] = values as number[];
+  if (left + right >= 0.9 || top + bottom >= 0.9) {
+    return null;
+  }
+  return { bottom, left, right, top };
 }
 
 function parseCropValue(raw: string): number | null {

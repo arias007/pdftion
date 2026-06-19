@@ -553,6 +553,18 @@ interface PdftionSettings {
   paymentQrOnePath: string;
   paymentQrTwoLabel: string;
   paymentQrTwoPath: string;
+  eraserWidth: number;
+  highlightColor: string;
+  highlightOpacity: number;
+  highlightWidth: number;
+  nativeTextHighlightColor: string;
+  penColor: string;
+  penOpacity: number;
+  penWidth: number;
+  textColor: string;
+  textFontFamily: string;
+  textFontSize: number;
+  textOpacity: number;
   toolbarButtonSize: number;
   toolbarMaxWidth: number;
   toolbarTopOffset: number;
@@ -571,6 +583,18 @@ const DEFAULT_SETTINGS: PdftionSettings = {
   paymentQrOnePath: "builtin:alipay",
   paymentQrTwoLabel: "币安",
   paymentQrTwoPath: "builtin:binance",
+  eraserWidth: 14,
+  highlightColor: "#fab005",
+  highlightOpacity: 0.36,
+  highlightWidth: 9,
+  nativeTextHighlightColor: "#ffd43b",
+  penColor: "#d9480f",
+  penOpacity: 1,
+  penWidth: 3,
+  textColor: "#000000",
+  textFontFamily: "sans-serif",
+  textFontSize: 18,
+  textOpacity: 1,
   toolbarButtonSize: 25,
   toolbarMaxWidth: 640,
   toolbarTopOffset: 0
@@ -2019,6 +2043,18 @@ function normalizeSettings(data: unknown): PdftionSettings {
     paymentQrOnePath: normalizeStringSetting(record.paymentQrOnePath, DEFAULT_SETTINGS.paymentQrOnePath),
     paymentQrTwoLabel: normalizeStringSetting(record.paymentQrTwoLabel, DEFAULT_SETTINGS.paymentQrTwoLabel),
     paymentQrTwoPath: normalizeStringSetting(record.paymentQrTwoPath, DEFAULT_SETTINGS.paymentQrTwoPath),
+    eraserWidth: normalizeNumberSetting(record.eraserWidth, DEFAULT_SETTINGS.eraserWidth, 2, 120, 0.5),
+    highlightColor: normalizeColorSetting(record.highlightColor, DEFAULT_SETTINGS.highlightColor),
+    highlightOpacity: normalizeNumberSetting(record.highlightOpacity, DEFAULT_SETTINGS.highlightOpacity, 0.05, 1, 0.05),
+    highlightWidth: normalizeNumberSetting(record.highlightWidth, DEFAULT_SETTINGS.highlightWidth, 2, 96, 0.5),
+    nativeTextHighlightColor: normalizeColorSetting(record.nativeTextHighlightColor, DEFAULT_SETTINGS.nativeTextHighlightColor),
+    penColor: normalizeColorSetting(record.penColor, DEFAULT_SETTINGS.penColor),
+    penOpacity: normalizeNumberSetting(record.penOpacity, DEFAULT_SETTINGS.penOpacity, 0.05, 1, 0.05),
+    penWidth: normalizeNumberSetting(record.penWidth, DEFAULT_SETTINGS.penWidth, 0.5, 72, 0.5),
+    textColor: normalizeColorSetting(record.textColor, DEFAULT_SETTINGS.textColor),
+    textFontFamily: normalizeFontFamilySetting(record.textFontFamily, DEFAULT_SETTINGS.textFontFamily),
+    textFontSize: normalizeNumberSetting(record.textFontSize, DEFAULT_SETTINGS.textFontSize, 6, 120, 1),
+    textOpacity: normalizeNumberSetting(record.textOpacity, DEFAULT_SETTINGS.textOpacity, 0.05, 1, 0.05),
     toolbarButtonSize: normalizeNumberSetting(record.toolbarButtonSize, DEFAULT_SETTINGS.toolbarButtonSize, 18, 44),
     toolbarMaxWidth: normalizeNumberSetting(record.toolbarMaxWidth, DEFAULT_SETTINGS.toolbarMaxWidth, 360, 1200),
     toolbarTopOffset: normalizeNumberSetting(record.toolbarTopOffset, DEFAULT_SETTINGS.toolbarTopOffset, 0, 160)
@@ -2035,6 +2071,17 @@ function normalizeNumberSetting(value: unknown, fallback: number, min: number, m
 
 function normalizeStringSetting(value: unknown, fallback: string): string {
   return typeof value === "string" && value.trim() ? value.trim() : fallback;
+}
+
+function normalizeColorSetting(value: unknown, fallback: string): string {
+  return typeof value === "string" ? normalizeHexColor(value) : fallback;
+}
+
+function normalizeFontFamilySetting(value: unknown, fallback: string): string {
+  if (typeof value !== "string") {
+    return fallback;
+  }
+  return TEXT_FONTS.some((font) => font.value === value) ? value : fallback;
 }
 
 class InkSession {
@@ -2054,20 +2101,21 @@ class InkSession {
   private annotationLoadToken = 0;
   private pendingSaveAfterCurrentSave = false;
   private palette: HTMLElement | null = null;
-  private penColor = "#d9480f";
-  private penOpacity = 1;
-  private penWidth = 3;
+  private penColor = DEFAULT_SETTINGS.penColor;
+  private penOpacity = DEFAULT_SETTINGS.penOpacity;
+  private penWidth = DEFAULT_SETTINGS.penWidth;
   private nativeTextEditor: HTMLTextAreaElement | null = null;
   private nativeTextEditorCover: InkCover | null = null;
-  private eraserWidth = 14;
-  private textColor = "#000000";
-  private textFontFamily = "sans-serif";
-  private textFontSize = 18;
-  private textOpacity = 1;
+  private eraserWidth = DEFAULT_SETTINGS.eraserWidth;
+  private textColor = DEFAULT_SETTINGS.textColor;
+  private textFontFamily = DEFAULT_SETTINGS.textFontFamily;
+  private textFontSize = DEFAULT_SETTINGS.textFontSize;
+  private textOpacity = DEFAULT_SETTINGS.textOpacity;
   private coverHistory: InkCover[] = [];
   private loadedAnnotationState = false;
   private redoStack: InkElement[] = [];
   private saveTimer: number | null = null;
+  private settingsSaveTimer: number | null = null;
   private scanTimer: number | null = null;
   private healthTimer: number | null = null;
   private selectionDrag: SelectionDragState | null = null;
@@ -2091,10 +2139,10 @@ class InkSession {
   private savedInkIsBurnedIntoPdf = false;
   private savedTextIsBurnedIntoPdf = false;
   private touchScroll: TouchScrollState | null = null;
-  private highlightColor = "#fab005";
-  private highlightOpacity = 0.36;
-  private highlightWidth = 9;
-  private nativeTextHighlightColor = "#ffd43b";
+  private highlightColor = DEFAULT_SETTINGS.highlightColor;
+  private highlightOpacity = DEFAULT_SETTINGS.highlightOpacity;
+  private highlightWidth = DEFAULT_SETTINGS.highlightWidth;
+  private nativeTextHighlightColor = DEFAULT_SETTINGS.nativeTextHighlightColor;
 
   constructor(
     private plugin: PdftionPlugin,
@@ -2102,6 +2150,7 @@ class InkSession {
     private file: TFile,
     private rootEl: HTMLElement
   ) {
+    this.applyToolSettingsFromPlugin();
     this.rootEl.classList.add("pdftion-root");
     this.injectButton();
     void this.loadEditableAnnotations();
@@ -2133,6 +2182,7 @@ class InkSession {
   destroy(): void {
     this.flushSoon();
     this.clearAutoSaveTimer();
+    this.clearToolSettingsSaveTimer();
     this.clearScanTimer();
     this.stopOverlayHealthCheck();
     this.mutationObserver.disconnect();
@@ -3593,6 +3643,7 @@ class InkSession {
     input.addEventListener("input", () => {
       const color = normalizeHexColor(input.value);
       this.nativeTextHighlightColor = color;
+      this.scheduleToolSettingsSave();
       this.applyNativeTextHighlight(color);
     });
     button.addEventListener("click", () => input.click());
@@ -3667,6 +3718,7 @@ class InkSession {
     }
 
     this.nativeTextHighlightColor = normalizeHexColor(color);
+    this.scheduleToolSettingsSave();
     for (const object of info.objects) {
       this.coverHistory.push({
         color: normalizeHexColor(color),
@@ -3935,6 +3987,7 @@ class InkSession {
       panel.appendChild(
         this.createPaletteRange(uiText("橡皮", "Eraser"), "eraser", "pdftion-width-eraser", 2, 120, 1, this.eraserWidth, (value) => {
           this.eraserWidth = value;
+          this.scheduleToolSettingsSave();
         })
       );
     } else if (this.tool === "highlight") {
@@ -4247,6 +4300,7 @@ class InkSession {
   private setTextPaletteColor(color: string): void {
     color = normalizeHexColor(color);
     this.textColor = color;
+    this.scheduleToolSettingsSave();
     this.updateSelectedTextElements((text) => {
       text.color = color;
     });
@@ -4254,6 +4308,7 @@ class InkSession {
 
   private setTextPaletteFontSize(fontSize: number): void {
     this.textFontSize = fontSize;
+    this.scheduleToolSettingsSave();
     this.updateSelectedTextElements((text) => {
       text.fontSize = fontSize;
     });
@@ -4261,6 +4316,7 @@ class InkSession {
 
   private setTextPaletteFontFamily(fontFamily: string): void {
     this.textFontFamily = fontFamily;
+    this.scheduleToolSettingsSave();
     this.updateSelectedTextElements((text) => {
       text.fontFamily = fontFamily;
     });
@@ -4268,6 +4324,7 @@ class InkSession {
 
   private setTextPaletteOpacity(opacity: number): void {
     this.textOpacity = opacity;
+    this.scheduleToolSettingsSave();
     this.updateSelectedTextElements((text) => {
       text.opacity = opacity;
     });
@@ -4735,6 +4792,21 @@ class InkSession {
     return tool === "highlight" ? this.highlightColor : this.penColor;
   }
 
+  private applyToolSettingsFromPlugin(): void {
+    this.penColor = this.plugin.settings.penColor;
+    this.penOpacity = this.plugin.settings.penOpacity;
+    this.penWidth = this.plugin.settings.penWidth;
+    this.highlightColor = this.plugin.settings.highlightColor;
+    this.highlightOpacity = this.plugin.settings.highlightOpacity;
+    this.highlightWidth = this.plugin.settings.highlightWidth;
+    this.eraserWidth = this.plugin.settings.eraserWidth;
+    this.textColor = this.plugin.settings.textColor;
+    this.textFontFamily = this.plugin.settings.textFontFamily;
+    this.textFontSize = this.plugin.settings.textFontSize;
+    this.textOpacity = this.plugin.settings.textOpacity;
+    this.nativeTextHighlightColor = this.plugin.settings.nativeTextHighlightColor;
+  }
+
   private setToolColor(tool: "pen" | "highlight", color: string): void {
     color = normalizeHexColor(color);
     if (tool === "highlight") {
@@ -4742,6 +4814,7 @@ class InkSession {
     } else {
       this.penColor = color;
     }
+    this.scheduleToolSettingsSave();
   }
 
   private getSelectedPaletteColor(): string {
@@ -4780,6 +4853,7 @@ class InkSession {
     } else {
       this.penOpacity = opacity;
     }
+    this.scheduleToolSettingsSave();
   }
 
   private getToolWidth(tool: "pen" | "highlight"): number {
@@ -4792,6 +4866,7 @@ class InkSession {
     } else {
       this.penWidth = width;
     }
+    this.scheduleToolSettingsSave();
   }
 
   private onPointerMove(event: PointerEvent, overlay: PageOverlay): void {
@@ -7150,6 +7225,34 @@ class InkSession {
     if (this.saveTimer !== null) {
       window.clearTimeout(this.saveTimer);
       this.saveTimer = null;
+    }
+  }
+
+  private scheduleToolSettingsSave(delay = 220): void {
+    this.plugin.settings.penColor = normalizeHexColor(this.penColor);
+    this.plugin.settings.penOpacity = clamp(this.penOpacity, 0.05, 1);
+    this.plugin.settings.penWidth = clamp(this.penWidth, 0.5, 72);
+    this.plugin.settings.highlightColor = normalizeHexColor(this.highlightColor);
+    this.plugin.settings.highlightOpacity = clamp(this.highlightOpacity, 0.05, 1);
+    this.plugin.settings.highlightWidth = clamp(this.highlightWidth, 2, 96);
+    this.plugin.settings.eraserWidth = clamp(this.eraserWidth, 2, 120);
+    this.plugin.settings.textColor = normalizeHexColor(this.textColor);
+    this.plugin.settings.textFontFamily = this.textFontFamily;
+    this.plugin.settings.textFontSize = clamp(this.textFontSize, 6, 120);
+    this.plugin.settings.textOpacity = clamp(this.textOpacity, 0.05, 1);
+    this.plugin.settings.nativeTextHighlightColor = normalizeHexColor(this.nativeTextHighlightColor);
+
+    this.clearToolSettingsSaveTimer();
+    this.settingsSaveTimer = window.setTimeout(() => {
+      this.settingsSaveTimer = null;
+      void this.plugin.saveSettings();
+    }, delay);
+  }
+
+  private clearToolSettingsSaveTimer(): void {
+    if (this.settingsSaveTimer !== null) {
+      window.clearTimeout(this.settingsSaveTimer);
+      this.settingsSaveTimer = null;
     }
   }
 

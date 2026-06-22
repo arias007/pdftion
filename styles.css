@@ -100,6 +100,13 @@ body.pdftion-menu-boost .pdftion-embed-actions .clickable-icon {
   min-width: 34px;
 }
 
+.pdftion-sr-inline-actions {
+  bottom: 10px;
+  left: auto;
+  right: 10px;
+  top: auto;
+}
+
 .pdftion-root {
   position: relative;
 }
@@ -147,6 +154,43 @@ body.pdftion-menu-boost .pdftion-embed-actions .clickable-icon {
 
 .pdftion-enabled .pdftion-canvas {
   pointer-events: auto;
+}
+
+.pdftion-enabled .annotationLayer,
+.pdftion-enabled .annotationEditorLayer {
+  pointer-events: none;
+  visibility: hidden;
+}
+
+.pdftion-hide-native-ink-layer .annotationLayer,
+.pdftion-hide-native-ink-layer .annotationEditorLayer {
+  opacity: 0 !important;
+  pointer-events: none !important;
+  visibility: hidden !important;
+}
+
+body.pdftion-editing-active .annotationLayer,
+body.pdftion-editing-active .annotationEditorLayer,
+body.pdftion-editing-active [data-annotation-id],
+body.pdftion-editing-active [data-pdf-annotation-id],
+body.pdftion-editing-active .popupAnnotation,
+body.pdftion-editing-active .pdf-annotation-popup,
+body.pdftion-editing-active .pdfAnnotationPopup {
+  opacity: 0 !important;
+  pointer-events: none !important;
+  visibility: hidden !important;
+}
+
+body.pdftion-editing-active .annotationLayer .popupWrapper,
+body.pdftion-editing-active .annotationLayer .popup,
+body.pdftion-editing-active .annotationEditorLayer .popupWrapper,
+body.pdftion-editing-active .annotationEditorLayer .popup,
+body.pdftion-editing-active .popupAnnotation,
+body.pdftion-editing-active .pdf-annotation-popup,
+body.pdftion-editing-active .pdfAnnotationPopup {
+  display: none !important;
+  pointer-events: none !important;
+  visibility: hidden !important;
 }
 
 .pdftion-toolbar-host {

@@ -1,11 +1,11 @@
 import { Notice, Plugin, PluginSettingTab, Setting, TFile, WorkspaceLeaf, getLanguage, setIcon } from "obsidian";
 import * as fontkitModule from "@pdf-lib/fontkit";
-import { PDFDocument, degrees, rgb } from "pdf-lib";
+import { PDFArray, PDFDict, PDFDocument, PDFHexString, PDFName, PDFNumber, PDFString, degrees, rgb } from "pdf-lib";
 
 type ToolMode = "select" | "pen" | "highlight" | "eraser" | "text" | "cover" | "image-crop";
 type ResizeHandle = "nw" | "ne" | "sw" | "se";
 
-const AUTO_SAVE_IDLE_DELAY_MS = 1800;
+const AUTO_SAVE_IDLE_DELAY_MS = 5200;
 const AUTO_SAVE_CLOSE_DELAY_MS = 200;
 const OVERLAY_HEALTH_CHECK_MS = 5000;
 const PALETTE_COLORS = [
@@ -1026,8 +1026,12 @@ interface InkStroke {
   pageCssHeight: number;
   pageCssWidth: number;
   pageIndex: number;
+  externalDirty?: boolean;
+  pdfPoints?: InkPoint[];
+  pdfSaved?: boolean;
   points: InkPoint[];
   saved: boolean;
+  source?: "external-ink" | "pdftion";
   tool: Exclude<ToolMode, "eraser" | "select">;
   width: number;
 }
@@ -1206,6 +1210,7 @@ interface TouchScrollState {
 }
 
 interface SelectionDragState {
+  clearSelectionOnTap?: boolean;
   current: InkPoint;
   handle?: ResizeHandle;
   historyRecorded?: boolean;
@@ -1404,6 +1409,7 @@ export default class PdftionPlugin extends Plugin {
     }
     delete (activeWindow as unknown as Record<string, unknown>)[PDFTION_AI_API_NAME];
     getActiveBody().classList.remove("pdftion-menu-boost");
+    getActiveBody().classList.remove("pdftion-editing-active");
     getActiveBody().style.removeProperty("--pdftion-toolbar-button-size");
     getActiveBody().style.removeProperty("--pdftion-toolbar-max-width");
     getActiveBody().style.removeProperty("--pdftion-toolbar-top-offset");
@@ -1412,6 +1418,11 @@ export default class PdftionPlugin extends Plugin {
     }
     this.sessions.clear();
     this.clearSurfaceScanTimers();
+  }
+
+  refreshGlobalEditingClass(): void {
+    const hasActiveSession = Array.from(this.sessions.values()).some((session) => session.isEnabled());
+    getActiveBody().classList.toggle("pdftion-editing-active", hasActiveSession);
   }
 
   applyRuntimeSettings(): void {
@@ -1458,7 +1469,8 @@ export default class PdftionPlugin extends Plugin {
   async loadAnnotationState(file: TFile): Promise<{ elements: InkElement[]; overlayAnnotationsOnly: boolean; overlayTextOnly: boolean } | null> {
     const currentBytes = await this.app.vault.readBinary(file);
     const currentFingerprint = await fingerprintPdfBytes(currentBytes, file.stat.mtime);
-    const state = await this.loadVerifiedAnnotationRecord(file, currentFingerprint);
+    const loadedState = await this.loadVerifiedAnnotationRecord(file, currentFingerprint);
+    const state = loadedState ? await this.recoverPendingPdfInkAnnotations(file, loadedState, currentBytes) : null;
     if (!state) {
       return null;
     }
@@ -1467,6 +1479,59 @@ export default class PdftionPlugin extends Plugin {
       overlayAnnotationsOnly: state.overlayAnnotationsOnly === true,
       overlayTextOnly: state.overlayTextOnly === true
     };
+  }
+
+  private async recoverPendingPdfInkAnnotations(file: TFile, state: AnnotationStateRecord, currentBytes: ArrayBuffer): Promise<AnnotationStateRecord> {
+    const hasPendingInk = state.elements.some((element) => (
+      element.kind === "stroke" &&
+      element.pdfSaved !== true &&
+      element.points.length >= 2
+    ));
+    if (!hasPendingInk) {
+      return state;
+    }
+
+    try {
+      const pdf = await PDFDocument.load(currentBytes, { ignoreEncryption: true, updateMetadata: false });
+      await syncEditableInkAnnotationsOnPdf(pdf, state.elements);
+      const saved = await pdf.save({ addDefaultPage: false, useObjectStreams: false });
+      const buffer = new ArrayBuffer(saved.byteLength);
+      new Uint8Array(buffer).set(saved);
+      await this.app.vault.modifyBinary(file, buffer);
+
+      const elements = state.elements.map((element) => {
+        const cloned = cloneElement(element);
+        cloned.saved = true;
+        if (cloned.kind === "stroke") {
+          cloned.pdfSaved = true;
+          cloned.pdfPoints = cloned.points.map((point) => ({ ...point }));
+          cloned.externalDirty = false;
+          cloned.source = cloned.source ?? "pdftion";
+        }
+        return cloned;
+      });
+      await this.saveEditableAnnotationState(file, elements, buffer);
+      return {
+        ...state,
+        elements,
+        pdfFingerprint: await fingerprintPdfBytes(buffer, file.stat.mtime),
+        updatedAt: new Date().toISOString()
+      };
+    } catch (error) {
+      console.warn("pdftion could not recover pending PDF ink annotations; keeping editable state for retry.", error);
+      return state;
+    }
+  }
+
+  async loadPdfInkAnnotations(file: TFile): Promise<InkStroke[]> {
+    try {
+      const binary = await this.app.vault.readBinary(file);
+      const pdf = await PDFDocument.load(binary, { ignoreEncryption: true, updateMetadata: false });
+      return extractPdfInkAnnotations(pdf);
+    } catch (error) {
+      console.warn("pdftion could not import PDF ink annotations.", error);
+      return [];
+    }
   }
 
   async saveAnnotationState(file: TFile, elements: InkElement[], basePdfFingerprint: PdfFingerprint, savedBytes: ArrayBuffer): Promise<void> {
@@ -1478,6 +1543,28 @@ export default class PdftionPlugin extends Plugin {
       JSON.stringify(
         {
           basePdfFingerprint,
+          filePath: file.path,
+          overlayAnnotationsOnly: true,
+          overlayTextOnly: true,
+          pdfFingerprint,
+          updatedAt: new Date().toISOString(),
+          version: 6,
+          elements
+        },
+        null,
+        2
+      )
+    );
+  }
+
+  async saveEditableAnnotationState(file: TFile, elements: InkElement[], currentBytes: ArrayBuffer): Promise<void> {
+    const path = this.getAnnotationStatePath(file);
+    const pdfFingerprint = await fingerprintPdfBytes(currentBytes, file.stat.mtime);
+    await this.ensureAdapterFolder(path.substring(0, path.lastIndexOf("/")));
+    await this.app.vault.adapter.write(
+      path,
+      JSON.stringify(
+        {
           filePath: file.path,
           overlayAnnotationsOnly: true,
           overlayTextOnly: true,
@@ -1514,6 +1601,14 @@ export default class PdftionPlugin extends Plugin {
     await this.ensureAdapterFolder(path.substring(0, path.lastIndexOf("/")));
     await this.app.vault.adapter.writeBinary(path, currentBytes);
     return { bytes: currentBytes, fingerprint: currentFingerprint };
+  }
+
+  async replaceBasePdfBytes(file: TFile, currentBytes: ArrayBuffer): Promise<PdfFingerprint> {
+    const fingerprint = await fingerprintPdfBytes(currentBytes, file.stat.mtime);
+    const path = this.getBasePdfPath(file, fingerprint.sha256);
+    await this.ensureAdapterFolder(path.substring(0, path.lastIndexOf("/")));
+    await this.app.vault.adapter.writeBinary(path, currentBytes);
+    return fingerprint;
   }
 
   private getAnnotationStatePath(file: TFile): string {
@@ -1628,6 +1723,7 @@ export default class PdftionPlugin extends Plugin {
         this.sessions.delete(rootEl);
       }
     }
+    this.refreshGlobalEditingClass();
   }
 
   private findLeafForFile(file: TFile): WorkspaceLeaf | null {
@@ -2109,9 +2205,14 @@ class InkSession {
   private imageMenu: HTMLElement | null = null;
   private shareMenu: HTMLElement | null = null;
   private mutationObserver: MutationObserver;
+  private hiddenNativeAnnotationStyles = new Map<HTMLElement, string>();
+  private detachedInkEditPages = new Set<number>();
   private overlays = new Map<HTMLElement, PageOverlay>();
   private activeTouchId: number | null = null;
   private annotationLoadToken = 0;
+  private annotationLoadPromise: Promise<void> | null = null;
+  private detachingPdfInkForEditing = false;
+  private pendingEditableInkPrepareAfterSave = false;
   private pendingSaveAfterCurrentSave = false;
   private palette: HTMLElement | null = null;
   private penColor = DEFAULT_SETTINGS.penColor;
@@ -2133,6 +2234,9 @@ class InkSession {
   private settingsSaveTimer: number | null = null;
   private scanTimer: number | null = null;
   private healthTimer: number | null = null;
+  private inkPrepareTimer: number | null = null;
+  private inkPrepareTimerForce = false;
+  private nativeAnnotationPopupTimer: number | null = null;
   private selectionDrag: SelectionDragState | null = null;
   private nativeSelection: PdfNativeObject | null = null;
   private pendingImageCrop: PdfNativeObject | null = null;
@@ -2176,6 +2280,11 @@ class InkSession {
 
     this.mutationObserver = new MutationObserver((mutations) => {
       if (this.shouldScanForMutations(mutations)) {
+        if (this.enabled) {
+          this.updateExternalInkLayerState();
+          this.scheduleEditableInkPrepare(80, true);
+          window.setTimeout(() => this.scheduleEditableInkPrepare(0, true), 360);
+        }
         this.scheduleQuietScan();
       }
     });
@@ -2192,14 +2301,38 @@ class InkSession {
     this.rootEl.addEventListener("keyup", () => this.scheduleNativeTextSelectionMenu(20), {
       signal: this.nativeTextSelectionAbort.signal
     });
+    this.rootEl.addEventListener("scroll", () => this.scheduleEditableInkPrepare(180), {
+      capture: true,
+      passive: true,
+      signal: this.nativeTextSelectionAbort.signal
+    });
+    activeDocument.addEventListener("scroll", () => this.scheduleEditableInkPrepare(180), {
+      capture: true,
+      passive: true,
+      signal: this.nativeTextSelectionAbort.signal
+    });
+    for (const eventName of ["auxclick", "click", "contextmenu", "dblclick", "mousedown", "mousemove", "mouseover", "mouseup", "pointerdown", "pointermove", "pointerup", "touchstart"]) {
+      this.rootEl.addEventListener(eventName, (event) => this.blockNativePdfAnnotationEvent(event), {
+        capture: true,
+        signal: this.nativeTextSelectionAbort.signal
+      });
+      activeDocument.addEventListener(eventName, (event) => this.blockNativePdfAnnotationEvent(event), {
+        capture: true,
+        signal: this.nativeTextSelectionAbort.signal
+      });
+    }
   }
 
   destroy(): void {
     this.flushSoon();
+    this.enabled = false;
+    this.restoreHiddenNativeInkAnnotations();
     this.clearAutoSaveTimer();
     this.clearToolSettingsSaveTimer();
     this.clearScanTimer();
+    this.clearEditableInkPrepareTimer();
     this.stopOverlayHealthCheck();
+    this.stopNativeAnnotationPopupSuppressor();
     this.mutationObserver.disconnect();
     this.button?.remove();
     this.closeNativeTextEditor(false);
@@ -2217,11 +2350,16 @@ class InkSession {
     for (const overlay of this.overlays.values()) {
       overlay.abort.abort();
       overlay.canvas.remove();
-      overlay.pageEl.classList.remove("pdftion-page");
+      overlay.pageEl.classList.remove("pdftion-page", "pdftion-hide-native-ink-layer");
     }
     this.overlays.clear();
     this.pendingImageCrop = null;
     this.rootEl.classList.remove("pdftion-enabled", "pdftion-root", "pdftion-selecting");
+    this.plugin.refreshGlobalEditingClass();
+  }
+
+  isEnabled(): boolean {
+    return this.enabled;
   }
 
   updateFile(file: TFile): void {
@@ -2230,9 +2368,11 @@ class InkSession {
     }
 
     this.flushSoon();
+    this.restoreHiddenNativeInkAnnotations();
     this.closeNativeTextEditor(false);
     this.file = file;
     this.clearAutoSaveTimer();
+    this.clearEditableInkPrepareTimer();
     this.currentStroke = null;
     this.dirty = false;
     this.redoStack = [];
@@ -2247,8 +2387,10 @@ class InkSession {
     this.textHistory = [];
     this.coverHistory = [];
     this.imageHistory = [];
+    this.detachedInkEditPages.clear();
     this.loadedAnnotationState = false;
     this.annotationLoadToken += 1;
+    this.annotationLoadPromise = null;
     void this.loadEditableAnnotations();
     this.redrawAll();
   }
@@ -2257,27 +2399,63 @@ class InkSession {
     if (this.loadedAnnotationState) {
       return;
     }
-    this.loadedAnnotationState = true;
+    if (this.annotationLoadPromise) {
+      return this.annotationLoadPromise;
+    }
+    this.annotationLoadPromise = this.loadEditableAnnotationsInner().finally(() => {
+      this.annotationLoadPromise = null;
+    });
+    return this.annotationLoadPromise;
+  }
+
+  private async loadEditableAnnotationsInner(): Promise<void> {
+    if (this.loadedAnnotationState) {
+      return;
+    }
     const filePath = this.file.path;
     const loadToken = ++this.annotationLoadToken;
     const state = await this.plugin.loadAnnotationState(this.file);
     if (loadToken !== this.annotationLoadToken || this.file.path !== filePath) {
       return;
     }
-    if (!state) {
+    const pdfInkStrokes = await this.plugin.loadPdfInkAnnotations(this.file);
+    if (loadToken !== this.annotationLoadToken || this.file.path !== filePath) {
       return;
     }
-    const elements = state.elements.map(markElementSaved);
+    const loadedElements: InkElement[] = [
+      ...(state?.elements ?? []),
+      ...pdfInkStrokes.filter((stroke) => !(state?.elements ?? []).some((element) => (
+        element.id === stroke.id ||
+        (element.kind === "stroke" && isSamePdfInkStrokeCandidate(element, stroke))
+      )))
+    ].map((element): InkElement => {
+      if (element.kind !== "stroke") {
+        return markElementSaved(element);
+      }
+      const pdfStroke = pdfInkStrokes.find((stroke) => stroke.id === element.id);
+      const pdfPoints = element.pdfPoints ?? pdfStroke?.points;
+      const matchesPdfStroke = Boolean(pdfStroke && pdfPoints && inkPointsApproximatelyEqual(element.points, pdfPoints));
+      const stroke: InkStroke = {
+        ...element,
+        externalDirty: matchesPdfStroke ? false : element.externalDirty,
+        pdfPoints: pdfPoints?.map((point) => ({ ...point })),
+        pdfSaved: matchesPdfStroke ? true : element.pdfSaved ?? (pdfStroke ? true : undefined),
+        source: element.source ?? pdfStroke?.source
+      };
+      return markElementSaved(stroke);
+    });
+    const elements = dedupeInkElements(loadedElements);
     this.strokeHistory = elements.filter((element): element is InkStroke => element.kind === "stroke");
     this.textHistory = elements.filter((element): element is InkText => element.kind === "text");
     this.coverHistory = elements.filter((element): element is InkCover => element.kind === "cover");
     this.imageHistory = elements.filter((element): element is InkImage => element.kind === "image");
-    this.savedInkIsBurnedIntoPdf = !state.overlayAnnotationsOnly && this.strokeHistory.length > 0;
-    this.savedTextIsBurnedIntoPdf = !state.overlayAnnotationsOnly && !state.overlayTextOnly && this.textHistory.length > 0;
+    this.savedInkIsBurnedIntoPdf = state !== null && !state.overlayAnnotationsOnly && this.strokeHistory.length > 0;
+    this.savedTextIsBurnedIntoPdf = state !== null && !state.overlayAnnotationsOnly && !state.overlayTextOnly && this.textHistory.length > 0;
     if (this.savedInkIsBurnedIntoPdf || this.savedTextIsBurnedIntoPdf) {
       this.dirty = true;
       this.scheduleAutoSave(250);
     }
+    this.loadedAnnotationState = true;
     this.redrawAll();
   }
 
@@ -2301,6 +2479,7 @@ class InkSession {
     }
 
     this.redrawAll();
+    this.scheduleEditableInkPrepare(120);
   }
 
   scheduleQuietScan(): void {
@@ -2472,6 +2651,9 @@ class InkSession {
     }
 
     if (this.isEmbeddedPdfSurface()) {
+      if (this.isSpacedRepetitionSurface()) {
+        return this.ensureInlineEmbedHost();
+      }
       return (
         this.rootEl.querySelector<HTMLElement>(".file-embed-title .file-embed-title-inner") ??
         this.rootEl.querySelector<HTMLElement>(".file-embed-title") ??
@@ -2491,6 +2673,10 @@ class InkSession {
       this.rootEl.closest(".internal-embed, .media-embed, .file-embed, .markdown-embed") !== null ||
       this.rootEl.closest(".sr-modal, .sr-card, .spaced-repetition, .spaced-repetition-modal, .review-modal, .review-card") !== null
     );
+  }
+
+  private isSpacedRepetitionSurface(): boolean {
+    return this.rootEl.closest(".sr-modal, .sr-card, .spaced-repetition, .spaced-repetition-modal, .review-modal, .review-card") !== null;
   }
 
   private findSpacedRepetitionHost(): HTMLElement | null {
@@ -2514,7 +2700,9 @@ class InkSession {
     }
 
     const host = activeDocument.createElement("div");
-    host.className = "pdftion-inline-actions";
+    host.className = this.isSpacedRepetitionSurface()
+      ? "pdftion-inline-actions pdftion-sr-inline-actions"
+      : "pdftion-inline-actions";
 
     const title =
       this.rootEl.querySelector<HTMLElement>(".file-embed-title, .embed-title, .markdown-embed-title") ??
@@ -2672,6 +2860,21 @@ class InkSession {
     }
   }
 
+  private startNativeAnnotationPopupSuppressor(): void {
+    if (this.nativeAnnotationPopupTimer !== null) {
+      return;
+    }
+    this.nativeAnnotationPopupTimer = window.setInterval(() => this.hideNativePdfAnnotationPopups(), 180);
+  }
+
+  private stopNativeAnnotationPopupSuppressor(): void {
+    if (this.nativeAnnotationPopupTimer !== null) {
+      window.clearInterval(this.nativeAnnotationPopupTimer);
+      this.nativeAnnotationPopupTimer = null;
+    }
+    this.hideNativePdfAnnotationPopups();
+  }
+
   private repairActiveOverlays(): void {
     if (!this.enabled || this.isInteracting()) {
       return;
@@ -2693,9 +2896,11 @@ class InkSession {
 
     if (repaired) {
       this.redrawAll();
+      void this.prepareEditableInkForCurrentPage();
       return;
     }
 
+    void this.prepareEditableInkForCurrentPage();
     this.scheduleScanPages(0);
   }
 
@@ -2703,17 +2908,25 @@ class InkSession {
     this.enabled = enabled;
     this.rootEl.classList.toggle("pdftion-enabled", this.enabled);
     this.rootEl.classList.toggle("pdftion-selecting", this.enabled && (this.tool === "select" || this.tool === "image-crop"));
+    this.plugin.refreshGlobalEditingClass();
     this.updateButtonState();
 
     if (this.enabled) {
+      this.pendingEditableInkPrepareAfterSave = false;
+      this.detachedInkEditPages.clear();
       this.showToolbar();
       this.scanPages();
       this.startOverlayHealthCheck();
+      this.startNativeAnnotationPopupSuppressor();
+      this.scheduleEditableInkPrepare(0, true);
+      window.setTimeout(() => this.scheduleEditableInkPrepare(0, true), 650);
+      window.setTimeout(() => this.scheduleEditableInkPrepare(0, true), 1600);
       if (options.notice !== false) {
         new Notice(uiText("PDF 批注已开启。", "PDF annotation enabled."));
       }
     } else {
       this.stopOverlayHealthCheck();
+      this.stopNativeAnnotationPopupSuppressor();
       this.currentStroke = null;
       this.selectionDrag = null;
       this.nativeSelection = null;
@@ -2727,10 +2940,165 @@ class InkSession {
       this.shareMenu = null;
       this.toolbar?.remove();
       this.toolbar = null;
-      if (this.dirty) {
+      if (this.hasPendingPdfWrite()) {
         this.scheduleAutoSave(AUTO_SAVE_CLOSE_DELAY_MS);
       }
       this.redrawAll();
+    }
+  }
+
+  private async prepareEditableInkForCurrentPage(force = false): Promise<void> {
+    try {
+      await this.loadEditableAnnotations();
+      if (!this.enabled) {
+        return;
+      }
+      if (this.saving) {
+        this.pendingEditableInkPrepareAfterSave = true;
+        return;
+      }
+      const pageIndexes = this.getCurrentInkDetachPages(force);
+      if (pageIndexes.size === 0) {
+        return;
+      }
+      await this.detachPdfInkForEditing(pageIndexes);
+    } catch (error) {
+      console.warn("pdftion could not prepare PDF ink for editable mode.", error);
+    }
+  }
+
+  private scheduleEditableInkPrepare(delay = 160, force = false): void {
+    if (!this.enabled) {
+      return;
+    }
+    const shouldForce = force || this.inkPrepareTimerForce;
+    this.clearEditableInkPrepareTimer();
+    this.inkPrepareTimerForce = shouldForce;
+    this.inkPrepareTimer = window.setTimeout(() => {
+      const runForce = this.inkPrepareTimerForce;
+      this.inkPrepareTimerForce = false;
+      this.inkPrepareTimer = null;
+      void this.prepareEditableInkForCurrentPage(runForce);
+    }, delay);
+  }
+
+  private clearEditableInkPrepareTimer(): void {
+    if (this.inkPrepareTimer !== null) {
+      window.clearTimeout(this.inkPrepareTimer);
+      this.inkPrepareTimer = null;
+    }
+    this.inkPrepareTimerForce = false;
+  }
+
+  private getCurrentInkDetachPages(force = false): Set<number> {
+    const pages = new Set<number>();
+    const viewportHeight = activeWindow.innerHeight || activeDocument.documentElement.clientHeight || 1;
+    for (const overlay of this.overlays.values()) {
+      if (!force && this.detachedInkEditPages.has(overlay.pageIndex)) {
+        continue;
+      }
+      const rect = overlay.pageEl.getBoundingClientRect();
+      if (rect.bottom >= -80 && rect.top <= viewportHeight + 80) {
+        pages.add(overlay.pageIndex);
+      }
+    }
+    if (pages.size === 0) {
+      const overlay = this.getVisibleOverlay() ?? Array.from(this.overlays.values()).sort((a, b) => a.pageIndex - b.pageIndex)[0];
+      if (overlay && (force || !this.detachedInkEditPages.has(overlay.pageIndex))) {
+        pages.add(overlay.pageIndex);
+      }
+    }
+    return pages;
+  }
+
+  private async detachPdfInkForEditing(pageIndexes: Set<number>): Promise<void> {
+    if (pageIndexes.size === 0 || this.detachingPdfInkForEditing) {
+      return;
+    }
+    if (this.saving) {
+      this.pendingEditableInkPrepareAfterSave = true;
+      window.setTimeout(() => void this.prepareEditableInkForCurrentPage(true), 250);
+      return;
+    }
+
+    this.detachingPdfInkForEditing = true;
+    this.saving = true;
+    const targetFile = this.file;
+    const targetPath = targetFile.path;
+    try {
+      const binary = await this.plugin.app.vault.readBinary(targetFile);
+      const pdf = await PDFDocument.load(binary, { ignoreEncryption: true, updateMetadata: false });
+      const detachedStrokes = detachPdfInkAnnotations(pdf, pageIndexes);
+      let buffer = binary;
+      if (detachedStrokes.length > 0) {
+        const saved = await pdf.save({ addDefaultPage: false, useObjectStreams: false });
+        buffer = new ArrayBuffer(saved.byteLength);
+        new Uint8Array(buffer).set(saved);
+        await this.plugin.app.vault.modifyBinary(targetFile, buffer);
+
+        if (this.file.path !== targetPath) {
+          return;
+        }
+      }
+
+      for (const stroke of detachedStrokes) {
+        const existing = this.strokeHistory.find((candidate) => candidate.id === stroke.id);
+        if (existing) {
+          if (existing.pdfSaved === true && existing.saved && existing.externalDirty !== true) {
+            existing.points = stroke.points.map((point) => ({ ...point }));
+            existing.color = stroke.color;
+            existing.opacity = stroke.opacity;
+            existing.pageCssHeight = stroke.pageCssHeight;
+            existing.pageCssWidth = stroke.pageCssWidth;
+            existing.tool = stroke.tool;
+            existing.width = stroke.width;
+          }
+          existing.pdfPoints = stroke.pdfPoints?.map((point) => ({ ...point })) ?? stroke.points.map((point) => ({ ...point }));
+          existing.pdfSaved = false;
+          existing.externalDirty = true;
+          existing.source = existing.source ?? stroke.source;
+          existing.saved = false;
+        } else {
+          this.strokeHistory.push({
+            ...stroke,
+            externalDirty: true,
+            pdfPoints: stroke.pdfPoints?.map((point) => ({ ...point })) ?? stroke.points.map((point) => ({ ...point })),
+            pdfSaved: false,
+            points: stroke.points.map((point) => ({ ...point })),
+            saved: false
+          });
+        }
+      }
+
+      for (const pageIndex of pageIndexes) {
+        this.detachedInkEditPages.add(pageIndex);
+      }
+
+      if (detachedStrokes.length > 0) {
+        const stateElements = this.getEditableElements().map(markElementSaved);
+        await this.plugin.saveEditableAnnotationState(targetFile, stateElements, buffer);
+        const savedElementIds = new Set(stateElements.map((element) => element.id));
+        for (const element of this.getEditableElements()) {
+          if (savedElementIds.has(element.id)) {
+            element.saved = true;
+          }
+        }
+      }
+      this.dirty = this.getEditableElements().some((element) => !element.saved);
+
+      if (this.file.path === targetPath) {
+        this.redrawAll();
+      }
+    } catch (error) {
+      console.warn("pdftion could not detach PDF ink annotations for editing.", error);
+    } finally {
+      this.detachingPdfInkForEditing = false;
+      this.saving = false;
+      this.flushPendingEditableInkPrepare();
+      if (this.pendingSaveAfterCurrentSave) {
+        this.pendingSaveAfterCurrentSave = false;
+        this.scheduleAutoSave(AUTO_SAVE_IDLE_DELAY_MS);
+      }
     }
   }
 
@@ -3892,6 +4260,100 @@ class InkSession {
     );
   }
 
+  private blockNativePdfAnnotationEvent(event: Event): void {
+    if (!this.enabled) {
+      return;
+    }
+
+    const path = typeof event.composedPath === "function" ? event.composedPath() : [];
+    const target = event.target;
+    const insideSession = path.some((value) => value === this.rootEl || (isHTMLElement(value) && this.rootEl.contains(value)));
+    const targetElement = isHTMLElement(target) ? target : null;
+    if (
+      !insideSession &&
+      !(targetElement && (this.isNativePdfAnnotationPopup(targetElement) || this.looksLikeNativeAnnotationMenu(targetElement)))
+    ) {
+      return;
+    }
+
+    const fromNativeAnnotation = path.some((value) => (
+      isHTMLElement(value) &&
+      this.isNativePdfAnnotationElement(value)
+    ));
+    const fromNativePopup = targetElement !== null && (this.isNativePdfAnnotationPopup(targetElement) || this.looksLikeNativeAnnotationMenu(targetElement));
+    if (!fromNativeAnnotation && !fromNativePopup) {
+      this.hideNativePdfAnnotationPopups();
+      return;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+    if (typeof event.stopImmediatePropagation === "function") {
+      event.stopImmediatePropagation();
+    }
+    this.hideNativePdfAnnotationPopups();
+    window.setTimeout(() => this.hideNativePdfAnnotationPopups(), 0);
+  }
+
+  private hideNativePdfAnnotationPopups(): void {
+    const rootRect = this.rootEl.getBoundingClientRect();
+    const selectors = [
+      ".annotationLayer .popupWrapper",
+      ".annotationLayer .popup",
+      ".annotationEditorLayer .popupWrapper",
+      ".annotationEditorLayer .popup",
+      ".pdf-annotation-popup",
+      ".pdfAnnotationPopup",
+      ".popupAnnotation",
+      ".popover",
+      ".hover-popover",
+      ".menu"
+    ];
+    for (const candidate of Array.from(activeDocument.querySelectorAll<HTMLElement>(selectors.join(",")))) {
+      if (candidate.closest(".pdftion-root, .pdftion-toolbar, .pdftion-panel, .pdftion-palette-panel, .pdftion-native-selection-menu")) {
+        continue;
+      }
+      const rect = candidate.getBoundingClientRect();
+      const nearSession = rectsOverlap(
+        {
+          bottom: rootRect.bottom + 80,
+          left: rootRect.left - 80,
+          right: rootRect.right + 80,
+          top: rootRect.top - 80
+        },
+        rect
+      );
+      if (!nearSession && !this.isNativePdfAnnotationPopup(candidate)) {
+        continue;
+      }
+      if (!this.isNativePdfAnnotationPopup(candidate) && !this.looksLikeNativeAnnotationMenu(candidate)) {
+        continue;
+      }
+      candidate.style.setProperty("display", "none", "important");
+      candidate.style.setProperty("pointer-events", "none", "important");
+    }
+  }
+
+  private isNativePdfAnnotationElement(element: HTMLElement): boolean {
+    return element.closest(
+      ".annotationLayer, .annotationEditorLayer, .popupAnnotation, [data-annotation-id], [data-pdf-annotation-id]"
+    ) !== null;
+  }
+
+  private isNativePdfAnnotationPopup(element: HTMLElement): boolean {
+    return element.closest(
+      ".annotationLayer .popupWrapper, .annotationLayer .popup, .annotationEditorLayer .popupWrapper, .annotationEditorLayer .popup, .pdf-annotation-popup, .pdfAnnotationPopup, .popupAnnotation"
+    ) !== null;
+  }
+
+  private looksLikeNativeAnnotationMenu(element: HTMLElement): boolean {
+    const text = (element.textContent ?? "").trim();
+    if (!text || text.length > 120) {
+      return false;
+    }
+    return /复制|信息|注释|批注|copy|info|annotation/i.test(text);
+  }
+
   private beginSelectionInteraction(point: InkPoint, overlay: PageOverlay): void {
     const handle = this.findSelectionHandleAt(overlay, point);
     if (handle) {
@@ -3934,6 +4396,7 @@ class InkSession {
     if (this.hasEditableSelection(overlay.pageIndex) && this.selectionBoxContainsPoint(overlay, point)) {
       this.nativeSelection = null;
       this.selectionDrag = {
+        clearSelectionOnTap: true,
         current: point,
         mode: "move",
         moved: false,
@@ -3945,6 +4408,13 @@ class InkSession {
     }
 
     if (!selected) {
+      if (this.selectedStrokeIds.size > 0 || this.nativeSelection !== null) {
+        this.selectedStrokeIds.clear();
+        this.nativeSelection = null;
+        this.selectionDrag = null;
+        this.redrawAll();
+        return;
+      }
       const blockingCover = this.findCoverElementAt(overlay, point, true);
       if (blockingCover?.source === "native-text") {
         this.selectedStrokeIds.clear();
@@ -4861,8 +5331,8 @@ class InkSession {
       if (!("color" in element) || normalizeHexColor(element.color) === color) {
         continue;
       }
+      this.markElementChanged(element);
       element.color = color;
-      element.saved = false;
       changed = true;
     }
     if (!changed) {
@@ -5007,8 +5477,8 @@ class InkSession {
       }
 
       for (const element of selected) {
+        this.markElementChanged(element);
         translateElement(element, dx, dy);
-        element.saved = false;
       }
       this.markDirty();
       this.redoStack = [];
@@ -5145,7 +5615,11 @@ class InkSession {
     if (drag.mode === "move") {
       if (drag.moved) {
         this.redrawAll();
-        this.scheduleAutoSave();
+        this.scheduleAutoSave(250);
+      } else if (drag.clearSelectionOnTap) {
+        this.selectedStrokeIds.clear();
+        this.nativeSelection = null;
+        this.redrawAll();
       }
       this.updateToolbarState();
       return;
@@ -5154,7 +5628,7 @@ class InkSession {
     if (drag.mode === "resize") {
       if (drag.moved) {
         this.redrawAll();
-        this.scheduleAutoSave();
+        this.scheduleAutoSave(250);
       }
       this.updateToolbarState();
       return;
@@ -5432,6 +5906,7 @@ class InkSession {
   }
 
   private redrawAll(): void {
+    this.updateExternalInkLayerState();
     for (const overlay of this.overlays.values()) {
       this.redrawOverlay(overlay);
     }
@@ -5468,9 +5943,14 @@ class InkSession {
     }
 
     for (const stroke of this.strokeHistory) {
-      if (stroke.pageIndex === overlay.pageIndex && (!stroke.saved || !this.savedInkIsBurnedIntoPdf)) {
-        drawStroke(ctx, stroke, overlay.cssWidth, overlay.cssHeight, !editingText && this.selectedStrokeIds.has(stroke.id));
+      if (stroke.pageIndex !== overlay.pageIndex) {
+        continue;
       }
+      if (this.savedInkIsBurnedIntoPdf && stroke.saved) {
+        continue;
+      }
+      const selected = !editingText && this.selectedStrokeIds.has(stroke.id);
+      drawStroke(ctx, stroke, overlay.cssWidth, overlay.cssHeight, selected);
     }
 
     if (previewStroke && previewStroke.pageIndex === overlay.pageIndex) {
@@ -5520,15 +6000,11 @@ class InkSession {
   }
 
   private async saveIntoPdf(auto = false): Promise<void> {
-    if (auto) {
-      await this.saveEditableState();
-      return;
-    }
-
     const elements = this.getEditableElements();
     const targetFile = this.file;
     const targetPath = targetFile.path;
-    if (!this.dirty && elements.every((element) => element.saved)) {
+    const hasUnsavedPdfStroke = elements.some((element) => element.kind === "stroke" && element.pdfSaved !== true);
+    if (!this.dirty && elements.every((element) => element.saved) && !hasUnsavedPdfStroke) {
       if (!auto) {
         new Notice(uiText("没有新的标注需要保存。", "No new annotations to save."));
       }
@@ -5545,15 +6021,27 @@ class InkSession {
 
     try {
       const binary = await this.plugin.app.vault.readBinary(targetFile);
-      const basePdf = await this.plugin.ensureBasePdfBytes(targetFile, binary);
-      const pdf = await PDFDocument.load(basePdf.bytes, { ignoreEncryption: true });
-      await drawInkElementsOnPdf(pdf, elements);
+      const pdf = await PDFDocument.load(binary, { ignoreEncryption: true, updateMetadata: false });
+      await syncEditableInkAnnotationsOnPdf(pdf, elements);
 
-      const saved = await pdf.save({ useObjectStreams: true });
+      const saved = await pdf.save({ addDefaultPage: false, useObjectStreams: false });
       const buffer = new ArrayBuffer(saved.byteLength);
       new Uint8Array(buffer).set(saved);
       await this.plugin.app.vault.modifyBinary(targetFile, buffer);
-      await this.plugin.saveAnnotationState(targetFile, elements.map(markElementSaved), basePdf.fingerprint, buffer);
+      const markedElements = elements.map((element) => {
+        const wroteStrokeToPdf = element.kind === "stroke" && element.pdfSaved !== true;
+        element.saved = true;
+        if (element.kind === "stroke") {
+          element.pdfSaved = true;
+          element.pdfPoints = element.points.map((point) => ({ ...point }));
+          element.externalDirty = false;
+          if (wroteStrokeToPdf) {
+            element.source = "pdftion";
+          }
+        }
+        return cloneElement(element);
+      });
+      await this.plugin.saveEditableAnnotationState(targetFile, markedElements, buffer);
 
       if (this.file.path !== targetPath) {
         return;
@@ -5563,20 +6051,26 @@ class InkSession {
       this.currentCover = null;
       this.savedInkIsBurnedIntoPdf = false;
       this.savedTextIsBurnedIntoPdf = false;
-      for (const element of elements) {
-        element.saved = true;
-      }
+      this.detachedInkEditPages.clear();
       this.pruneSelection();
       this.dirty = false;
-      this.redrawAll();
+      this.updateExternalInkLayerState();
+      if (!auto) {
+        this.redrawAll();
+      }
       if (!auto) {
         new Notice(uiText(`已保存到 ${targetFile.name}。`, `Saved into ${targetFile.name}.`));
       }
     } catch (error) {
       console.error(error);
-      new Notice(uiText("自动保存失败，请查看控制台。", "Could not auto-save into this PDF. Check the console for details."));
+      if (auto) {
+        await this.saveEditableStateWhileSaving();
+      } else {
+        new Notice(uiText("自动保存失败，请查看控制台。", "Could not auto-save into this PDF. Check the console for details."));
+      }
     } finally {
       this.saving = false;
+      this.flushPendingEditableInkPrepare();
       if (this.pendingSaveAfterCurrentSave) {
         this.pendingSaveAfterCurrentSave = false;
         this.scheduleAutoSave(AUTO_SAVE_IDLE_DELAY_MS);
@@ -5602,8 +6096,7 @@ class InkSession {
 
     try {
       const binary = await this.plugin.app.vault.readBinary(targetFile);
-      const basePdf = await this.plugin.ensureBasePdfBytes(targetFile, binary);
-      await this.plugin.saveAnnotationState(targetFile, elements.map(markElementSaved), basePdf.fingerprint, binary);
+      await this.plugin.saveEditableAnnotationState(targetFile, elements.map(markElementSaved), binary);
 
       if (this.file.path !== targetPath) {
         return;
@@ -5616,15 +6109,28 @@ class InkSession {
       }
       this.dirty = false;
     } catch (error) {
-      console.error(error);
-      new Notice(uiText("保存 Pdftion 可编辑标注失败，请查看控制台。", "Could not save Pdftion editable annotations. Check the console for details."));
+      console.warn("pdftion could not save editable annotation state; retrying.", error);
+      if (this.file.path === targetPath) {
+        this.scheduleAutoSave(1200);
+      }
     } finally {
       this.saving = false;
+      this.flushPendingEditableInkPrepare();
       if (this.pendingSaveAfterCurrentSave) {
         this.pendingSaveAfterCurrentSave = false;
         this.scheduleAutoSave(AUTO_SAVE_IDLE_DELAY_MS);
       }
     }
+  }
+
+  private flushPendingEditableInkPrepare(): void {
+    if (!this.pendingEditableInkPrepareAfterSave || !this.enabled) {
+      return;
+    }
+    this.pendingEditableInkPrepareAfterSave = false;
+    this.detachedInkEditPages.clear();
+    this.scheduleEditableInkPrepare(0, true);
+    window.setTimeout(() => this.scheduleEditableInkPrepare(0, true), 500);
   }
 
   async exportAnnotationsMarkdown(): Promise<string | null> {
@@ -5873,12 +6379,22 @@ class InkSession {
       const targetFile = this.file;
       const targetPath = await this.getUniqueAnnotatedPdfPath(targetFile);
       const binary = await this.plugin.app.vault.readBinary(targetFile);
-      const basePdf = await this.plugin.ensureBasePdfBytes(targetFile, binary);
-      const pdf = await PDFDocument.load(basePdf.bytes, { ignoreEncryption: true });
+      let basePdf = await this.plugin.ensureBasePdfBytes(targetFile, binary);
+      let pdf: PDFDocument;
+      try {
+        pdf = await PDFDocument.load(basePdf.bytes, { ignoreEncryption: true, updateMetadata: false });
+      } catch (error) {
+        console.warn("pdftion could not load the stored base PDF for export; retrying with the current PDF.", error);
+        basePdf = {
+          bytes: binary,
+          fingerprint: await this.plugin.replaceBasePdfBytes(targetFile, binary)
+        };
+        pdf = await PDFDocument.load(binary, { ignoreEncryption: true, updateMetadata: false });
+      }
       const fontBytes = elements.some((element) => element.kind === "text") ? await this.plugin.loadAnnotationFontBytes() : null;
       await drawVisibleInkElementsOnPdf(pdf, elements, fontBytes);
 
-      const saved = await pdf.save({ useObjectStreams: true });
+      const saved = await pdf.save({ addDefaultPage: false, useObjectStreams: false });
       const buffer = new ArrayBuffer(saved.byteLength);
       new Uint8Array(buffer).set(saved);
       const exportedFile = await this.plugin.app.vault.createBinary(targetPath, buffer);
@@ -6715,6 +7231,68 @@ class InkSession {
     return this.getSelectedEditableElements(pageIndex).length > 0;
   }
 
+  private updateExternalInkLayerState(): void {
+    this.restoreHiddenNativeInkAnnotations();
+
+    for (const overlay of this.overlays.values()) {
+      const targets = this.strokeHistory.filter((stroke) => (
+        stroke.pageIndex === overlay.pageIndex &&
+        Array.isArray(stroke.pdfPoints)
+      ));
+      overlay.pageEl.classList.toggle("pdftion-hide-native-ink-layer", targets.length > 0);
+      if (targets.length === 0) {
+        continue;
+      }
+
+      for (const layer of Array.from(overlay.pageEl.querySelectorAll<HTMLElement>(".annotationLayer, .annotationEditorLayer"))) {
+        this.hiddenNativeAnnotationStyles.set(layer, layer.style.visibility);
+        layer.style.visibility = "hidden";
+      }
+
+      const canvasRect = overlay.canvas.getBoundingClientRect();
+      const targetRects = targets
+        .map((stroke) => normalizedStrokeBounds({ ...stroke, points: stroke.pdfPoints ?? stroke.points }))
+        .filter((bounds): bounds is NormalizedBounds => bounds !== null)
+        .map((bounds) => {
+          const pad = 24;
+          return {
+            bottom: canvasRect.top + bounds.maxY * canvasRect.height + pad,
+            left: canvasRect.left + bounds.minX * canvasRect.width - pad,
+            right: canvasRect.left + bounds.maxX * canvasRect.width + pad,
+            top: canvasRect.top + bounds.minY * canvasRect.height - pad
+          };
+        });
+      if (targetRects.length === 0) {
+        continue;
+      }
+
+      for (const candidate of Array.from(overlay.pageEl.querySelectorAll<HTMLElement>(".annotationLayer *, .annotationEditorLayer *"))) {
+        const rect = candidate.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) {
+          continue;
+        }
+        if (targetRects.some((target) => rectsOverlap(target, rect))) {
+          this.hiddenNativeAnnotationStyles.set(candidate, candidate.style.visibility);
+          candidate.style.visibility = "hidden";
+        }
+      }
+    }
+  }
+
+  private restoreHiddenNativeInkAnnotations(): void {
+    for (const [element, visibility] of this.hiddenNativeAnnotationStyles) {
+      if (visibility) {
+        element.style.visibility = visibility;
+      } else {
+        element.style.removeProperty("visibility");
+      }
+    }
+    this.hiddenNativeAnnotationStyles.clear();
+    for (const overlay of this.overlays.values()) {
+      overlay.pageEl.classList.remove("pdftion-hide-native-ink-layer");
+    }
+  }
+
   private selectionBoxContainsPoint(overlay: PageOverlay, point: InkPoint): boolean {
     const bounds = normalizedElementsBounds(this.getSelectedEditableElements(overlay.pageIndex));
     if (!bounds) {
@@ -6766,7 +7344,7 @@ class InkSession {
       if (!live) {
         continue;
       }
-      live.saved = false;
+      this.markElementChanged(live);
       if (live.kind === "stroke" && element.kind === "stroke") {
         live.points = element.points;
         live.width = element.width;
@@ -6863,11 +7441,43 @@ class InkSession {
   }
 
   private hasPendingPdfWrite(): boolean {
-    return this.dirty || this.getEditableElements().some((element) => !element.saved);
+    return this.dirty || this.getEditableElements().some((element) => !element.saved || (element.kind === "stroke" && element.pdfSaved !== true));
   }
 
   private markDirty(): void {
     this.dirty = true;
+  }
+
+  private markElementChanged(element: InkElement): void {
+    element.saved = false;
+    if (element.kind === "stroke") {
+      if (element.pdfSaved === true && !element.pdfPoints) {
+        element.pdfPoints = element.points.map((point) => ({ ...point }));
+      }
+      if (element.source === "external-ink") {
+        element.externalDirty = true;
+      }
+      element.pdfSaved = false;
+    }
+  }
+
+  private async saveEditableStateWhileSaving(): Promise<void> {
+    const elements = this.getEditableElements();
+    const targetFile = this.file;
+    const targetPath = targetFile.path;
+    try {
+      const binary = await this.plugin.app.vault.readBinary(targetFile);
+      await this.plugin.saveEditableAnnotationState(targetFile, elements.map(markElementSaved), binary);
+      if (this.file.path !== targetPath) {
+        return;
+      }
+      for (const element of elements) {
+        element.saved = true;
+      }
+      this.dirty = false;
+    } catch (error) {
+      console.error(error);
+    }
   }
 
   getFilePath(): string {
@@ -7303,10 +7913,15 @@ class InkSession {
       return;
     }
     this.clearAutoSaveTimer();
+    const effectiveDelay = this.enabled ? Math.min(delay, 900) : delay;
     this.saveTimer = window.setTimeout(() => {
       this.saveTimer = null;
-      void this.saveIntoPdf(true);
-    }, delay);
+      if (this.enabled) {
+        void this.saveEditableState();
+      } else {
+        void this.saveIntoPdf(true);
+      }
+    }, effectiveDelay);
   }
 
   flushSoon(): void {
@@ -7367,6 +7982,7 @@ class InkSession {
 
       overlay.abort.abort();
       overlay.canvas.remove();
+      pageEl.classList.remove("pdftion-page", "pdftion-hide-native-ink-layer");
       this.overlays.delete(pageEl);
     }
   }
@@ -7387,9 +8003,18 @@ async function embedAnnotationFont(pdf: PDFDocument, fontBytes: Uint8Array) {
   return pdf.embedFont(fontBytes, { subset: true });
 }
 
-async function drawInkElementsOnPdf(pdf: PDFDocument, elements: InkElement[]): Promise<void> {
+async function drawInkElementsOnPdf(
+  pdf: PDFDocument,
+  elements: InkElement[],
+  options: { strokesOnlyUnsaved?: boolean } = {}
+): Promise<void> {
   const pages = pdf.getPages();
-  const orderedElements = elements.filter((element): element is InkCover => element.kind === "cover");
+  const orderedElements = [
+    ...elements.filter((element): element is InkCover => element.kind === "cover"),
+    ...elements.filter((element): element is InkStroke => (
+      element.kind === "stroke" && (!options.strokesOnlyUnsaved || element.pdfSaved !== true)
+    ))
+  ];
 
   for (const element of orderedElements) {
     const page = pages[element.pageIndex];
@@ -7408,7 +8033,358 @@ async function drawInkElementsOnPdf(pdf: PDFDocument, elements: InkElement[]): P
         x: element.x * size.width,
         y: size.height - (element.y + element.height) * size.height
       });
+      continue;
     }
+
+    if (element.kind === "stroke") {
+      if (!addStandardInkAnnotation(pdf, page, element)) {
+        drawStrokeAsPdfLines(page, element, size.width, size.height);
+      }
+    }
+  }
+}
+
+async function syncEditableInkAnnotationsOnPdf(pdf: PDFDocument, elements: InkElement[]): Promise<void> {
+  const strokesToWrite = elements.filter((element): element is InkStroke => (
+    element.kind === "stroke" && element.pdfSaved !== true
+  ));
+  removeTargetInkAnnotations(
+    pdf,
+    new Set(strokesToWrite.filter((stroke) => stroke.source !== "external-ink").map((stroke) => stroke.id)),
+    new Set(strokesToWrite.filter((stroke) => stroke.source === "external-ink" && stroke.externalDirty === true).map((stroke) => stroke.id))
+  );
+  const pages = pdf.getPages();
+  for (const stroke of strokesToWrite) {
+    const page = pages[stroke.pageIndex];
+    if (!page || stroke.points.length < 2) {
+      continue;
+    }
+    if (!addStandardInkAnnotation(pdf, page, stroke)) {
+      const size = page.getSize();
+      drawStrokeAsPdfLines(page, stroke, size.width, size.height);
+    }
+  }
+}
+
+function removeTargetInkAnnotations(pdf: PDFDocument, pdftionIds = new Set<string>(), importedExternalIds = new Set<string>()): void {
+  const pages = pdf.getPages();
+  for (let pageIndex = 0; pageIndex < pages.length; pageIndex += 1) {
+    const page = pages[pageIndex];
+    const annots = page.node.Annots?.();
+    if (!annots) {
+      continue;
+    }
+    for (let index = annots.size() - 1; index >= 0; index -= 1) {
+      const annot = annots.lookupMaybe(index, PDFDict);
+      if (annot && (pdftionIds.has(pdftionInkStrokeId(annot) ?? "") || importedExternalIds.has(externalInkStrokeId(pageIndex, index, annot)))) {
+        annots.remove(index);
+      }
+    }
+  }
+}
+
+function isPdftionInkAnnotation(annot: PDFDict): boolean {
+  const subtype = annot.lookupMaybe(PDFName.of("Subtype"), PDFName);
+  if (subtype?.decodeText() !== "Ink") {
+    return false;
+  }
+
+  const nm = decodePdfText(annot.lookupMaybe(PDFName.of("NM"), PDFString, PDFHexString));
+  const contents = decodePdfText(annot.lookupMaybe(PDFName.of("Contents"), PDFString, PDFHexString));
+  const title = decodePdfText(annot.lookupMaybe(PDFName.of("T"), PDFString, PDFHexString));
+  return nm.startsWith("Pdftion:") || contents.startsWith("Pdftion ") || title === "Pdftion";
+}
+
+function extractPdfInkAnnotations(pdf: PDFDocument): InkStroke[] {
+  const strokes: InkStroke[] = [];
+  const pages = pdf.getPages();
+  for (let pageIndex = 0; pageIndex < pages.length; pageIndex += 1) {
+    const page = pages[pageIndex];
+    const size = page.getSize();
+    const annots = page.node.Annots?.();
+    if (!annots) {
+      continue;
+    }
+    for (let annotIndex = 0; annotIndex < annots.size(); annotIndex += 1) {
+      const annot = annots.lookupMaybe(annotIndex, PDFDict);
+      if (!annot) {
+        continue;
+      }
+      const stroke = externalInkAnnotationToStroke(annot, pageIndex, annotIndex, size.width, size.height);
+      if (stroke) {
+        strokes.push(stroke);
+      }
+    }
+  }
+  return strokes;
+}
+
+function detachPdfInkAnnotations(pdf: PDFDocument, pageIndexes: Set<number>): InkStroke[] {
+  const strokes: InkStroke[] = [];
+  const pages = pdf.getPages();
+  for (const pageIndex of Array.from(pageIndexes).sort((a, b) => a - b)) {
+    const page = pages[pageIndex];
+    if (!page) {
+      continue;
+    }
+    const size = page.getSize();
+    const annots = page.node.Annots?.();
+    if (!annots) {
+      continue;
+    }
+    const pageStrokes: InkStroke[] = [];
+    for (let annotIndex = annots.size() - 1; annotIndex >= 0; annotIndex -= 1) {
+      const annot = annots.lookupMaybe(annotIndex, PDFDict);
+      if (!annot) {
+        continue;
+      }
+      const stroke = externalInkAnnotationToStroke(annot, pageIndex, annotIndex, size.width, size.height);
+      if (!stroke) {
+        continue;
+      }
+      annots.remove(annotIndex);
+      pageStrokes.push(stroke);
+    }
+    strokes.push(...pageStrokes.reverse());
+  }
+  return strokes;
+}
+
+function externalInkAnnotationToStroke(
+  annot: PDFDict,
+  pageIndex: number,
+  annotIndex: number,
+  pageWidth: number,
+  pageHeight: number
+): InkStroke | null {
+  const subtype = annot.lookupMaybe(PDFName.of("Subtype"), PDFName);
+  if (subtype?.decodeText() !== "Ink") {
+    return null;
+  }
+  const inkList = annot.lookupMaybe(PDFName.of("InkList"), PDFArray);
+  if (!inkList || inkList.size() === 0) {
+    return null;
+  }
+
+  const points: InkPoint[] = [];
+  for (let pathIndex = 0; pathIndex < inkList.size(); pathIndex += 1) {
+    const path = inkList.lookupMaybe(pathIndex, PDFArray);
+    if (!path) {
+      continue;
+    }
+    for (let pointIndex = 0; pointIndex + 1 < path.size(); pointIndex += 2) {
+      const x = path.lookupMaybe(pointIndex, PDFNumber)?.asNumber();
+      const y = path.lookupMaybe(pointIndex + 1, PDFNumber)?.asNumber();
+      if (typeof x !== "number" || typeof y !== "number") {
+        continue;
+      }
+      points.push({
+        x: clamp(x / Math.max(1, pageWidth), 0, 1),
+        y: clamp((pageHeight - y) / Math.max(1, pageHeight), 0, 1)
+      });
+    }
+  }
+  if (points.length < 2) {
+    return null;
+  }
+
+  const color = readPdfColor(annot.lookupMaybe(PDFName.of("C"), PDFArray));
+  const opacity = annot.lookupMaybe(PDFName.of("CA"), PDFNumber)?.asNumber() ?? 1;
+  const border = annot.lookupMaybe(PDFName.of("Border"), PDFArray);
+  const borderWidth = border?.lookupMaybe(2, PDFNumber)?.asNumber() ?? 2;
+  const pdftionId = pdftionInkStrokeId(annot);
+  const simplifiedPoints = simplifyInkPoints(points, 900);
+  return {
+    color,
+    id: pdftionId ?? externalInkStrokeId(pageIndex, annotIndex, annot),
+    kind: "stroke",
+    opacity: clamp(opacity, 0.01, 1),
+    pageCssHeight: pageHeight,
+    pageCssWidth: pageWidth,
+    pageIndex,
+    pdfPoints: simplifiedPoints.map((point) => ({ ...point })),
+    pdfSaved: true,
+    points: simplifiedPoints,
+    saved: true,
+    source: pdftionId ? "pdftion" : "external-ink",
+    tool: "pen",
+    width: clamp(borderWidth, 0.5, 96)
+  };
+}
+
+function pdftionInkStrokeId(annot: PDFDict): string | null {
+  if (!isPdftionInkAnnotation(annot)) {
+    return null;
+  }
+  const nm = decodePdfText(annot.lookupMaybe(PDFName.of("NM"), PDFString, PDFHexString));
+  if (nm.startsWith("Pdftion:")) {
+    return nm.slice("Pdftion:".length) || null;
+  }
+  const contents = decodePdfText(annot.lookupMaybe(PDFName.of("Contents"), PDFString, PDFHexString));
+  const match = contents.match(/^Pdftion\s+(.+)$/);
+  return match?.[1]?.trim() || null;
+}
+
+function externalInkStrokeId(pageIndex: number, annotIndex: number, annot: PDFDict): string {
+  const nm = decodePdfText(annot.lookupMaybe(PDFName.of("NM"), PDFString, PDFHexString));
+  if (nm) {
+    return `external-ink-${pageIndex}-${safeAnnotationKey(nm)}`;
+  }
+  const contents = decodePdfText(annot.lookupMaybe(PDFName.of("Contents"), PDFString, PDFHexString));
+  if (contents) {
+    return `external-ink-${pageIndex}-${annotIndex}-${fallbackBufferHash(new TextEncoder().encode(contents).buffer)}`;
+  }
+  return `external-ink-${pageIndex}-${annotIndex}`;
+}
+
+function simplifyInkPoints(points: InkPoint[], maxPoints: number): InkPoint[] {
+  if (points.length <= maxPoints) {
+    return points;
+  }
+  const step = Math.ceil(points.length / maxPoints);
+  const simplified: InkPoint[] = [];
+  for (let index = 0; index < points.length; index += step) {
+    simplified.push(points[index]);
+  }
+  const last = points[points.length - 1];
+  if (simplified[simplified.length - 1] !== last) {
+    simplified.push(last);
+  }
+  return simplified;
+}
+
+function smoothInkPointsForPdf(points: InkPoint[], maxPoints: number): InkPoint[] {
+  if (points.length <= 2) {
+    return points.map((point) => ({ ...point }));
+  }
+
+  const result: InkPoint[] = [{ ...points[0] }];
+  let current = points[0];
+  for (let i = 1; i < points.length - 1; i += 1) {
+    const control = points[i];
+    const next = points[i + 1];
+    const end = {
+      x: (control.x + next.x) / 2,
+      y: (control.y + next.y) / 2
+    };
+    const distance = Math.hypot(end.x - current.x, end.y - current.y);
+    const steps = clamp(Math.ceil(distance * 1600), 2, 10);
+    for (let step = 1; step <= steps; step += 1) {
+      const t = step / steps;
+      const oneMinusT = 1 - t;
+      result.push({
+        x: oneMinusT * oneMinusT * current.x + 2 * oneMinusT * t * control.x + t * t * end.x,
+        y: oneMinusT * oneMinusT * current.y + 2 * oneMinusT * t * control.y + t * t * end.y
+      });
+    }
+    current = end;
+    if (result.length > maxPoints * 1.4) {
+      return simplifyInkPoints(result, maxPoints);
+    }
+  }
+  result.push({ ...points[points.length - 1] });
+  return simplifyInkPoints(result, maxPoints);
+}
+
+function readPdfColor(colorArray: PDFArray | undefined): string {
+  if (!colorArray || colorArray.size() < 3) {
+    return "#000000";
+  }
+  const r = colorArray.lookupMaybe(0, PDFNumber)?.asNumber() ?? 0;
+  const g = colorArray.lookupMaybe(1, PDFNumber)?.asNumber() ?? 0;
+  const b = colorArray.lookupMaybe(2, PDFNumber)?.asNumber() ?? 0;
+  return rgbToHex(r * 255, g * 255, b * 255);
+}
+
+function decodePdfText(value: PDFString | PDFHexString | undefined): string {
+  try {
+    return value?.decodeText() ?? "";
+  } catch {
+    return value?.asString() ?? "";
+  }
+}
+
+function addStandardInkAnnotation(pdf: PDFDocument, page: ReturnType<PDFDocument["getPage"]>, stroke: InkStroke): boolean {
+  if (stroke.points.length < 2) {
+    return true;
+  }
+
+  try {
+    const size = page.getSize();
+    const inkPoints = smoothInkPointsForPdf(stroke.points, 1600);
+    const scaledPoints = inkPoints.map((point) => ({
+      x: clamp(point.x, 0, 1) * size.width,
+      y: size.height - clamp(point.y, 0, 1) * size.height
+    }));
+    const xs = scaledPoints.map((point) => point.x);
+    const ys = scaledPoints.map((point) => point.y);
+    const thickness = Math.max(0.5, stroke.width * (size.width / Math.max(1, stroke.pageCssWidth)));
+    const padding = Math.max(4, thickness * 2);
+    const color = hexToRgb(stroke.color);
+
+    const rect = pdf.context.obj([
+      Math.max(0, Math.min(...xs) - padding),
+      Math.max(0, Math.min(...ys) - padding),
+      Math.min(size.width, Math.max(...xs) + padding),
+      Math.min(size.height, Math.max(...ys) + padding)
+    ]);
+    const inkPath = pdf.context.obj(scaledPoints.flatMap((point) => [point.x, point.y]));
+    const inkList = pdf.context.obj([inkPath]);
+    const border = pdf.context.obj([0, 0, thickness]);
+    const annotation = pdf.context.obj({
+      Border: border,
+      C: pdf.context.obj([color.r, color.g, color.b]),
+      CA: PDFNumber.of(clamp(stroke.opacity, 0.01, 1)),
+      Contents: PDFHexString.fromText(`Pdftion ${stroke.id}`),
+      F: PDFNumber.of(4),
+      InkList: inkList,
+      M: PDFHexString.fromText(new Date().toISOString()),
+      NM: PDFHexString.fromText(`Pdftion:${stroke.id}`),
+      Rect: rect,
+      Subtype: PDFName.of("Ink"),
+      T: PDFHexString.fromText("Pdftion"),
+      Type: PDFName.of("Annot")
+    });
+    const annotationRef = pdf.context.register(annotation);
+    const pageNode = page.node as unknown as {
+      addAnnot?: (annotRef: unknown) => void;
+      Annots?: () => PDFArray | undefined;
+      set: (key: PDFName, value: PDFArray) => void;
+    };
+    if (typeof pageNode.addAnnot === "function") {
+      pageNode.addAnnot(annotationRef);
+      return true;
+    }
+    let annots = pageNode.Annots?.();
+    if (!annots) {
+      annots = pdf.context.obj([]) as PDFArray;
+      pageNode.set(PDFName.of("Annots"), annots);
+    }
+    annots.push(annotationRef);
+    return true;
+  } catch (error) {
+    console.warn("pdftion could not write a standard ink annotation; falling back to visible lines.", error);
+    return false;
+  }
+}
+
+function drawStrokeAsPdfLines(page: ReturnType<PDFDocument["getPage"]>, stroke: InkStroke, width: number, height: number): void {
+  if (stroke.points.length < 2) {
+    return;
+  }
+  const color = hexToRgb(stroke.color);
+  const thickness = Math.max(0.5, stroke.width * (width / Math.max(1, stroke.pageCssWidth)));
+  const points = smoothInkPointsForPdf(stroke.points, 1600);
+  for (let i = 1; i < points.length; i += 1) {
+    const start = points[i - 1];
+    const end = points[i];
+    page.drawLine({
+      color: rgb(color.r, color.g, color.b),
+      end: { x: end.x * width, y: height - end.y * height },
+      opacity: stroke.opacity,
+      start: { x: start.x * width, y: height - start.y * height },
+      thickness
+    });
   }
 }
 
@@ -8200,10 +9176,8 @@ function drawSelectionGroup(ctx: CanvasRenderingContext2D, elements: InkElement[
   ctx.save();
   ctx.globalAlpha = 1;
   ctx.strokeStyle = "#1c7ed6";
-  ctx.fillStyle = "rgba(28, 126, 214, 0.06)";
   ctx.lineWidth = 1.8;
   ctx.setLineDash([7, 4]);
-  ctx.fillRect(x, y, width, height);
   ctx.strokeRect(x, y, width, height);
   ctx.setLineDash([]);
 
@@ -8416,7 +9390,9 @@ function strokeBoxContainsPoint(stroke: InkStroke, point: InkPoint, cssWidth: nu
     return false;
   }
 
-  const pad = Math.max(8, stroke.width * 1.8);
+  const pad = stroke.source === "external-ink"
+    ? Math.max(22, stroke.width * 4)
+    : Math.max(8, stroke.width * 1.8);
   const px = point.x * cssWidth;
   const py = point.y * cssHeight;
 
@@ -8481,6 +9457,13 @@ function imageIntersectsSelection(image: InkImage, start: InkPoint, end: InkPoin
   return coverIntersectsSelection(image, start, end);
 }
 
+function rectsOverlap(
+  a: { bottom: number; left: number; right: number; top: number },
+  b: { bottom: number; left: number; right: number; top: number }
+): boolean {
+  return a.right >= b.left && a.left <= b.right && a.bottom >= b.top && a.top <= b.bottom;
+}
+
 function nativeRegionContainsPoint(region: PdfNativeObject, point: InkPoint): boolean {
   return point.x >= region.x && point.x <= region.x + region.width && point.y >= region.y && point.y <= region.y + region.height;
 }
@@ -8513,6 +9496,7 @@ function translateElement(element: InkElement, dx: number, dy: number): void {
 function cloneStroke(stroke: InkStroke): InkStroke {
   return {
     ...stroke,
+    pdfPoints: stroke.pdfPoints?.map((point) => ({ ...point })),
     points: stroke.points.map((point) => ({ ...point }))
   };
 }
@@ -8759,9 +9743,29 @@ function getResizeCorner(bounds: NormalizedBounds, handle: ResizeHandle): InkPoi
 }
 
 function shiftElementsInsidePage(elements: InkElement[]): void {
-  const box = normalizedElementsBounds(elements);
+  let box = normalizedElementsBounds(elements);
   if (!box) {
     return;
+  }
+
+  const width = box.maxX - box.minX;
+  const height = box.maxY - box.minY;
+  if (width > 0.98 || height > 0.98) {
+    const factor = Math.min(
+      width > 0 ? 0.98 / width : 1,
+      height > 0 ? 0.98 / height : 1
+    );
+    const center = {
+      x: (box.minX + box.maxX) / 2,
+      y: (box.minY + box.maxY) / 2
+    };
+    for (const element of elements) {
+      scaleElementAroundPointInPlace(element, center, factor);
+    }
+    box = normalizedElementsBounds(elements);
+    if (!box) {
+      return;
+    }
   }
 
   let dx = 0;
@@ -8785,6 +9789,26 @@ function shiftElementsInsidePage(elements: InkElement[]): void {
   for (const element of elements) {
     translateElement(element, dx, dy);
   }
+}
+
+function scaleElementAroundPointInPlace(element: InkElement, center: InkPoint, factor: number): void {
+  if (element.kind === "stroke") {
+    element.points = element.points.map((point) => ({
+      x: center.x + (point.x - center.x) * factor,
+      y: center.y + (point.y - center.y) * factor
+    }));
+    element.width = clamp(element.width * factor, 0.5, 80);
+    return;
+  }
+
+  element.x = center.x + (element.x - center.x) * factor;
+  element.y = center.y + (element.y - center.y) * factor;
+  if (element.kind === "text") {
+    element.fontSize = clamp(element.fontSize * factor, 4, 96);
+    return;
+  }
+  element.width = clamp(element.width * factor, 0.001, 1);
+  element.height = clamp(element.height * factor, 0.001, 1);
 }
 
 function strokeContainsPoint(
@@ -8838,6 +9862,91 @@ function pointToSegmentDistance(px: number, py: number, ax: number, ay: number, 
 
 function normalizedDistance(a: InkPoint, b: InkPoint, cssWidth: number, cssHeight: number): number {
   return Math.hypot((a.x - b.x) * cssWidth, (a.y - b.y) * cssHeight);
+}
+
+function inkPointsApproximatelyEqual(a: InkPoint[], b: InkPoint[]): boolean {
+  if (a.length !== b.length) {
+    return false;
+  }
+  for (let index = 0; index < a.length; index += 1) {
+    if (Math.abs(a[index].x - b[index].x) > 0.0008 || Math.abs(a[index].y - b[index].y) > 0.0008) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function dedupeInkElements(elements: InkElement[]): InkElement[] {
+  const deduped: InkElement[] = [];
+  for (const element of elements) {
+    if (element.kind !== "stroke") {
+      deduped.push(element);
+      continue;
+    }
+    const duplicateIndex = deduped.findIndex((candidate) => (
+      candidate.kind === "stroke" &&
+      (candidate.id === element.id || isSamePdfInkStrokeCandidate(candidate, element))
+    ));
+    if (duplicateIndex === -1) {
+      deduped.push(element);
+      continue;
+    }
+    const existing = deduped[duplicateIndex];
+    deduped[duplicateIndex] = existing.kind === "stroke" ? chooseInkStrokeToKeep(existing, element) : element;
+  }
+  return deduped;
+}
+
+function chooseInkStrokeToKeep(existing: InkStroke, candidate: InkStroke): InkStroke {
+  if (existing.pdfSaved === true && candidate.pdfSaved !== true) {
+    return candidate;
+  }
+  if (existing.saved && !candidate.saved) {
+    return candidate;
+  }
+  if (candidate.externalDirty === true && existing.externalDirty !== true) {
+    return candidate;
+  }
+  if (candidate.points.length > existing.points.length * 1.2) {
+    return candidate;
+  }
+  return existing;
+}
+
+function isSamePdfInkStrokeCandidate(a: InkStroke, b: InkStroke): boolean {
+  if (a.pageIndex !== b.pageIndex) {
+    return false;
+  }
+  if (normalizeHexColor(a.color) !== normalizeHexColor(b.color)) {
+    return false;
+  }
+  if (Math.abs(a.opacity - b.opacity) > 0.06 || Math.abs(a.width - b.width) > Math.max(2, Math.min(a.width, b.width) * 0.35)) {
+    return false;
+  }
+  if (inkPointsApproximatelyEqual(a.points, b.points)) {
+    return true;
+  }
+  const aBounds = normalizedStrokeBounds(a);
+  const bBounds = normalizedStrokeBounds(b);
+  if (!aBounds || !bBounds) {
+    return false;
+  }
+  const boundsClose =
+    Math.abs(aBounds.minX - bBounds.minX) <= 0.006 &&
+    Math.abs(aBounds.minY - bBounds.minY) <= 0.006 &&
+    Math.abs(aBounds.maxX - bBounds.maxX) <= 0.006 &&
+    Math.abs(aBounds.maxY - bBounds.maxY) <= 0.006;
+  if (!boundsClose) {
+    return false;
+  }
+  const aFirst = a.points[0];
+  const aLast = a.points[a.points.length - 1];
+  const bFirst = b.points[0];
+  const bLast = b.points[b.points.length - 1];
+  return (
+    Math.hypot(aFirst.x - bFirst.x, aFirst.y - bFirst.y) <= 0.012 &&
+    Math.hypot(aLast.x - bLast.x, aLast.y - bLast.y) <= 0.012
+  );
 }
 
 function collectPdfPathHints(rootEl: HTMLElement): string[] {
@@ -9073,7 +10182,11 @@ function markElementSaved<T extends InkElement>(element: T): T {
 }
 
 function markElementUnsaved<T extends InkElement>(element: T): T {
-  return { ...element, saved: false };
+  if (element.kind === "stroke") {
+    return { ...element, pdfSaved: element.pdfSaved, saved: false };
+  }
+  const next = { ...element, saved: false };
+  return next;
 }
 
 function hexToRgb(hex: string): { b: number; g: number; r: number } {

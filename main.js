@@ -52115,7 +52115,7 @@ var PDFButton = (
 var PDFButton_default = PDFButton;
 
 // src/main.ts
-var AUTO_SAVE_IDLE_DELAY_MS = 1800;
+var AUTO_SAVE_IDLE_DELAY_MS = 5200;
 var AUTO_SAVE_CLOSE_DELAY_MS = 200;
 var OVERLAY_HEALTH_CHECK_MS = 5e3;
 var PALETTE_COLORS = [
@@ -53106,6 +53106,7 @@ var PdftionPlugin = class extends import_obsidian.Plugin {
     }
     delete activeWindow[PDFTION_AI_API_NAME];
     getActiveBody().classList.remove("pdftion-menu-boost");
+    getActiveBody().classList.remove("pdftion-editing-active");
     getActiveBody().style.removeProperty("--pdftion-toolbar-button-size");
     getActiveBody().style.removeProperty("--pdftion-toolbar-max-width");
     getActiveBody().style.removeProperty("--pdftion-toolbar-top-offset");
@@ -53114,6 +53115,10 @@ var PdftionPlugin = class extends import_obsidian.Plugin {
     }
     this.sessions.clear();
     this.clearSurfaceScanTimers();
+  }
+  refreshGlobalEditingClass() {
+    const hasActiveSession = Array.from(this.sessions.values()).some((session) => session.isEnabled());
+    getActiveBody().classList.toggle("pdftion-editing-active", hasActiveSession);
   }
   applyRuntimeSettings() {
     const body = getActiveBody();
@@ -53153,7 +53158,8 @@ var PdftionPlugin = class extends import_obsidian.Plugin {
   async loadAnnotationState(file) {
     const currentBytes = await this.app.vault.readBinary(file);
     const currentFingerprint = await fingerprintPdfBytes(currentBytes, file.stat.mtime);
-    const state = await this.loadVerifiedAnnotationRecord(file, currentFingerprint);
+    const loadedState = await this.loadVerifiedAnnotationRecord(file, currentFingerprint);
+    const state = loadedState ? await this.recoverPendingPdfInkAnnotations(file, loadedState, currentBytes) : null;
     if (!state) {
       return null;
     }
@@ -53162,6 +53168,51 @@ var PdftionPlugin = class extends import_obsidian.Plugin {
       overlayAnnotationsOnly: state.overlayAnnotationsOnly === true,
       overlayTextOnly: state.overlayTextOnly === true
     };
+  }
+  async recoverPendingPdfInkAnnotations(file, state, currentBytes) {
+    const hasPendingInk = state.elements.some((element) => element.kind === "stroke" && element.pdfSaved !== true && element.points.length >= 2);
+    if (!hasPendingInk) {
+      return state;
+    }
+    try {
+      const pdf = await PDFDocument_default.load(currentBytes, { ignoreEncryption: true, updateMetadata: false });
+      await syncEditableInkAnnotationsOnPdf(pdf, state.elements);
+      const saved = await pdf.save({ addDefaultPage: false, useObjectStreams: false });
+      const buffer2 = new ArrayBuffer(saved.byteLength);
+      new Uint8Array(buffer2).set(saved);
+      await this.app.vault.modifyBinary(file, buffer2);
+      const elements = state.elements.map((element) => {
+        const cloned = cloneElement(element);
+        cloned.saved = true;
+        if (cloned.kind === "stroke") {
+          cloned.pdfSaved = true;
+          cloned.pdfPoints = cloned.points.map((point) => ({ ...point }));
+          cloned.externalDirty = false;
+          cloned.source = cloned.source ?? "pdftion";
+        }
+        return cloned;
+      });
+      await this.saveEditableAnnotationState(file, elements, buffer2);
+      return {
+        ...state,
+        elements,
+        pdfFingerprint: await fingerprintPdfBytes(buffer2, file.stat.mtime),
+        updatedAt: (/* @__PURE__ */ new Date()).toISOString()
+      };
+    } catch (error2) {
+      console.warn("pdftion could not recover pending PDF ink annotations; keeping editable state for retry.", error2);
+      return state;
+    }
+  }
+  async loadPdfInkAnnotations(file) {
+    try {
+      const binary = await this.app.vault.readBinary(file);
+      const pdf = await PDFDocument_default.load(binary, { ignoreEncryption: true, updateMetadata: false });
+      return extractPdfInkAnnotations(pdf);
+    } catch (error2) {
+      console.warn("pdftion could not import PDF ink annotations.", error2);
+      return [];
+    }
   }
   async saveAnnotationState(file, elements, basePdfFingerprint, savedBytes) {
     const path = this.getAnnotationStatePath(file);
@@ -53172,6 +53223,27 @@ var PdftionPlugin = class extends import_obsidian.Plugin {
       JSON.stringify(
         {
           basePdfFingerprint,
+          filePath: file.path,
+          overlayAnnotationsOnly: true,
+          overlayTextOnly: true,
+          pdfFingerprint,
+          updatedAt: (/* @__PURE__ */ new Date()).toISOString(),
+          version: 6,
+          elements
+        },
+        null,
+        2
+      )
+    );
+  }
+  async saveEditableAnnotationState(file, elements, currentBytes) {
+    const path = this.getAnnotationStatePath(file);
+    const pdfFingerprint = await fingerprintPdfBytes(currentBytes, file.stat.mtime);
+    await this.ensureAdapterFolder(path.substring(0, path.lastIndexOf("/")));
+    await this.app.vault.adapter.write(
+      path,
+      JSON.stringify(
+        {
           filePath: file.path,
           overlayAnnotationsOnly: true,
           overlayTextOnly: true,
@@ -53205,6 +53277,13 @@ var PdftionPlugin = class extends import_obsidian.Plugin {
     await this.ensureAdapterFolder(path.substring(0, path.lastIndexOf("/")));
     await this.app.vault.adapter.writeBinary(path, currentBytes);
     return { bytes: currentBytes, fingerprint: currentFingerprint };
+  }
+  async replaceBasePdfBytes(file, currentBytes) {
+    const fingerprint = await fingerprintPdfBytes(currentBytes, file.stat.mtime);
+    const path = this.getBasePdfPath(file, fingerprint.sha256);
+    await this.ensureAdapterFolder(path.substring(0, path.lastIndexOf("/")));
+    await this.app.vault.adapter.writeBinary(path, currentBytes);
+    return fingerprint;
   }
   getAnnotationStatePath(file) {
     return `${this.manifest.dir}/data/annotations/${safeAnnotationKey(file.path)}.json`;
@@ -53298,6 +53377,7 @@ var PdftionPlugin = class extends import_obsidian.Plugin {
         this.sessions.delete(rootEl);
       }
     }
+    this.refreshGlobalEditingClass();
   }
   findLeafForFile(file) {
     let matched = null;
@@ -53688,6 +53768,11 @@ var InkSession = class {
     this.scanPages();
     this.mutationObserver = new MutationObserver((mutations) => {
       if (this.shouldScanForMutations(mutations)) {
+        if (this.enabled) {
+          this.updateExternalInkLayerState();
+          this.scheduleEditableInkPrepare(80, true);
+          window.setTimeout(() => this.scheduleEditableInkPrepare(0, true), 360);
+        }
         this.scheduleQuietScan();
       }
     });
@@ -53704,6 +53789,26 @@ var InkSession = class {
     this.rootEl.addEventListener("keyup", () => this.scheduleNativeTextSelectionMenu(20), {
       signal: this.nativeTextSelectionAbort.signal
     });
+    this.rootEl.addEventListener("scroll", () => this.scheduleEditableInkPrepare(180), {
+      capture: true,
+      passive: true,
+      signal: this.nativeTextSelectionAbort.signal
+    });
+    activeDocument.addEventListener("scroll", () => this.scheduleEditableInkPrepare(180), {
+      capture: true,
+      passive: true,
+      signal: this.nativeTextSelectionAbort.signal
+    });
+    for (const eventName of ["auxclick", "click", "contextmenu", "dblclick", "mousedown", "mousemove", "mouseover", "mouseup", "pointerdown", "pointermove", "pointerup", "touchstart"]) {
+      this.rootEl.addEventListener(eventName, (event) => this.blockNativePdfAnnotationEvent(event), {
+        capture: true,
+        signal: this.nativeTextSelectionAbort.signal
+      });
+      activeDocument.addEventListener(eventName, (event) => this.blockNativePdfAnnotationEvent(event), {
+        capture: true,
+        signal: this.nativeTextSelectionAbort.signal
+      });
+    }
   }
   plugin;
   leaf;
@@ -53720,9 +53825,14 @@ var InkSession = class {
   imageMenu = null;
   shareMenu = null;
   mutationObserver;
+  hiddenNativeAnnotationStyles = /* @__PURE__ */ new Map();
+  detachedInkEditPages = /* @__PURE__ */ new Set();
   overlays = /* @__PURE__ */ new Map();
   activeTouchId = null;
   annotationLoadToken = 0;
+  annotationLoadPromise = null;
+  detachingPdfInkForEditing = false;
+  pendingEditableInkPrepareAfterSave = false;
   pendingSaveAfterCurrentSave = false;
   palette = null;
   penColor = DEFAULT_SETTINGS.penColor;
@@ -53744,6 +53854,9 @@ var InkSession = class {
   settingsSaveTimer = null;
   scanTimer = null;
   healthTimer = null;
+  inkPrepareTimer = null;
+  inkPrepareTimerForce = false;
+  nativeAnnotationPopupTimer = null;
   selectionDrag = null;
   nativeSelection = null;
   pendingImageCrop = null;
@@ -53771,10 +53884,14 @@ var InkSession = class {
   nativeTextHighlightColor = DEFAULT_SETTINGS.nativeTextHighlightColor;
   destroy() {
     this.flushSoon();
+    this.enabled = false;
+    this.restoreHiddenNativeInkAnnotations();
     this.clearAutoSaveTimer();
     this.clearToolSettingsSaveTimer();
     this.clearScanTimer();
+    this.clearEditableInkPrepareTimer();
     this.stopOverlayHealthCheck();
+    this.stopNativeAnnotationPopupSuppressor();
     this.mutationObserver.disconnect();
     this.button?.remove();
     this.closeNativeTextEditor(false);
@@ -53792,20 +53909,26 @@ var InkSession = class {
     for (const overlay of this.overlays.values()) {
       overlay.abort.abort();
       overlay.canvas.remove();
-      overlay.pageEl.classList.remove("pdftion-page");
+      overlay.pageEl.classList.remove("pdftion-page", "pdftion-hide-native-ink-layer");
     }
     this.overlays.clear();
     this.pendingImageCrop = null;
     this.rootEl.classList.remove("pdftion-enabled", "pdftion-root", "pdftion-selecting");
+    this.plugin.refreshGlobalEditingClass();
+  }
+  isEnabled() {
+    return this.enabled;
   }
   updateFile(file) {
     if (file.path === this.file.path) {
       return;
     }
     this.flushSoon();
+    this.restoreHiddenNativeInkAnnotations();
     this.closeNativeTextEditor(false);
     this.file = file;
     this.clearAutoSaveTimer();
+    this.clearEditableInkPrepareTimer();
     this.currentStroke = null;
     this.dirty = false;
     this.redoStack = [];
@@ -53820,8 +53943,10 @@ var InkSession = class {
     this.textHistory = [];
     this.coverHistory = [];
     this.imageHistory = [];
+    this.detachedInkEditPages.clear();
     this.loadedAnnotationState = false;
     this.annotationLoadToken += 1;
+    this.annotationLoadPromise = null;
     void this.loadEditableAnnotations();
     this.redrawAll();
   }
@@ -53829,27 +53954,59 @@ var InkSession = class {
     if (this.loadedAnnotationState) {
       return;
     }
-    this.loadedAnnotationState = true;
+    if (this.annotationLoadPromise) {
+      return this.annotationLoadPromise;
+    }
+    this.annotationLoadPromise = this.loadEditableAnnotationsInner().finally(() => {
+      this.annotationLoadPromise = null;
+    });
+    return this.annotationLoadPromise;
+  }
+  async loadEditableAnnotationsInner() {
+    if (this.loadedAnnotationState) {
+      return;
+    }
     const filePath = this.file.path;
     const loadToken = ++this.annotationLoadToken;
     const state = await this.plugin.loadAnnotationState(this.file);
     if (loadToken !== this.annotationLoadToken || this.file.path !== filePath) {
       return;
     }
-    if (!state) {
+    const pdfInkStrokes = await this.plugin.loadPdfInkAnnotations(this.file);
+    if (loadToken !== this.annotationLoadToken || this.file.path !== filePath) {
       return;
     }
-    const elements = state.elements.map(markElementSaved);
+    const loadedElements = [
+      ...state?.elements ?? [],
+      ...pdfInkStrokes.filter((stroke2) => !(state?.elements ?? []).some((element) => element.id === stroke2.id || element.kind === "stroke" && isSamePdfInkStrokeCandidate(element, stroke2)))
+    ].map((element) => {
+      if (element.kind !== "stroke") {
+        return markElementSaved(element);
+      }
+      const pdfStroke = pdfInkStrokes.find((stroke3) => stroke3.id === element.id);
+      const pdfPoints = element.pdfPoints ?? pdfStroke?.points;
+      const matchesPdfStroke = Boolean(pdfStroke && pdfPoints && inkPointsApproximatelyEqual(element.points, pdfPoints));
+      const stroke2 = {
+        ...element,
+        externalDirty: matchesPdfStroke ? false : element.externalDirty,
+        pdfPoints: pdfPoints?.map((point) => ({ ...point })),
+        pdfSaved: matchesPdfStroke ? true : element.pdfSaved ?? (pdfStroke ? true : void 0),
+        source: element.source ?? pdfStroke?.source
+      };
+      return markElementSaved(stroke2);
+    });
+    const elements = dedupeInkElements(loadedElements);
     this.strokeHistory = elements.filter((element) => element.kind === "stroke");
     this.textHistory = elements.filter((element) => element.kind === "text");
     this.coverHistory = elements.filter((element) => element.kind === "cover");
     this.imageHistory = elements.filter((element) => element.kind === "image");
-    this.savedInkIsBurnedIntoPdf = !state.overlayAnnotationsOnly && this.strokeHistory.length > 0;
-    this.savedTextIsBurnedIntoPdf = !state.overlayAnnotationsOnly && !state.overlayTextOnly && this.textHistory.length > 0;
+    this.savedInkIsBurnedIntoPdf = state !== null && !state.overlayAnnotationsOnly && this.strokeHistory.length > 0;
+    this.savedTextIsBurnedIntoPdf = state !== null && !state.overlayAnnotationsOnly && !state.overlayTextOnly && this.textHistory.length > 0;
     if (this.savedInkIsBurnedIntoPdf || this.savedTextIsBurnedIntoPdf) {
       this.dirty = true;
       this.scheduleAutoSave(250);
     }
+    this.loadedAnnotationState = true;
     this.redrawAll();
   }
   toggle() {
@@ -53868,6 +54025,7 @@ var InkSession = class {
       this.ensureOverlay(pageEls[i], i);
     }
     this.redrawAll();
+    this.scheduleEditableInkPrepare(120);
   }
   scheduleQuietScan() {
     this.scheduleScanPages(this.enabled ? 320 : 120);
@@ -53989,12 +54147,18 @@ var InkSession = class {
       return officialHost;
     }
     if (this.isEmbeddedPdfSurface()) {
+      if (this.isSpacedRepetitionSurface()) {
+        return this.ensureInlineEmbedHost();
+      }
       return this.rootEl.querySelector(".file-embed-title .file-embed-title-inner") ?? this.rootEl.querySelector(".file-embed-title") ?? this.rootEl.querySelector(".embed-title .embed-title-inner") ?? this.rootEl.querySelector(".embed-title") ?? this.findSpacedRepetitionHost() ?? this.ensureInlineEmbedHost();
     }
     return null;
   }
   isEmbeddedPdfSurface() {
     return this.rootEl.matches(".internal-embed, .media-embed, .file-embed, .markdown-embed") || this.rootEl.closest(".internal-embed, .media-embed, .file-embed, .markdown-embed") !== null || this.rootEl.closest(".sr-modal, .sr-card, .spaced-repetition, .spaced-repetition-modal, .review-modal, .review-card") !== null;
+  }
+  isSpacedRepetitionSurface() {
+    return this.rootEl.closest(".sr-modal, .sr-card, .spaced-repetition, .spaced-repetition-modal, .review-modal, .review-card") !== null;
   }
   findSpacedRepetitionHost() {
     const srRoot = this.rootEl.closest(".sr-modal, .sr-card, .spaced-repetition, .spaced-repetition-modal, .review-modal, .review-card");
@@ -54009,7 +54173,7 @@ var InkSession = class {
       return existing;
     }
     const host = activeDocument.createElement("div");
-    host.className = "pdftion-inline-actions";
+    host.className = this.isSpacedRepetitionSurface() ? "pdftion-inline-actions pdftion-sr-inline-actions" : "pdftion-inline-actions";
     const title2 = this.rootEl.querySelector(".file-embed-title, .embed-title, .markdown-embed-title") ?? this.rootEl.firstElementChild;
     if (title2?.parentElement) {
       title2.insertAdjacentElement("afterend", host);
@@ -54143,6 +54307,19 @@ var InkSession = class {
       this.healthTimer = null;
     }
   }
+  startNativeAnnotationPopupSuppressor() {
+    if (this.nativeAnnotationPopupTimer !== null) {
+      return;
+    }
+    this.nativeAnnotationPopupTimer = window.setInterval(() => this.hideNativePdfAnnotationPopups(), 180);
+  }
+  stopNativeAnnotationPopupSuppressor() {
+    if (this.nativeAnnotationPopupTimer !== null) {
+      window.clearInterval(this.nativeAnnotationPopupTimer);
+      this.nativeAnnotationPopupTimer = null;
+    }
+    this.hideNativePdfAnnotationPopups();
+  }
   repairActiveOverlays() {
     if (!this.enabled || this.isInteracting()) {
       return;
@@ -54162,24 +54339,34 @@ var InkSession = class {
     }
     if (repaired) {
       this.redrawAll();
+      void this.prepareEditableInkForCurrentPage();
       return;
     }
+    void this.prepareEditableInkForCurrentPage();
     this.scheduleScanPages(0);
   }
   setEnabled(enabled, options = {}) {
     this.enabled = enabled;
     this.rootEl.classList.toggle("pdftion-enabled", this.enabled);
     this.rootEl.classList.toggle("pdftion-selecting", this.enabled && (this.tool === "select" || this.tool === "image-crop"));
+    this.plugin.refreshGlobalEditingClass();
     this.updateButtonState();
     if (this.enabled) {
+      this.pendingEditableInkPrepareAfterSave = false;
+      this.detachedInkEditPages.clear();
       this.showToolbar();
       this.scanPages();
       this.startOverlayHealthCheck();
+      this.startNativeAnnotationPopupSuppressor();
+      this.scheduleEditableInkPrepare(0, true);
+      window.setTimeout(() => this.scheduleEditableInkPrepare(0, true), 650);
+      window.setTimeout(() => this.scheduleEditableInkPrepare(0, true), 1600);
       if (options.notice !== false) {
         new import_obsidian.Notice(uiText("PDF \u6279\u6CE8\u5DF2\u5F00\u542F\u3002", "PDF annotation enabled."));
       }
     } else {
       this.stopOverlayHealthCheck();
+      this.stopNativeAnnotationPopupSuppressor();
       this.currentStroke = null;
       this.selectionDrag = null;
       this.nativeSelection = null;
@@ -54193,10 +54380,154 @@ var InkSession = class {
       this.shareMenu = null;
       this.toolbar?.remove();
       this.toolbar = null;
-      if (this.dirty) {
+      if (this.hasPendingPdfWrite()) {
         this.scheduleAutoSave(AUTO_SAVE_CLOSE_DELAY_MS);
       }
       this.redrawAll();
+    }
+  }
+  async prepareEditableInkForCurrentPage(force = false) {
+    try {
+      await this.loadEditableAnnotations();
+      if (!this.enabled) {
+        return;
+      }
+      if (this.saving) {
+        this.pendingEditableInkPrepareAfterSave = true;
+        return;
+      }
+      const pageIndexes = this.getCurrentInkDetachPages(force);
+      if (pageIndexes.size === 0) {
+        return;
+      }
+      await this.detachPdfInkForEditing(pageIndexes);
+    } catch (error2) {
+      console.warn("pdftion could not prepare PDF ink for editable mode.", error2);
+    }
+  }
+  scheduleEditableInkPrepare(delay = 160, force = false) {
+    if (!this.enabled) {
+      return;
+    }
+    const shouldForce = force || this.inkPrepareTimerForce;
+    this.clearEditableInkPrepareTimer();
+    this.inkPrepareTimerForce = shouldForce;
+    this.inkPrepareTimer = window.setTimeout(() => {
+      const runForce = this.inkPrepareTimerForce;
+      this.inkPrepareTimerForce = false;
+      this.inkPrepareTimer = null;
+      void this.prepareEditableInkForCurrentPage(runForce);
+    }, delay);
+  }
+  clearEditableInkPrepareTimer() {
+    if (this.inkPrepareTimer !== null) {
+      window.clearTimeout(this.inkPrepareTimer);
+      this.inkPrepareTimer = null;
+    }
+    this.inkPrepareTimerForce = false;
+  }
+  getCurrentInkDetachPages(force = false) {
+    const pages = /* @__PURE__ */ new Set();
+    const viewportHeight = activeWindow.innerHeight || activeDocument.documentElement.clientHeight || 1;
+    for (const overlay of this.overlays.values()) {
+      if (!force && this.detachedInkEditPages.has(overlay.pageIndex)) {
+        continue;
+      }
+      const rect = overlay.pageEl.getBoundingClientRect();
+      if (rect.bottom >= -80 && rect.top <= viewportHeight + 80) {
+        pages.add(overlay.pageIndex);
+      }
+    }
+    if (pages.size === 0) {
+      const overlay = this.getVisibleOverlay() ?? Array.from(this.overlays.values()).sort((a, b) => a.pageIndex - b.pageIndex)[0];
+      if (overlay && (force || !this.detachedInkEditPages.has(overlay.pageIndex))) {
+        pages.add(overlay.pageIndex);
+      }
+    }
+    return pages;
+  }
+  async detachPdfInkForEditing(pageIndexes) {
+    if (pageIndexes.size === 0 || this.detachingPdfInkForEditing) {
+      return;
+    }
+    if (this.saving) {
+      this.pendingEditableInkPrepareAfterSave = true;
+      window.setTimeout(() => void this.prepareEditableInkForCurrentPage(true), 250);
+      return;
+    }
+    this.detachingPdfInkForEditing = true;
+    this.saving = true;
+    const targetFile = this.file;
+    const targetPath = targetFile.path;
+    try {
+      const binary = await this.plugin.app.vault.readBinary(targetFile);
+      const pdf = await PDFDocument_default.load(binary, { ignoreEncryption: true, updateMetadata: false });
+      const detachedStrokes = detachPdfInkAnnotations(pdf, pageIndexes);
+      let buffer2 = binary;
+      if (detachedStrokes.length > 0) {
+        const saved = await pdf.save({ addDefaultPage: false, useObjectStreams: false });
+        buffer2 = new ArrayBuffer(saved.byteLength);
+        new Uint8Array(buffer2).set(saved);
+        await this.plugin.app.vault.modifyBinary(targetFile, buffer2);
+        if (this.file.path !== targetPath) {
+          return;
+        }
+      }
+      for (const stroke2 of detachedStrokes) {
+        const existing = this.strokeHistory.find((candidate) => candidate.id === stroke2.id);
+        if (existing) {
+          if (existing.pdfSaved === true && existing.saved && existing.externalDirty !== true) {
+            existing.points = stroke2.points.map((point) => ({ ...point }));
+            existing.color = stroke2.color;
+            existing.opacity = stroke2.opacity;
+            existing.pageCssHeight = stroke2.pageCssHeight;
+            existing.pageCssWidth = stroke2.pageCssWidth;
+            existing.tool = stroke2.tool;
+            existing.width = stroke2.width;
+          }
+          existing.pdfPoints = stroke2.pdfPoints?.map((point) => ({ ...point })) ?? stroke2.points.map((point) => ({ ...point }));
+          existing.pdfSaved = false;
+          existing.externalDirty = true;
+          existing.source = existing.source ?? stroke2.source;
+          existing.saved = false;
+        } else {
+          this.strokeHistory.push({
+            ...stroke2,
+            externalDirty: true,
+            pdfPoints: stroke2.pdfPoints?.map((point) => ({ ...point })) ?? stroke2.points.map((point) => ({ ...point })),
+            pdfSaved: false,
+            points: stroke2.points.map((point) => ({ ...point })),
+            saved: false
+          });
+        }
+      }
+      for (const pageIndex of pageIndexes) {
+        this.detachedInkEditPages.add(pageIndex);
+      }
+      if (detachedStrokes.length > 0) {
+        const stateElements = this.getEditableElements().map(markElementSaved);
+        await this.plugin.saveEditableAnnotationState(targetFile, stateElements, buffer2);
+        const savedElementIds = new Set(stateElements.map((element) => element.id));
+        for (const element of this.getEditableElements()) {
+          if (savedElementIds.has(element.id)) {
+            element.saved = true;
+          }
+        }
+      }
+      this.dirty = this.getEditableElements().some((element) => !element.saved);
+      if (this.file.path === targetPath) {
+        this.redrawAll();
+      }
+    } catch (error2) {
+      console.warn("pdftion could not detach PDF ink annotations for editing.", error2);
+    } finally {
+      this.detachingPdfInkForEditing = false;
+      this.saving = false;
+      this.flushPendingEditableInkPrepare();
+      if (this.pendingSaveAfterCurrentSave) {
+        this.pendingSaveAfterCurrentSave = false;
+        this.scheduleAutoSave(AUTO_SAVE_IDLE_DELAY_MS);
+      }
     }
   }
   updateButtonState() {
@@ -55224,6 +55555,86 @@ var InkSession = class {
   getPdfCanvas(overlay) {
     return overlay.pageEl.querySelector(".canvasWrapper canvas") ?? Array.from(overlay.pageEl.querySelectorAll("canvas")).find((canvas) => canvas !== overlay.canvas) ?? null;
   }
+  blockNativePdfAnnotationEvent(event) {
+    if (!this.enabled) {
+      return;
+    }
+    const path = typeof event.composedPath === "function" ? event.composedPath() : [];
+    const target = event.target;
+    const insideSession = path.some((value) => value === this.rootEl || isHTMLElement(value) && this.rootEl.contains(value));
+    const targetElement = isHTMLElement(target) ? target : null;
+    if (!insideSession && !(targetElement && (this.isNativePdfAnnotationPopup(targetElement) || this.looksLikeNativeAnnotationMenu(targetElement)))) {
+      return;
+    }
+    const fromNativeAnnotation = path.some((value) => isHTMLElement(value) && this.isNativePdfAnnotationElement(value));
+    const fromNativePopup = targetElement !== null && (this.isNativePdfAnnotationPopup(targetElement) || this.looksLikeNativeAnnotationMenu(targetElement));
+    if (!fromNativeAnnotation && !fromNativePopup) {
+      this.hideNativePdfAnnotationPopups();
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    if (typeof event.stopImmediatePropagation === "function") {
+      event.stopImmediatePropagation();
+    }
+    this.hideNativePdfAnnotationPopups();
+    window.setTimeout(() => this.hideNativePdfAnnotationPopups(), 0);
+  }
+  hideNativePdfAnnotationPopups() {
+    const rootRect = this.rootEl.getBoundingClientRect();
+    const selectors = [
+      ".annotationLayer .popupWrapper",
+      ".annotationLayer .popup",
+      ".annotationEditorLayer .popupWrapper",
+      ".annotationEditorLayer .popup",
+      ".pdf-annotation-popup",
+      ".pdfAnnotationPopup",
+      ".popupAnnotation",
+      ".popover",
+      ".hover-popover",
+      ".menu"
+    ];
+    for (const candidate of Array.from(activeDocument.querySelectorAll(selectors.join(",")))) {
+      if (candidate.closest(".pdftion-root, .pdftion-toolbar, .pdftion-panel, .pdftion-palette-panel, .pdftion-native-selection-menu")) {
+        continue;
+      }
+      const rect = candidate.getBoundingClientRect();
+      const nearSession = rectsOverlap(
+        {
+          bottom: rootRect.bottom + 80,
+          left: rootRect.left - 80,
+          right: rootRect.right + 80,
+          top: rootRect.top - 80
+        },
+        rect
+      );
+      if (!nearSession && !this.isNativePdfAnnotationPopup(candidate)) {
+        continue;
+      }
+      if (!this.isNativePdfAnnotationPopup(candidate) && !this.looksLikeNativeAnnotationMenu(candidate)) {
+        continue;
+      }
+      candidate.style.setProperty("display", "none", "important");
+      candidate.style.setProperty("pointer-events", "none", "important");
+    }
+  }
+  isNativePdfAnnotationElement(element) {
+    return element.closest(
+      ".annotationLayer, .annotationEditorLayer, .popupAnnotation, [data-annotation-id], [data-pdf-annotation-id]"
+    ) !== null;
+  }
+  isNativePdfAnnotationPopup(element) {
+    return element.closest(
+      ".annotationLayer .popupWrapper, .annotationLayer .popup, .annotationEditorLayer .popupWrapper, .annotationEditorLayer .popup, .pdf-annotation-popup, .pdfAnnotationPopup, .popupAnnotation"
+    ) !== null;
+  }
+  looksLikeNativeAnnotationMenu(element) {
+    const text = (element.textContent ?? "").trim();
+    if (!text || text.length > 120) {
+      return false;
+    }
+    return /复制|信息|注释|批注|copy|info|annotation/i.test(text);
+  }
   beginSelectionInteraction(point, overlay) {
     const handle = this.findSelectionHandleAt(overlay, point);
     if (handle) {
@@ -55264,6 +55675,7 @@ var InkSession = class {
     if (this.hasEditableSelection(overlay.pageIndex) && this.selectionBoxContainsPoint(overlay, point)) {
       this.nativeSelection = null;
       this.selectionDrag = {
+        clearSelectionOnTap: true,
         current: point,
         mode: "move",
         moved: false,
@@ -55274,6 +55686,13 @@ var InkSession = class {
       return;
     }
     if (!selected) {
+      if (this.selectedStrokeIds.size > 0 || this.nativeSelection !== null) {
+        this.selectedStrokeIds.clear();
+        this.nativeSelection = null;
+        this.selectionDrag = null;
+        this.redrawAll();
+        return;
+      }
       const blockingCover = this.findCoverElementAt(overlay, point, true);
       if (blockingCover?.source === "native-text") {
         this.selectedStrokeIds.clear();
@@ -56072,8 +56491,8 @@ var InkSession = class {
       if (!("color" in element) || normalizeHexColor(element.color) === color) {
         continue;
       }
+      this.markElementChanged(element);
       element.color = color;
-      element.saved = false;
       changed = true;
     }
     if (!changed) {
@@ -56196,8 +56615,8 @@ var InkSession = class {
         drag.historyRecorded = true;
       }
       for (const element of selected) {
+        this.markElementChanged(element);
         translateElement(element, dx, dy);
-        element.saved = false;
       }
       this.markDirty();
       this.redoStack = [];
@@ -56317,7 +56736,11 @@ var InkSession = class {
     if (drag.mode === "move") {
       if (drag.moved) {
         this.redrawAll();
-        this.scheduleAutoSave();
+        this.scheduleAutoSave(250);
+      } else if (drag.clearSelectionOnTap) {
+        this.selectedStrokeIds.clear();
+        this.nativeSelection = null;
+        this.redrawAll();
       }
       this.updateToolbarState();
       return;
@@ -56325,7 +56748,7 @@ var InkSession = class {
     if (drag.mode === "resize") {
       if (drag.moved) {
         this.redrawAll();
-        this.scheduleAutoSave();
+        this.scheduleAutoSave(250);
       }
       this.updateToolbarState();
       return;
@@ -56568,6 +56991,7 @@ var InkSession = class {
     this.scheduleAutoSave();
   }
   redrawAll() {
+    this.updateExternalInkLayerState();
     for (const overlay of this.overlays.values()) {
       this.redrawOverlay(overlay);
     }
@@ -56597,9 +57021,14 @@ var InkSession = class {
       }
     }
     for (const stroke2 of this.strokeHistory) {
-      if (stroke2.pageIndex === overlay.pageIndex && (!stroke2.saved || !this.savedInkIsBurnedIntoPdf)) {
-        drawStroke(ctx, stroke2, overlay.cssWidth, overlay.cssHeight, !editingText && this.selectedStrokeIds.has(stroke2.id));
+      if (stroke2.pageIndex !== overlay.pageIndex) {
+        continue;
       }
+      if (this.savedInkIsBurnedIntoPdf && stroke2.saved) {
+        continue;
+      }
+      const selected2 = !editingText && this.selectedStrokeIds.has(stroke2.id);
+      drawStroke(ctx, stroke2, overlay.cssWidth, overlay.cssHeight, selected2);
     }
     if (previewStroke && previewStroke.pageIndex === overlay.pageIndex) {
       drawStroke(ctx, previewStroke, overlay.cssWidth, overlay.cssHeight, !editingText && this.selectedStrokeIds.has(previewStroke.id));
@@ -56640,14 +57069,11 @@ var InkSession = class {
     ctx.restore();
   }
   async saveIntoPdf(auto = false) {
-    if (auto) {
-      await this.saveEditableState();
-      return;
-    }
     const elements = this.getEditableElements();
     const targetFile = this.file;
     const targetPath = targetFile.path;
-    if (!this.dirty && elements.every((element) => element.saved)) {
+    const hasUnsavedPdfStroke = elements.some((element) => element.kind === "stroke" && element.pdfSaved !== true);
+    if (!this.dirty && elements.every((element) => element.saved) && !hasUnsavedPdfStroke) {
       if (!auto) {
         new import_obsidian.Notice(uiText("\u6CA1\u6709\u65B0\u7684\u6807\u6CE8\u9700\u8981\u4FDD\u5B58\u3002", "No new annotations to save."));
       }
@@ -56661,14 +57087,26 @@ var InkSession = class {
     this.saving = true;
     try {
       const binary = await this.plugin.app.vault.readBinary(targetFile);
-      const basePdf = await this.plugin.ensureBasePdfBytes(targetFile, binary);
-      const pdf = await PDFDocument_default.load(basePdf.bytes, { ignoreEncryption: true });
-      await drawInkElementsOnPdf(pdf, elements);
-      const saved = await pdf.save({ useObjectStreams: true });
+      const pdf = await PDFDocument_default.load(binary, { ignoreEncryption: true, updateMetadata: false });
+      await syncEditableInkAnnotationsOnPdf(pdf, elements);
+      const saved = await pdf.save({ addDefaultPage: false, useObjectStreams: false });
       const buffer2 = new ArrayBuffer(saved.byteLength);
       new Uint8Array(buffer2).set(saved);
       await this.plugin.app.vault.modifyBinary(targetFile, buffer2);
-      await this.plugin.saveAnnotationState(targetFile, elements.map(markElementSaved), basePdf.fingerprint, buffer2);
+      const markedElements = elements.map((element) => {
+        const wroteStrokeToPdf = element.kind === "stroke" && element.pdfSaved !== true;
+        element.saved = true;
+        if (element.kind === "stroke") {
+          element.pdfSaved = true;
+          element.pdfPoints = element.points.map((point) => ({ ...point }));
+          element.externalDirty = false;
+          if (wroteStrokeToPdf) {
+            element.source = "pdftion";
+          }
+        }
+        return cloneElement(element);
+      });
+      await this.plugin.saveEditableAnnotationState(targetFile, markedElements, buffer2);
       if (this.file.path !== targetPath) {
         return;
       }
@@ -56676,20 +57114,26 @@ var InkSession = class {
       this.currentCover = null;
       this.savedInkIsBurnedIntoPdf = false;
       this.savedTextIsBurnedIntoPdf = false;
-      for (const element of elements) {
-        element.saved = true;
-      }
+      this.detachedInkEditPages.clear();
       this.pruneSelection();
       this.dirty = false;
-      this.redrawAll();
+      this.updateExternalInkLayerState();
+      if (!auto) {
+        this.redrawAll();
+      }
       if (!auto) {
         new import_obsidian.Notice(uiText(`\u5DF2\u4FDD\u5B58\u5230 ${targetFile.name}\u3002`, `Saved into ${targetFile.name}.`));
       }
     } catch (error2) {
       console.error(error2);
-      new import_obsidian.Notice(uiText("\u81EA\u52A8\u4FDD\u5B58\u5931\u8D25\uFF0C\u8BF7\u67E5\u770B\u63A7\u5236\u53F0\u3002", "Could not auto-save into this PDF. Check the console for details."));
+      if (auto) {
+        await this.saveEditableStateWhileSaving();
+      } else {
+        new import_obsidian.Notice(uiText("\u81EA\u52A8\u4FDD\u5B58\u5931\u8D25\uFF0C\u8BF7\u67E5\u770B\u63A7\u5236\u53F0\u3002", "Could not auto-save into this PDF. Check the console for details."));
+      }
     } finally {
       this.saving = false;
+      this.flushPendingEditableInkPrepare();
       if (this.pendingSaveAfterCurrentSave) {
         this.pendingSaveAfterCurrentSave = false;
         this.scheduleAutoSave(AUTO_SAVE_IDLE_DELAY_MS);
@@ -56711,8 +57155,7 @@ var InkSession = class {
     this.saving = true;
     try {
       const binary = await this.plugin.app.vault.readBinary(targetFile);
-      const basePdf = await this.plugin.ensureBasePdfBytes(targetFile, binary);
-      await this.plugin.saveAnnotationState(targetFile, elements.map(markElementSaved), basePdf.fingerprint, binary);
+      await this.plugin.saveEditableAnnotationState(targetFile, elements.map(markElementSaved), binary);
       if (this.file.path !== targetPath) {
         return;
       }
@@ -56723,15 +57166,27 @@ var InkSession = class {
       }
       this.dirty = false;
     } catch (error2) {
-      console.error(error2);
-      new import_obsidian.Notice(uiText("\u4FDD\u5B58 Pdftion \u53EF\u7F16\u8F91\u6807\u6CE8\u5931\u8D25\uFF0C\u8BF7\u67E5\u770B\u63A7\u5236\u53F0\u3002", "Could not save Pdftion editable annotations. Check the console for details."));
+      console.warn("pdftion could not save editable annotation state; retrying.", error2);
+      if (this.file.path === targetPath) {
+        this.scheduleAutoSave(1200);
+      }
     } finally {
       this.saving = false;
+      this.flushPendingEditableInkPrepare();
       if (this.pendingSaveAfterCurrentSave) {
         this.pendingSaveAfterCurrentSave = false;
         this.scheduleAutoSave(AUTO_SAVE_IDLE_DELAY_MS);
       }
     }
+  }
+  flushPendingEditableInkPrepare() {
+    if (!this.pendingEditableInkPrepareAfterSave || !this.enabled) {
+      return;
+    }
+    this.pendingEditableInkPrepareAfterSave = false;
+    this.detachedInkEditPages.clear();
+    this.scheduleEditableInkPrepare(0, true);
+    window.setTimeout(() => this.scheduleEditableInkPrepare(0, true), 500);
   }
   async exportAnnotationsMarkdown() {
     this.commitNativeTextEditor();
@@ -56957,11 +57412,21 @@ var InkSession = class {
       const targetFile = this.file;
       const targetPath = await this.getUniqueAnnotatedPdfPath(targetFile);
       const binary = await this.plugin.app.vault.readBinary(targetFile);
-      const basePdf = await this.plugin.ensureBasePdfBytes(targetFile, binary);
-      const pdf = await PDFDocument_default.load(basePdf.bytes, { ignoreEncryption: true });
+      let basePdf = await this.plugin.ensureBasePdfBytes(targetFile, binary);
+      let pdf;
+      try {
+        pdf = await PDFDocument_default.load(basePdf.bytes, { ignoreEncryption: true, updateMetadata: false });
+      } catch (error2) {
+        console.warn("pdftion could not load the stored base PDF for export; retrying with the current PDF.", error2);
+        basePdf = {
+          bytes: binary,
+          fingerprint: await this.plugin.replaceBasePdfBytes(targetFile, binary)
+        };
+        pdf = await PDFDocument_default.load(binary, { ignoreEncryption: true, updateMetadata: false });
+      }
       const fontBytes = elements.some((element) => element.kind === "text") ? await this.plugin.loadAnnotationFontBytes() : null;
       await drawVisibleInkElementsOnPdf(pdf, elements, fontBytes);
-      const saved = await pdf.save({ useObjectStreams: true });
+      const saved = await pdf.save({ addDefaultPage: false, useObjectStreams: false });
       const buffer2 = new ArrayBuffer(saved.byteLength);
       new Uint8Array(buffer2).set(saved);
       const exportedFile = await this.plugin.app.vault.createBinary(targetPath, buffer2);
@@ -57713,6 +58178,56 @@ var InkSession = class {
   hasEditableSelection(pageIndex) {
     return this.getSelectedEditableElements(pageIndex).length > 0;
   }
+  updateExternalInkLayerState() {
+    this.restoreHiddenNativeInkAnnotations();
+    for (const overlay of this.overlays.values()) {
+      const targets = this.strokeHistory.filter((stroke2) => stroke2.pageIndex === overlay.pageIndex && Array.isArray(stroke2.pdfPoints));
+      overlay.pageEl.classList.toggle("pdftion-hide-native-ink-layer", targets.length > 0);
+      if (targets.length === 0) {
+        continue;
+      }
+      for (const layer of Array.from(overlay.pageEl.querySelectorAll(".annotationLayer, .annotationEditorLayer"))) {
+        this.hiddenNativeAnnotationStyles.set(layer, layer.style.visibility);
+        layer.style.visibility = "hidden";
+      }
+      const canvasRect = overlay.canvas.getBoundingClientRect();
+      const targetRects = targets.map((stroke2) => normalizedStrokeBounds({ ...stroke2, points: stroke2.pdfPoints ?? stroke2.points })).filter((bounds) => bounds !== null).map((bounds) => {
+        const pad2 = 24;
+        return {
+          bottom: canvasRect.top + bounds.maxY * canvasRect.height + pad2,
+          left: canvasRect.left + bounds.minX * canvasRect.width - pad2,
+          right: canvasRect.left + bounds.maxX * canvasRect.width + pad2,
+          top: canvasRect.top + bounds.minY * canvasRect.height - pad2
+        };
+      });
+      if (targetRects.length === 0) {
+        continue;
+      }
+      for (const candidate of Array.from(overlay.pageEl.querySelectorAll(".annotationLayer *, .annotationEditorLayer *"))) {
+        const rect = candidate.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) {
+          continue;
+        }
+        if (targetRects.some((target) => rectsOverlap(target, rect))) {
+          this.hiddenNativeAnnotationStyles.set(candidate, candidate.style.visibility);
+          candidate.style.visibility = "hidden";
+        }
+      }
+    }
+  }
+  restoreHiddenNativeInkAnnotations() {
+    for (const [element, visibility] of this.hiddenNativeAnnotationStyles) {
+      if (visibility) {
+        element.style.visibility = visibility;
+      } else {
+        element.style.removeProperty("visibility");
+      }
+    }
+    this.hiddenNativeAnnotationStyles.clear();
+    for (const overlay of this.overlays.values()) {
+      overlay.pageEl.classList.remove("pdftion-hide-native-ink-layer");
+    }
+  }
   selectionBoxContainsPoint(overlay, point) {
     const bounds = normalizedElementsBounds(this.getSelectedEditableElements(overlay.pageIndex));
     if (!bounds) {
@@ -57750,7 +58265,7 @@ var InkSession = class {
       if (!live) {
         continue;
       }
-      live.saved = false;
+      this.markElementChanged(live);
       if (live.kind === "stroke" && element.kind === "stroke") {
         live.points = element.points;
         live.width = element.width;
@@ -57832,10 +58347,40 @@ var InkSession = class {
     return this.getEditableElements().some((element) => !element.saved);
   }
   hasPendingPdfWrite() {
-    return this.dirty || this.getEditableElements().some((element) => !element.saved);
+    return this.dirty || this.getEditableElements().some((element) => !element.saved || element.kind === "stroke" && element.pdfSaved !== true);
   }
   markDirty() {
     this.dirty = true;
+  }
+  markElementChanged(element) {
+    element.saved = false;
+    if (element.kind === "stroke") {
+      if (element.pdfSaved === true && !element.pdfPoints) {
+        element.pdfPoints = element.points.map((point) => ({ ...point }));
+      }
+      if (element.source === "external-ink") {
+        element.externalDirty = true;
+      }
+      element.pdfSaved = false;
+    }
+  }
+  async saveEditableStateWhileSaving() {
+    const elements = this.getEditableElements();
+    const targetFile = this.file;
+    const targetPath = targetFile.path;
+    try {
+      const binary = await this.plugin.app.vault.readBinary(targetFile);
+      await this.plugin.saveEditableAnnotationState(targetFile, elements.map(markElementSaved), binary);
+      if (this.file.path !== targetPath) {
+        return;
+      }
+      for (const element of elements) {
+        element.saved = true;
+      }
+      this.dirty = false;
+    } catch (error2) {
+      console.error(error2);
+    }
   }
   getFilePath() {
     return this.file.path;
@@ -58238,10 +58783,15 @@ var InkSession = class {
       return;
     }
     this.clearAutoSaveTimer();
+    const effectiveDelay = this.enabled ? Math.min(delay, 900) : delay;
     this.saveTimer = window.setTimeout(() => {
       this.saveTimer = null;
-      void this.saveIntoPdf(true);
-    }, delay);
+      if (this.enabled) {
+        void this.saveEditableState();
+      } else {
+        void this.saveIntoPdf(true);
+      }
+    }, effectiveDelay);
   }
   flushSoon() {
     if (!this.hasPendingPdfWrite()) {
@@ -58294,6 +58844,7 @@ var InkSession = class {
       }
       overlay.abort.abort();
       overlay.canvas.remove();
+      pageEl.classList.remove("pdftion-page", "pdftion-hide-native-ink-layer");
       this.overlays.delete(pageEl);
     }
   }
@@ -58311,26 +58862,316 @@ async function embedAnnotationFont(pdf, fontBytes) {
   pdf.registerFontkit(resolvePdfFontkit(fontkit_es_exports));
   return pdf.embedFont(fontBytes, { subset: true });
 }
-async function drawInkElementsOnPdf(pdf, elements) {
+async function syncEditableInkAnnotationsOnPdf(pdf, elements) {
+  const strokesToWrite = elements.filter((element) => element.kind === "stroke" && element.pdfSaved !== true);
+  removeTargetInkAnnotations(
+    pdf,
+    new Set(strokesToWrite.filter((stroke2) => stroke2.source !== "external-ink").map((stroke2) => stroke2.id)),
+    new Set(strokesToWrite.filter((stroke2) => stroke2.source === "external-ink" && stroke2.externalDirty === true).map((stroke2) => stroke2.id))
+  );
   const pages = pdf.getPages();
-  const orderedElements = elements.filter((element) => element.kind === "cover");
-  for (const element of orderedElements) {
-    const page = pages[element.pageIndex];
+  for (const stroke2 of strokesToWrite) {
+    const page = pages[stroke2.pageIndex];
+    if (!page || stroke2.points.length < 2) {
+      continue;
+    }
+    if (!addStandardInkAnnotation(pdf, page, stroke2)) {
+      const size = page.getSize();
+      drawStrokeAsPdfLines(page, stroke2, size.width, size.height);
+    }
+  }
+}
+function removeTargetInkAnnotations(pdf, pdftionIds = /* @__PURE__ */ new Set(), importedExternalIds = /* @__PURE__ */ new Set()) {
+  const pages = pdf.getPages();
+  for (let pageIndex = 0; pageIndex < pages.length; pageIndex += 1) {
+    const page = pages[pageIndex];
+    const annots = page.node.Annots?.();
+    if (!annots) {
+      continue;
+    }
+    for (let index = annots.size() - 1; index >= 0; index -= 1) {
+      const annot = annots.lookupMaybe(index, PDFDict_default);
+      if (annot && (pdftionIds.has(pdftionInkStrokeId(annot) ?? "") || importedExternalIds.has(externalInkStrokeId(pageIndex, index, annot)))) {
+        annots.remove(index);
+      }
+    }
+  }
+}
+function isPdftionInkAnnotation(annot) {
+  const subtype = annot.lookupMaybe(PDFName_default.of("Subtype"), PDFName_default);
+  if (subtype?.decodeText() !== "Ink") {
+    return false;
+  }
+  const nm = decodePdfText(annot.lookupMaybe(PDFName_default.of("NM"), PDFString_default, PDFHexString_default));
+  const contents = decodePdfText(annot.lookupMaybe(PDFName_default.of("Contents"), PDFString_default, PDFHexString_default));
+  const title2 = decodePdfText(annot.lookupMaybe(PDFName_default.of("T"), PDFString_default, PDFHexString_default));
+  return nm.startsWith("Pdftion:") || contents.startsWith("Pdftion ") || title2 === "Pdftion";
+}
+function extractPdfInkAnnotations(pdf) {
+  const strokes = [];
+  const pages = pdf.getPages();
+  for (let pageIndex = 0; pageIndex < pages.length; pageIndex += 1) {
+    const page = pages[pageIndex];
+    const size = page.getSize();
+    const annots = page.node.Annots?.();
+    if (!annots) {
+      continue;
+    }
+    for (let annotIndex = 0; annotIndex < annots.size(); annotIndex += 1) {
+      const annot = annots.lookupMaybe(annotIndex, PDFDict_default);
+      if (!annot) {
+        continue;
+      }
+      const stroke2 = externalInkAnnotationToStroke(annot, pageIndex, annotIndex, size.width, size.height);
+      if (stroke2) {
+        strokes.push(stroke2);
+      }
+    }
+  }
+  return strokes;
+}
+function detachPdfInkAnnotations(pdf, pageIndexes) {
+  const strokes = [];
+  const pages = pdf.getPages();
+  for (const pageIndex of Array.from(pageIndexes).sort((a, b) => a - b)) {
+    const page = pages[pageIndex];
     if (!page) {
       continue;
     }
     const size = page.getSize();
-    if (element.kind === "cover") {
-      const color = hexToRgb(element.color);
-      page.drawRectangle({
-        color: rgb(color.r, color.g, color.b),
-        height: element.height * size.height,
-        opacity: element.opacity,
-        width: element.width * size.width,
-        x: element.x * size.width,
-        y: size.height - (element.y + element.height) * size.height
+    const annots = page.node.Annots?.();
+    if (!annots) {
+      continue;
+    }
+    const pageStrokes = [];
+    for (let annotIndex = annots.size() - 1; annotIndex >= 0; annotIndex -= 1) {
+      const annot = annots.lookupMaybe(annotIndex, PDFDict_default);
+      if (!annot) {
+        continue;
+      }
+      const stroke2 = externalInkAnnotationToStroke(annot, pageIndex, annotIndex, size.width, size.height);
+      if (!stroke2) {
+        continue;
+      }
+      annots.remove(annotIndex);
+      pageStrokes.push(stroke2);
+    }
+    strokes.push(...pageStrokes.reverse());
+  }
+  return strokes;
+}
+function externalInkAnnotationToStroke(annot, pageIndex, annotIndex, pageWidth, pageHeight) {
+  const subtype = annot.lookupMaybe(PDFName_default.of("Subtype"), PDFName_default);
+  if (subtype?.decodeText() !== "Ink") {
+    return null;
+  }
+  const inkList = annot.lookupMaybe(PDFName_default.of("InkList"), PDFArray_default);
+  if (!inkList || inkList.size() === 0) {
+    return null;
+  }
+  const points = [];
+  for (let pathIndex = 0; pathIndex < inkList.size(); pathIndex += 1) {
+    const path = inkList.lookupMaybe(pathIndex, PDFArray_default);
+    if (!path) {
+      continue;
+    }
+    for (let pointIndex = 0; pointIndex + 1 < path.size(); pointIndex += 2) {
+      const x = path.lookupMaybe(pointIndex, PDFNumber_default)?.asNumber();
+      const y = path.lookupMaybe(pointIndex + 1, PDFNumber_default)?.asNumber();
+      if (typeof x !== "number" || typeof y !== "number") {
+        continue;
+      }
+      points.push({
+        x: clamp(x / Math.max(1, pageWidth), 0, 1),
+        y: clamp((pageHeight - y) / Math.max(1, pageHeight), 0, 1)
       });
     }
+  }
+  if (points.length < 2) {
+    return null;
+  }
+  const color = readPdfColor(annot.lookupMaybe(PDFName_default.of("C"), PDFArray_default));
+  const opacity = annot.lookupMaybe(PDFName_default.of("CA"), PDFNumber_default)?.asNumber() ?? 1;
+  const border = annot.lookupMaybe(PDFName_default.of("Border"), PDFArray_default);
+  const borderWidth = border?.lookupMaybe(2, PDFNumber_default)?.asNumber() ?? 2;
+  const pdftionId = pdftionInkStrokeId(annot);
+  const simplifiedPoints = simplifyInkPoints(points, 900);
+  return {
+    color,
+    id: pdftionId ?? externalInkStrokeId(pageIndex, annotIndex, annot),
+    kind: "stroke",
+    opacity: clamp(opacity, 0.01, 1),
+    pageCssHeight: pageHeight,
+    pageCssWidth: pageWidth,
+    pageIndex,
+    pdfPoints: simplifiedPoints.map((point) => ({ ...point })),
+    pdfSaved: true,
+    points: simplifiedPoints,
+    saved: true,
+    source: pdftionId ? "pdftion" : "external-ink",
+    tool: "pen",
+    width: clamp(borderWidth, 0.5, 96)
+  };
+}
+function pdftionInkStrokeId(annot) {
+  if (!isPdftionInkAnnotation(annot)) {
+    return null;
+  }
+  const nm = decodePdfText(annot.lookupMaybe(PDFName_default.of("NM"), PDFString_default, PDFHexString_default));
+  if (nm.startsWith("Pdftion:")) {
+    return nm.slice("Pdftion:".length) || null;
+  }
+  const contents = decodePdfText(annot.lookupMaybe(PDFName_default.of("Contents"), PDFString_default, PDFHexString_default));
+  const match = contents.match(/^Pdftion\s+(.+)$/);
+  return match?.[1]?.trim() || null;
+}
+function externalInkStrokeId(pageIndex, annotIndex, annot) {
+  const nm = decodePdfText(annot.lookupMaybe(PDFName_default.of("NM"), PDFString_default, PDFHexString_default));
+  if (nm) {
+    return `external-ink-${pageIndex}-${safeAnnotationKey(nm)}`;
+  }
+  const contents = decodePdfText(annot.lookupMaybe(PDFName_default.of("Contents"), PDFString_default, PDFHexString_default));
+  if (contents) {
+    return `external-ink-${pageIndex}-${annotIndex}-${fallbackBufferHash(new TextEncoder().encode(contents).buffer)}`;
+  }
+  return `external-ink-${pageIndex}-${annotIndex}`;
+}
+function simplifyInkPoints(points, maxPoints) {
+  if (points.length <= maxPoints) {
+    return points;
+  }
+  const step = Math.ceil(points.length / maxPoints);
+  const simplified = [];
+  for (let index = 0; index < points.length; index += step) {
+    simplified.push(points[index]);
+  }
+  const last2 = points[points.length - 1];
+  if (simplified[simplified.length - 1] !== last2) {
+    simplified.push(last2);
+  }
+  return simplified;
+}
+function smoothInkPointsForPdf(points, maxPoints) {
+  if (points.length <= 2) {
+    return points.map((point) => ({ ...point }));
+  }
+  const result = [{ ...points[0] }];
+  let current = points[0];
+  for (let i = 1; i < points.length - 1; i += 1) {
+    const control = points[i];
+    const next = points[i + 1];
+    const end = {
+      x: (control.x + next.x) / 2,
+      y: (control.y + next.y) / 2
+    };
+    const distance = Math.hypot(end.x - current.x, end.y - current.y);
+    const steps = clamp(Math.ceil(distance * 1600), 2, 10);
+    for (let step = 1; step <= steps; step += 1) {
+      const t = step / steps;
+      const oneMinusT = 1 - t;
+      result.push({
+        x: oneMinusT * oneMinusT * current.x + 2 * oneMinusT * t * control.x + t * t * end.x,
+        y: oneMinusT * oneMinusT * current.y + 2 * oneMinusT * t * control.y + t * t * end.y
+      });
+    }
+    current = end;
+    if (result.length > maxPoints * 1.4) {
+      return simplifyInkPoints(result, maxPoints);
+    }
+  }
+  result.push({ ...points[points.length - 1] });
+  return simplifyInkPoints(result, maxPoints);
+}
+function readPdfColor(colorArray) {
+  if (!colorArray || colorArray.size() < 3) {
+    return "#000000";
+  }
+  const r = colorArray.lookupMaybe(0, PDFNumber_default)?.asNumber() ?? 0;
+  const g = colorArray.lookupMaybe(1, PDFNumber_default)?.asNumber() ?? 0;
+  const b = colorArray.lookupMaybe(2, PDFNumber_default)?.asNumber() ?? 0;
+  return rgbToHex(r * 255, g * 255, b * 255);
+}
+function decodePdfText(value) {
+  try {
+    return value?.decodeText() ?? "";
+  } catch {
+    return value?.asString() ?? "";
+  }
+}
+function addStandardInkAnnotation(pdf, page, stroke2) {
+  if (stroke2.points.length < 2) {
+    return true;
+  }
+  try {
+    const size = page.getSize();
+    const inkPoints = smoothInkPointsForPdf(stroke2.points, 1600);
+    const scaledPoints = inkPoints.map((point) => ({
+      x: clamp(point.x, 0, 1) * size.width,
+      y: size.height - clamp(point.y, 0, 1) * size.height
+    }));
+    const xs = scaledPoints.map((point) => point.x);
+    const ys = scaledPoints.map((point) => point.y);
+    const thickness = Math.max(0.5, stroke2.width * (size.width / Math.max(1, stroke2.pageCssWidth)));
+    const padding = Math.max(4, thickness * 2);
+    const color = hexToRgb(stroke2.color);
+    const rect = pdf.context.obj([
+      Math.max(0, Math.min(...xs) - padding),
+      Math.max(0, Math.min(...ys) - padding),
+      Math.min(size.width, Math.max(...xs) + padding),
+      Math.min(size.height, Math.max(...ys) + padding)
+    ]);
+    const inkPath = pdf.context.obj(scaledPoints.flatMap((point) => [point.x, point.y]));
+    const inkList = pdf.context.obj([inkPath]);
+    const border = pdf.context.obj([0, 0, thickness]);
+    const annotation = pdf.context.obj({
+      Border: border,
+      C: pdf.context.obj([color.r, color.g, color.b]),
+      CA: PDFNumber_default.of(clamp(stroke2.opacity, 0.01, 1)),
+      Contents: PDFHexString_default.fromText(`Pdftion ${stroke2.id}`),
+      F: PDFNumber_default.of(4),
+      InkList: inkList,
+      M: PDFHexString_default.fromText((/* @__PURE__ */ new Date()).toISOString()),
+      NM: PDFHexString_default.fromText(`Pdftion:${stroke2.id}`),
+      Rect: rect,
+      Subtype: PDFName_default.of("Ink"),
+      T: PDFHexString_default.fromText("Pdftion"),
+      Type: PDFName_default.of("Annot")
+    });
+    const annotationRef = pdf.context.register(annotation);
+    const pageNode = page.node;
+    if (typeof pageNode.addAnnot === "function") {
+      pageNode.addAnnot(annotationRef);
+      return true;
+    }
+    let annots = pageNode.Annots?.();
+    if (!annots) {
+      annots = pdf.context.obj([]);
+      pageNode.set(PDFName_default.of("Annots"), annots);
+    }
+    annots.push(annotationRef);
+    return true;
+  } catch (error2) {
+    console.warn("pdftion could not write a standard ink annotation; falling back to visible lines.", error2);
+    return false;
+  }
+}
+function drawStrokeAsPdfLines(page, stroke2, width, height) {
+  if (stroke2.points.length < 2) {
+    return;
+  }
+  const color = hexToRgb(stroke2.color);
+  const thickness = Math.max(0.5, stroke2.width * (width / Math.max(1, stroke2.pageCssWidth)));
+  const points = smoothInkPointsForPdf(stroke2.points, 1600);
+  for (let i = 1; i < points.length; i += 1) {
+    const start = points[i - 1];
+    const end = points[i];
+    page.drawLine({
+      color: rgb(color.r, color.g, color.b),
+      end: { x: end.x * width, y: height - end.y * height },
+      opacity: stroke2.opacity,
+      start: { x: start.x * width, y: height - start.y * height },
+      thickness
+    });
   }
 }
 async function drawVisibleInkElementsOnPdf(pdf, elements, fontBytes) {
@@ -59046,10 +59887,8 @@ function drawSelectionGroup(ctx, elements, cssWidth, cssHeight) {
   ctx.save();
   ctx.globalAlpha = 1;
   ctx.strokeStyle = "#1c7ed6";
-  ctx.fillStyle = "rgba(28, 126, 214, 0.06)";
   ctx.lineWidth = 1.8;
   ctx.setLineDash([7, 4]);
-  ctx.fillRect(x, y, width, height);
   ctx.strokeRect(x, y, width, height);
   ctx.setLineDash([]);
   for (const handle of getSelectionHandlePoints(box)) {
@@ -59222,7 +60061,7 @@ function strokeBoxContainsPoint(stroke2, point, cssWidth, cssHeight) {
   if (!box) {
     return false;
   }
-  const pad2 = Math.max(8, stroke2.width * 1.8);
+  const pad2 = stroke2.source === "external-ink" ? Math.max(22, stroke2.width * 4) : Math.max(8, stroke2.width * 1.8);
   const px2 = point.x * cssWidth;
   const py2 = point.y * cssHeight;
   return px2 >= box.minX - pad2 && px2 <= box.maxX + pad2 && py2 >= box.minY - pad2 && py2 <= box.maxY + pad2;
@@ -59270,6 +60109,9 @@ function imageBoxContainsPoint(image, point) {
 function imageIntersectsSelection(image, start, end) {
   return coverIntersectsSelection(image, start, end);
 }
+function rectsOverlap(a, b) {
+  return a.right >= b.left && a.left <= b.right && a.bottom >= b.top && a.top <= b.bottom;
+}
 function nativeRegionContainsPoint(region, point) {
   return point.x >= region.x && point.x <= region.x + region.width && point.y >= region.y && point.y <= region.y + region.height;
 }
@@ -59297,6 +60139,7 @@ function translateElement(element, dx, dy) {
 function cloneStroke(stroke2) {
   return {
     ...stroke2,
+    pdfPoints: stroke2.pdfPoints?.map((point) => ({ ...point })),
     points: stroke2.points.map((point) => ({ ...point }))
   };
 }
@@ -59510,9 +60353,28 @@ function getResizeCorner(bounds, handle) {
   return { x: bounds.maxX, y: bounds.maxY };
 }
 function shiftElementsInsidePage(elements) {
-  const box = normalizedElementsBounds(elements);
+  let box = normalizedElementsBounds(elements);
   if (!box) {
     return;
+  }
+  const width = box.maxX - box.minX;
+  const height = box.maxY - box.minY;
+  if (width > 0.98 || height > 0.98) {
+    const factor = Math.min(
+      width > 0 ? 0.98 / width : 1,
+      height > 0 ? 0.98 / height : 1
+    );
+    const center = {
+      x: (box.minX + box.maxX) / 2,
+      y: (box.minY + box.maxY) / 2
+    };
+    for (const element of elements) {
+      scaleElementAroundPointInPlace(element, center, factor);
+    }
+    box = normalizedElementsBounds(elements);
+    if (!box) {
+      return;
+    }
   }
   let dx = 0;
   let dy = 0;
@@ -59532,6 +60394,24 @@ function shiftElementsInsidePage(elements) {
   for (const element of elements) {
     translateElement(element, dx, dy);
   }
+}
+function scaleElementAroundPointInPlace(element, center, factor) {
+  if (element.kind === "stroke") {
+    element.points = element.points.map((point) => ({
+      x: center.x + (point.x - center.x) * factor,
+      y: center.y + (point.y - center.y) * factor
+    }));
+    element.width = clamp(element.width * factor, 0.5, 80);
+    return;
+  }
+  element.x = center.x + (element.x - center.x) * factor;
+  element.y = center.y + (element.y - center.y) * factor;
+  if (element.kind === "text") {
+    element.fontSize = clamp(element.fontSize * factor, 4, 96);
+    return;
+  }
+  element.width = clamp(element.width * factor, 1e-3, 1);
+  element.height = clamp(element.height * factor, 1e-3, 1);
 }
 function strokeContainsPoint(stroke2, point, cssWidth, cssHeight, eraserWidth = 10) {
   if (stroke2.points.length < 2) {
@@ -59570,6 +60450,77 @@ function pointToSegmentDistance(px2, py2, ax, ay, bx, by) {
 }
 function normalizedDistance(a, b, cssWidth, cssHeight) {
   return Math.hypot((a.x - b.x) * cssWidth, (a.y - b.y) * cssHeight);
+}
+function inkPointsApproximatelyEqual(a, b) {
+  if (a.length !== b.length) {
+    return false;
+  }
+  for (let index = 0; index < a.length; index += 1) {
+    if (Math.abs(a[index].x - b[index].x) > 8e-4 || Math.abs(a[index].y - b[index].y) > 8e-4) {
+      return false;
+    }
+  }
+  return true;
+}
+function dedupeInkElements(elements) {
+  const deduped = [];
+  for (const element of elements) {
+    if (element.kind !== "stroke") {
+      deduped.push(element);
+      continue;
+    }
+    const duplicateIndex = deduped.findIndex((candidate) => candidate.kind === "stroke" && (candidate.id === element.id || isSamePdfInkStrokeCandidate(candidate, element)));
+    if (duplicateIndex === -1) {
+      deduped.push(element);
+      continue;
+    }
+    const existing = deduped[duplicateIndex];
+    deduped[duplicateIndex] = existing.kind === "stroke" ? chooseInkStrokeToKeep(existing, element) : element;
+  }
+  return deduped;
+}
+function chooseInkStrokeToKeep(existing, candidate) {
+  if (existing.pdfSaved === true && candidate.pdfSaved !== true) {
+    return candidate;
+  }
+  if (existing.saved && !candidate.saved) {
+    return candidate;
+  }
+  if (candidate.externalDirty === true && existing.externalDirty !== true) {
+    return candidate;
+  }
+  if (candidate.points.length > existing.points.length * 1.2) {
+    return candidate;
+  }
+  return existing;
+}
+function isSamePdfInkStrokeCandidate(a, b) {
+  if (a.pageIndex !== b.pageIndex) {
+    return false;
+  }
+  if (normalizeHexColor(a.color) !== normalizeHexColor(b.color)) {
+    return false;
+  }
+  if (Math.abs(a.opacity - b.opacity) > 0.06 || Math.abs(a.width - b.width) > Math.max(2, Math.min(a.width, b.width) * 0.35)) {
+    return false;
+  }
+  if (inkPointsApproximatelyEqual(a.points, b.points)) {
+    return true;
+  }
+  const aBounds = normalizedStrokeBounds(a);
+  const bBounds = normalizedStrokeBounds(b);
+  if (!aBounds || !bBounds) {
+    return false;
+  }
+  const boundsClose = Math.abs(aBounds.minX - bBounds.minX) <= 6e-3 && Math.abs(aBounds.minY - bBounds.minY) <= 6e-3 && Math.abs(aBounds.maxX - bBounds.maxX) <= 6e-3 && Math.abs(aBounds.maxY - bBounds.maxY) <= 6e-3;
+  if (!boundsClose) {
+    return false;
+  }
+  const aFirst = a.points[0];
+  const aLast = a.points[a.points.length - 1];
+  const bFirst = b.points[0];
+  const bLast = b.points[b.points.length - 1];
+  return Math.hypot(aFirst.x - bFirst.x, aFirst.y - bFirst.y) <= 0.012 && Math.hypot(aLast.x - bLast.x, aLast.y - bLast.y) <= 0.012;
 }
 function collectPdfPathHints(rootEl) {
   const hints = /* @__PURE__ */ new Set();
@@ -59746,7 +60697,11 @@ function markElementSaved(element) {
   return { ...element, saved: true };
 }
 function markElementUnsaved(element) {
-  return { ...element, saved: false };
+  if (element.kind === "stroke") {
+    return { ...element, pdfSaved: element.pdfSaved, saved: false };
+  }
+  const next = { ...element, saved: false };
+  return next;
 }
 function hexToRgb(hex) {
   const clean = hex.replace("#", "");

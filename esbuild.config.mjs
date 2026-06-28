@@ -1,5 +1,7 @@
 import esbuild from "esbuild";
 
+const prod = process.argv[2] === "production";
+
 await esbuild.build({
   bundle: true,
   entryPoints: ["src/main.ts"],
@@ -9,9 +11,10 @@ await esbuild.build({
     ".otf": "base64"
   },
   logLevel: "info",
+  minify: prod,
   outfile: "main.js",
   platform: "browser",
-  sourcemap: false,
+  sourcemap: prod ? false : "inline",
   target: "es2022",
   treeShaking: true
 });

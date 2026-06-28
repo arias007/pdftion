@@ -1,5 +1,4 @@
-import { Notice, Plugin, PluginSettingTab, Setting, TFile, WorkspaceLeaf, getLanguage, setIcon } from "obsidian";
-import * as fontkitModule from "@pdf-lib/fontkit";
+import { Notice, Plugin, PluginSettingTab, Setting, TFile, WorkspaceLeaf, setIcon } from "obsidian";
 import { PDFArray, PDFDict, PDFDocument, PDFHexString, PDFName, PDFNumber, PDFString, degrees, rgb } from "pdf-lib";
 
 // Mobile WebViews do not expose Obsidian desktop-only activeWindow globals.
@@ -8,10 +7,12 @@ const activeDocument = document;
 
 type ToolMode = "select" | "pen" | "highlight" | "eraser" | "text" | "cover" | "image-crop";
 type ResizeHandle = "nw" | "ne" | "sw" | "se";
+type PdfFontkitModule = typeof import("@pdf-lib/fontkit");
 
 const AUTO_SAVE_IDLE_DELAY_MS = 5200;
 const AUTO_SAVE_CLOSE_DELAY_MS = 200;
 const OVERLAY_HEALTH_CHECK_MS = 5000;
+let pdfFontkitModulePromise: Promise<PdfFontkitModule> | null = null;
 const PALETTE_COLORS = [
   "#000000",
   "#e03131",
@@ -653,10 +654,8 @@ function normalizePdftionLocale(language: string): PdftionLocale | null {
 
 function getPdftionLocale(): PdftionLocale {
   const languages: string[] = [];
-  try {
-    languages.push(getLanguage());
-  } catch {
-    // Fall back to browser language when Obsidian language is unavailable.
+  if (activeDocument.documentElement.lang) {
+    languages.push(activeDocument.documentElement.lang);
   }
   languages.push(activeWindow.navigator.language);
   languages.push(...(activeWindow.navigator.languages ?? []));
@@ -8405,8 +8404,16 @@ function createIconButton(icon: string, title: string): HTMLElement {
 }
 
 async function embedAnnotationFont(pdf: PDFDocument, fontBytes: Uint8Array) {
+  const fontkitModule = await loadPdfFontkitModule();
   pdf.registerFontkit(resolvePdfFontkit(fontkitModule) as Parameters<PDFDocument["registerFontkit"]>[0]);
   return pdf.embedFont(fontBytes, { subset: true });
+}
+
+function loadPdfFontkitModule(): Promise<PdfFontkitModule> {
+  if (!pdfFontkitModulePromise) {
+    pdfFontkitModulePromise = import("@pdf-lib/fontkit");
+  }
+  return pdfFontkitModulePromise;
 }
 
 interface PdfInkSyncOptions {

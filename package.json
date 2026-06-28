@@ -1,12 +1,12 @@
 {
   "name": "pdftion",
-  "version": "0.3.72",
+  "version": "0.3.73",
   "description": "AI-open PDF annotation, editing, export, and note integration tools.",
   "main": "main.js",
   "scripts": {
-    "build": "node --check main.js",
-    "check": "node --check main.js",
-    "dist": "npm run check && npm run build"
+    "build": "node esbuild.config.mjs production",
+    "check": "tsc --noEmit && node --check main.js",
+    "dist": "npm run check && npm run build && node --check main.js"
   },
   "keywords": [],
   "author": "Murat / Codex",

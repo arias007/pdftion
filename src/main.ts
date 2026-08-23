@@ -4642,6 +4642,13 @@ class InkSession {
     for (const stroke of pdfInkStrokes) {
       changed = this.mergePdfInkStrokeForEditing(stroke) || changed;
     }
+    // A legacy state can contain the moved editable copy while the PDF still
+    // contains its original coordinates. Merge by the PDF identity first and
+    // remove any duplicate copy before the next frame renders the page.
+    const strokeCountBeforeDedupe = this.strokeHistory.length;
+    this.strokeHistory = dedupeInkElements(this.strokeHistory)
+      .filter((element): element is InkStroke => element.kind === "stroke");
+    changed = this.strokeHistory.length !== strokeCountBeforeDedupe || changed;
     if (changed) {
       this.savedInkIsBurnedIntoPdf = this.strokeHistory.some((stroke) => !Array.isArray(stroke.pdfPoints)) && this.savedInkIsBurnedIntoPdf;
       this.dirty = true;
@@ -4669,7 +4676,9 @@ class InkSession {
     }
 
     let changed = false;
-    const canRefreshFromPdf = existing.saved && existing.pdfSaved !== false && existing.externalDirty !== true;
+    const canRefreshFromPdf = existing.saved && existing.pdfSaved !== false && existing.externalDirty !== true && (
+      !existing.pdfPoints || inkPointsApproximatelyEqual(existing.points, existing.pdfPoints)
+    );
     if (canRefreshFromPdf && !inkStrokesEquivalentForPdf(existing, stroke)) {
       existing.points = stroke.points.map((point) => ({ ...point }));
       existing.color = stroke.color;
@@ -14784,27 +14793,32 @@ function drawStroke(
   ctx.lineWidth = strokeDisplayWidth(stroke, cssWidth);
   ctx.strokeStyle = stroke.color;
   ctx.beginPath();
-  const first = stroke.points[0];
-  ctx.moveTo(first.x * cssWidth, first.y * cssHeight);
-
-  if (stroke.points.length === 2) {
-    const end = stroke.points[1];
-    ctx.lineTo(end.x * cssWidth, end.y * cssHeight);
-  } else {
-    for (let i = 1; i < stroke.points.length - 1; i += 1) {
-      const point = stroke.points[i];
-      const next = stroke.points[i + 1];
-      const midX = ((point.x + next.x) / 2) * cssWidth;
-      const midY = ((point.y + next.y) / 2) * cssHeight;
-      ctx.quadraticCurveTo(point.x * cssWidth, point.y * cssHeight, midX, midY);
-    }
-    const last = stroke.points[stroke.points.length - 1];
-    ctx.lineTo(last.x * cssWidth, last.y * cssHeight);
-  }
-
+  traceInkStrokePath(ctx, stroke.points, cssWidth, cssHeight);
   ctx.stroke();
   ctx.restore();
 
+}
+
+function traceInkStrokePath(ctx: CanvasRenderingContext2D, points: InkPoint[], cssWidth: number, cssHeight: number): void {
+  const first = points[0];
+  if (!first) {
+    return;
+  }
+  ctx.moveTo(first.x * cssWidth, first.y * cssHeight);
+  if (points.length === 2) {
+    const end = points[1];
+    ctx.lineTo(end.x * cssWidth, end.y * cssHeight);
+    return;
+  }
+  for (let i = 1; i < points.length - 1; i += 1) {
+    const point = points[i];
+    const next = points[i + 1];
+    const midX = ((point.x + next.x) / 2) * cssWidth;
+    const midY = ((point.y + next.y) / 2) * cssHeight;
+    ctx.quadraticCurveTo(point.x * cssWidth, point.y * cssHeight, midX, midY);
+  }
+  const last = points[points.length - 1];
+  ctx.lineTo(last.x * cssWidth, last.y * cssHeight);
 }
 
 function strokeDisplayWidth(stroke: InkStroke, cssWidth: number): number {
@@ -15363,6 +15377,10 @@ function normalizedStrokeBounds(stroke: InkStroke): NormalizedBounds | null {
   return { maxX, maxY, minX, minY };
 }
 
+function pdfIdentityPoints(stroke: InkStroke): InkPoint[] {
+  return stroke.pdfPoints ?? stroke.points;
+}
+
 function unionNormalizedBounds(a: NormalizedBounds, b: NormalizedBounds): NormalizedBounds {
   return {
     maxX: Math.max(a.maxX, b.maxX),
@@ -15795,11 +15813,13 @@ function isSamePdfInkStrokeCandidate(a: InkStroke, b: InkStroke): boolean {
   if (Math.abs(a.opacity - b.opacity) > 0.06 || Math.abs(a.width - b.width) > Math.max(2, Math.min(a.width, b.width) * 0.35)) {
     return false;
   }
-  if (inkPointsApproximatelyEqual(a.points, b.points)) {
+  const aPdfPoints = pdfIdentityPoints(a);
+  const bPdfPoints = pdfIdentityPoints(b);
+  if (inkPointsApproximatelyEqual(aPdfPoints, bPdfPoints)) {
     return true;
   }
-  const aBounds = normalizedStrokeBounds(a);
-  const bBounds = normalizedStrokeBounds(b);
+  const aBounds = normalizedStrokeBounds({ ...a, points: aPdfPoints });
+  const bBounds = normalizedStrokeBounds({ ...b, points: bPdfPoints });
   if (!aBounds || !bBounds) {
     return false;
   }
@@ -15811,10 +15831,13 @@ function isSamePdfInkStrokeCandidate(a: InkStroke, b: InkStroke): boolean {
   if (!boundsClose) {
     return false;
   }
-  const aFirst = a.points[0];
-  const aLast = a.points[a.points.length - 1];
-  const bFirst = b.points[0];
-  const bLast = b.points[b.points.length - 1];
+  const aFirst = aPdfPoints[0];
+  const aLast = aPdfPoints[aPdfPoints.length - 1];
+  const bFirst = bPdfPoints[0];
+  const bLast = bPdfPoints[bPdfPoints.length - 1];
+  if (!aFirst || !aLast || !bFirst || !bLast) {
+    return false;
+  }
   return (
     Math.hypot(aFirst.x - bFirst.x, aFirst.y - bFirst.y) <= 0.012 &&
     Math.hypot(aLast.x - bLast.x, aLast.y - bLast.y) <= 0.012

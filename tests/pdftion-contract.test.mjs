@@ -28,6 +28,18 @@ test("saved PDF ink hides its original native layer as soon as editing begins", 
   assert.match(source, /this\.nativeInkScannedPages\.add\(pageIndex\)/);
   assert.match(source, /if \(element\.pdfSaved === true\) \{[\s\S]*?this\.pendingNativeInkHidePages\.add\(element\.pageIndex\);\s*this\.updateExternalInkLayerState\(\)/);
   assert.match(source, /translateElement\(element, dx, dy\)/);
+  assert.match(source, /function pdfIdentityPoints\(stroke: InkStroke\): InkPoint\[\]/);
+  assert.match(source, /const aPdfPoints = pdfIdentityPoints\(a\)/);
+  assert.match(source, /const strokeCountBeforeDedupe = this\.strokeHistory\.length/);
+  assert.match(source, /this\.strokeHistory = dedupeInkElements\(this\.strokeHistory\)/);
+});
+
+test("moving imported ink keeps its editable coordinates and uses one rounded canvas path", async () => {
+  const source = await readFile(sourceUrl, "utf8");
+  const mergeSource = source.slice(source.indexOf("private mergePdfInkStrokeForEditing"), source.indexOf("private updateButtonState"));
+  assert.match(mergeSource, /const canRefreshFromPdf = existing\.saved[\s\S]{0,240}inkPointsApproximatelyEqual\(existing\.points, existing\.pdfPoints\)/);
+  assert.match(source, /function traceInkStrokePath\(ctx: CanvasRenderingContext2D, points: InkPoint\[\]/);
+  assert.match(source, /traceInkStrokePath\(ctx, stroke\.points, cssWidth, cssHeight\)/);
 });
 
 test("PDF sessions isolate file state and maintain only live plugin data", async () => {

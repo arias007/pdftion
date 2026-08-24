@@ -1,5 +1,27 @@
 import { Notice, Plugin, PluginSettingTab, Setting, TFile, WorkspaceLeaf, setIcon } from "obsidian";
-import { PDFArray, PDFDict, PDFDocument, PDFHexString, PDFName, PDFNumber, PDFString, degrees, rgb } from "pdf-lib";
+import {
+  LineCapStyle,
+  LineJoinStyle,
+  PDFArray,
+  PDFDict,
+  PDFDocument,
+  PDFHexString,
+  PDFName,
+  PDFNumber,
+  PDFString,
+  degrees,
+  lineTo,
+  moveTo,
+  popGraphicsState,
+  pushGraphicsState,
+  rgb,
+  setGraphicsState,
+  setLineCap,
+  setLineJoin,
+  setLineWidth,
+  setStrokingColor,
+  stroke as strokePath
+} from "pdf-lib";
 import { getExtendedPdftionTranslation } from "./i18n";
 
 // Mobile WebViews do not expose Obsidian desktop-only activeWindow globals.
@@ -2185,6 +2207,11 @@ export default class PdftionPlugin extends Plugin {
     }
   }
 
+  async getPdfInkPageIndexes(file: TFile): Promise<Set<number>> {
+    const strokes = await this.loadPdfInkAnnotations(file);
+    return new Set(strokes.map((stroke) => stroke.pageIndex));
+  }
+
   async saveAnnotationState(file: TFile, elements: InkElement[], basePdfFingerprint: PdfFingerprint, savedBytes: ArrayBuffer): Promise<void> {
     const path = this.getAnnotationStatePath(file);
     const pdfFingerprint = await fingerprintPdfBytes(savedBytes, file.stat.mtime);
@@ -2432,22 +2459,44 @@ export default class PdftionPlugin extends Plugin {
     return visiblePdf ?? visibleOther ?? matchedPdf ?? matchedOther;
   }
 
-  async beginInkEditTransaction(file: TFile, pageIndexes: Set<number>): Promise<void> {
+  async beginInkEditTransaction(file: TFile, pageIndexes: Set<number>): Promise<boolean> {
     const normalizedPages = Array.from(pageIndexes)
       .filter((pageIndex) => Number.isInteger(pageIndex) && pageIndex >= 0)
       .sort((a, b) => a - b);
     if (normalizedPages.length === 0) {
-      return;
+      return false;
     }
     const existing = await this.readInkEditTransaction(file);
     if (existing) {
-      if (
-        existing.filePath === file.path &&
-        normalizedPages.every((pageIndex) => existing.pageIndexes.includes(pageIndex))
-      ) {
-        return;
+      if (existing.filePath !== file.path) {
+        throw new Error(`An ink edit transaction is already active for ${existing.filePath}.`);
       }
-      throw new Error(`An ink edit transaction is already active for ${existing.filePath} page ${existing.pageIndexes.join(", ")}.`);
+      const additionalPages = normalizedPages.filter((pageIndex) => !existing.pageIndexes.includes(pageIndex));
+      if (additionalPages.length === 0) {
+        return false;
+      }
+      const currentBytes = await this.app.vault.readBinary(file);
+      const pdf = await PDFDocument.load(currentBytes, { ignoreEncryption: true, updateMetadata: false });
+      const validAdditionalPages = additionalPages.filter((pageIndex) => pageIndex < pdf.getPageCount());
+      if (validAdditionalPages.length === 0) {
+        return false;
+      }
+      const expandedRecord: PdfInkEditTransactionRecord = {
+        ...existing,
+        pageIndexes: Array.from(new Set([...existing.pageIndexes, ...validAdditionalPages])).sort((a, b) => a - b)
+      };
+      await this.writeInkEditTransaction(file, expandedRecord);
+      try {
+        removeAllInkAnnotationsOnPages(pdf, new Set(validAdditionalPages));
+        const saved = await pdf.save({ addDefaultPage: false, useObjectStreams: false });
+        const detachedBytes = new ArrayBuffer(saved.byteLength);
+        new Uint8Array(detachedBytes).set(saved);
+        await this.app.vault.modifyBinary(file, detachedBytes);
+        return true;
+      } catch (error) {
+        await this.restoreInkEditTransaction(file, expandedRecord, true);
+        throw error;
+      }
     }
 
     const dir = `${this.manifest.dir}/data/ink-edit-transactions`;
@@ -2458,7 +2507,7 @@ export default class PdftionPlugin extends Plugin {
     const pdf = await PDFDocument.load(currentBytes, { ignoreEncryption: true, updateMetadata: false });
     const transactionPages = normalizedPages.filter((pageIndex) => pageIndex < pdf.getPageCount());
     if (transactionPages.length === 0) {
-      return;
+      return false;
     }
     await this.ensureAdapterFolder(dir);
     await this.app.vault.adapter.writeBinary(backupPdfPath, currentBytes);
@@ -2489,6 +2538,7 @@ export default class PdftionPlugin extends Plugin {
       const detachedBytes = new ArrayBuffer(saved.byteLength);
       new Uint8Array(detachedBytes).set(saved);
       await this.app.vault.modifyBinary(file, detachedBytes);
+      return true;
     } catch (error) {
       await this.restoreInkEditTransaction(file, record, true);
       throw error;
@@ -2525,27 +2575,10 @@ export default class PdftionPlugin extends Plugin {
       return this.completeInkEditTransaction(file, elements, pages);
     }
 
-    try {
-      await this.restoreInkEditTransaction(file, record, true);
-      const restoredBytes = await this.app.vault.readBinary(file);
-      const preserved = elements.map((element): InkElement => {
-        if (element.kind !== "stroke" || !pages.has(element.pageIndex)) {
-          return markElementSaved(cloneElement(element));
-        }
-        return {
-          ...cloneStroke(element),
-          externalDirty: false,
-          pdfPoints: element.points.map((point) => ({ ...point })),
-          pdfSaved: true,
-          saved: true
-        };
-      });
-      await this.saveEditableAnnotationState(file, preserved, restoredBytes);
-      return true;
-    } catch (error) {
-      console.error("pdftion could not restore an unchanged PDF ink edit transaction.", error);
-      return false;
-    }
+    // The detached PDF may already contain duplicate legacy/external Ink annotations.
+    // Rewriting the unchanged page through the same verified path normalizes it instead
+    // of restoring those duplicates after the user leaves edit mode.
+    return this.completeInkEditTransaction(file, elements, pages);
   }
 
   private async completeInkEditTransactionNow(file: TFile, elements: InkElement[], pageIndexes: Set<number>): Promise<boolean> {
@@ -2562,9 +2595,9 @@ export default class PdftionPlugin extends Plugin {
       const pdf = await PDFDocument.load(currentBytes, { ignoreEncryption: true, updateMetadata: false });
       removeAllInkAnnotationsOnPages(pdf, pagesToCommit);
       const pages = pdf.getPages();
-      const strokes = elements.filter((element): element is InkStroke => (
+      const strokes = dedupeInkElements(elements.filter((element) => (
         element.kind === "stroke" && pagesToCommit.has(element.pageIndex) && element.points.length >= 2
-      ));
+      ))).filter((element): element is InkStroke => element.kind === "stroke");
       for (const stroke of strokes) {
         const page = pages[stroke.pageIndex];
         if (!page || !addStandardInkAnnotation(pdf, page, stroke)) {
@@ -3308,6 +3341,7 @@ class InkSession {
   private conversionInProgress = false;
   private exportRenderFallbackPages = new Set<number>();
   private preparingPdfInkForEditing = false;
+  private pdfInkPreparationComplete = false;
   private pendingEditableInkPrepareAfterSave = false;
   private pendingSaveAfterCurrentSave = false;
   private finishingPdfInkEditing: Promise<boolean> | null = null;
@@ -3565,6 +3599,7 @@ class InkSession {
     this.selectedPageIndexes.clear();
     this.savedInkIsBurnedIntoPdf = false;
     this.savedTextIsBurnedIntoPdf = false;
+    this.pdfInkPreparationComplete = false;
     this.lastTap = null;
     this.nativeTextAutoHighlight = null;
     this.strokeHistory = [];
@@ -4406,6 +4441,7 @@ class InkSession {
       this.commentPopover = null;
       this.toolbar?.remove();
       this.toolbar = null;
+      this.pdfInkPreparationComplete = false;
       void this.finishPdfInkEditing();
       this.redrawAll();
     }
@@ -4424,8 +4460,20 @@ class InkSession {
         this.pendingEditableInkPrepareAfterSave = true;
         return;
       }
-      const pageIndexes = this.getCurrentInkPreparePages(force);
+      if (this.pdfInkPreparationComplete) {
+        return;
+      }
+      if (this.detachedInkEditPages.size > 0) {
+        for (const pageIndex of this.detachedInkEditPages) {
+          this.pendingNativeInkHidePages.add(pageIndex);
+        }
+        this.pdfInkPreparationComplete = true;
+        this.updateExternalInkLayerState();
+        return;
+      }
+      const pageIndexes = await this.plugin.getPdfInkPageIndexes(this.file);
       if (pageIndexes.size === 0) {
+        this.pdfInkPreparationComplete = true;
         return;
       }
       await this.preparePdfInkOverlayForEditing(pageIndexes);
@@ -4497,6 +4545,13 @@ class InkSession {
       }
       this.updateExternalInkLayerState();
       await this.importPdfInkForPages(pageIndexes);
+      const detachedNow = await this.plugin.beginInkEditTransaction(this.file, pageIndexes);
+      for (const pageIndex of pageIndexes) {
+        this.detachedInkEditPages.add(pageIndex);
+      }
+      if (detachedNow) {
+        await this.reloadNativePdfView();
+      }
       for (const pageIndex of pageIndexes) {
         const hasNativeInk = this.strokeHistory.some((stroke) => (
           stroke.pageIndex === pageIndex && Array.isArray(stroke.pdfPoints)
@@ -4507,6 +4562,7 @@ class InkSession {
       }
       this.updateExternalInkLayerState();
       this.redrawAll();
+      this.pdfInkPreparationComplete = true;
     } catch (error) {
       console.warn("pdftion could not prepare PDF ink annotations for editing.", error);
       for (const pageIndex of pageIndexes) {
@@ -4560,6 +4616,7 @@ class InkSession {
         this.dirty = this.getEditableElements().some((element) => !element.saved);
         this.updateExternalInkLayerState();
         this.redrawAll();
+        this.pdfInkPreparationComplete = false;
         await this.reloadNativePdfView();
         this.scheduleQuietScan();
         return true;
@@ -11324,22 +11381,23 @@ async function syncEditableInkAnnotationsOnPdf(pdf: PDFDocument, elements: InkEl
     ...(options.dirtyPages ? Array.from(options.dirtyPages) : []),
     ...dirtyStrokes.map((stroke) => stroke.pageIndex)
   ]);
-  const strokesToWrite = elements.filter((element): element is InkStroke => (
-    element.kind === "stroke" &&
-    (element.pdfSaved !== true || (pagesToRewrite.has(element.pageIndex) && element.source !== "external-ink"))
+  // A dirty page is rewritten as one complete Ink set. Partial ID-based removal
+  // leaves legacy external annotations behind when annotation indexes or IDs changed.
+  // Keep untracked third-party Ink from the PDF, but merge it by geometry so a legacy
+  // annotation and its Pdftion copy become one canonical stroke.
+  const currentStrokes = dedupeInkElements(elements.filter((element) => (
+    element.kind === "stroke" && pagesToRewrite.has(element.pageIndex) && element.points.length >= 2
+  ))).filter((element): element is InkStroke => element.kind === "stroke");
+  const untrackedPdfStrokes = extractPdfInkAnnotations(pdf, pagesToRewrite).filter((candidate) => (
+    !options.deletedExternalInkIds?.has(candidate.id) &&
+    !options.deletedPdftionInkIds?.has(candidate.id) &&
+    !currentStrokes.some((stroke) => (
+      stroke.id === candidate.id || isSamePdfInkStrokeCandidate(stroke, candidate)
+    ))
   ));
-  removeTargetInkAnnotations(
-    pdf,
-    new Set([
-      ...dirtyStrokes.filter((stroke) => stroke.source !== "external-ink").map((stroke) => stroke.id),
-      ...(options.deletedPdftionInkIds ? Array.from(options.deletedPdftionInkIds) : [])
-    ]),
-    new Set([
-      ...dirtyStrokes.filter((stroke) => stroke.source === "external-ink" && stroke.externalDirty === true).map((stroke) => stroke.id),
-      ...(options.deletedExternalInkIds ? Array.from(options.deletedExternalInkIds) : [])
-    ])
-  );
-  removePdftionInkAnnotationsOnPages(pdf, pagesToRewrite);
+  const strokesToWrite = dedupeInkElements([...currentStrokes, ...untrackedPdfStrokes])
+    .filter((element): element is InkStroke => element.kind === "stroke");
+  removeAllInkAnnotationsOnPages(pdf, pagesToRewrite);
   const pages = pdf.getPages();
   for (const stroke of strokesToWrite) {
     const page = pages[stroke.pageIndex];
@@ -11622,20 +11680,48 @@ function addStandardInkAnnotation(pdf: PDFDocument, page: ReturnType<PDFDocument
     const thickness = Math.max(0.5, stroke.width * (size.width / Math.max(1, stroke.pageCssWidth)));
     const padding = Math.max(4, thickness * 2);
     const color = hexToRgb(stroke.color);
-
-    const rect = pdf.context.obj([
-      Math.max(0, Math.min(...xs) - padding),
-      Math.max(0, Math.min(...ys) - padding),
-      Math.min(size.width, Math.max(...xs) + padding),
-      Math.min(size.height, Math.max(...ys) + padding)
-    ]);
+    const rectLeft = Math.max(0, Math.min(...xs) - padding);
+    const rectBottom = Math.max(0, Math.min(...ys) - padding);
+    const rectRight = Math.min(size.width, Math.max(...xs) + padding);
+    const rectTop = Math.min(size.height, Math.max(...ys) + padding);
+    const opacity = clamp(stroke.opacity, 0.01, 1);
+    const appearancePoints = scaledPoints.map((point) => ({
+      x: point.x - rectLeft,
+      y: point.y - rectBottom
+    }));
+    const graphicsStateRef = pdf.context.register(pdf.context.obj({
+      CA: PDFNumber.of(opacity),
+      Type: PDFName.of("ExtGState"),
+      ca: PDFNumber.of(opacity)
+    }));
+    const appearance = pdf.context.formXObject([
+      pushGraphicsState(),
+      setGraphicsState(PDFName.of("GS0")),
+      setStrokingColor(rgb(color.r, color.g, color.b)),
+      setLineWidth(thickness),
+      setLineCap(LineCapStyle.Round),
+      setLineJoin(LineJoinStyle.Round),
+      moveTo(appearancePoints[0].x, appearancePoints[0].y),
+      ...appearancePoints.slice(1).map((point) => lineTo(point.x, point.y)),
+      strokePath(),
+      popGraphicsState()
+    ], {
+      BBox: pdf.context.obj([0, 0, rectRight - rectLeft, rectTop - rectBottom]),
+      Matrix: pdf.context.obj([1, 0, 0, 1, 0, 0]),
+      Resources: pdf.context.obj({
+        ExtGState: pdf.context.obj({ GS0: graphicsStateRef })
+      })
+    });
+    const appearanceRef = pdf.context.register(appearance);
+    const rect = pdf.context.obj([rectLeft, rectBottom, rectRight, rectTop]);
     const inkPath = pdf.context.obj(scaledPoints.flatMap((point) => [point.x, point.y]));
     const inkList = pdf.context.obj([inkPath]);
     const border = pdf.context.obj([0, 0, thickness]);
     const annotation = pdf.context.obj({
+      AP: pdf.context.obj({ N: appearanceRef }),
       Border: border,
       C: pdf.context.obj([color.r, color.g, color.b]),
-      CA: PDFNumber.of(clamp(stroke.opacity, 0.01, 1)),
+      CA: PDFNumber.of(opacity),
       Contents: PDFHexString.fromText(`Pdftion ${stroke.id}`),
       F: PDFNumber.of(4),
       InkList: inkList,
@@ -11676,18 +11762,45 @@ function drawStrokeAsPdfLines(page: ReturnType<PDFDocument["getPage"]>, stroke: 
   if (stroke.points.length < 2) {
     return;
   }
-  const color = hexToRgb(stroke.color);
-  const thickness = Math.max(0.5, stroke.width * (width / Math.max(1, stroke.pageCssWidth)));
-  const points = smoothInkPointsForPdf(stroke.points, 1600);
+  drawRoundedPdfStroke(page, stroke.points, stroke.color, stroke.opacity, stroke.width, stroke.pageCssWidth, width, height);
+}
+
+function drawRoundedPdfStroke(
+  page: ReturnType<PDFDocument["getPage"]>,
+  sourcePoints: InkPoint[],
+  colorHex: string,
+  opacity: number,
+  sourceWidth: number,
+  sourcePageWidth: number,
+  width: number,
+  height: number
+): void {
+  if (sourcePoints.length < 2) {
+    return;
+  }
+  const color = hexToRgb(colorHex);
+  const thickness = Math.max(0.5, sourceWidth * (width / Math.max(1, sourcePageWidth)));
+  const points = smoothInkPointsForPdf(sourcePoints, 1600);
   for (let i = 1; i < points.length; i += 1) {
     const start = points[i - 1];
     const end = points[i];
     page.drawLine({
       color: rgb(color.r, color.g, color.b),
       end: { x: end.x * width, y: height - end.y * height },
-      opacity: stroke.opacity,
+      opacity,
       start: { x: start.x * width, y: height - start.y * height },
       thickness
+    });
+  }
+  // pdf-lib line joins are viewer-dependent. Circles at the sampled points make
+  // both joins and endpoints round even in viewers that render each segment sharply.
+  for (const point of points) {
+    page.drawCircle({
+      color: rgb(color.r, color.g, color.b),
+      opacity,
+      size: thickness / 2,
+      x: point.x * width,
+      y: height - point.y * height
     });
   }
 }
@@ -11722,19 +11835,16 @@ async function drawVisibleInkElementsOnPdf(pdf: PDFDocument, elements: InkElemen
       if (element.points.length < 2) {
         continue;
       }
-      const color = hexToRgb(element.color);
-      const thickness = Math.max(0.5, element.width * (size.width / Math.max(1, element.pageCssWidth)));
-      for (let i = 1; i < element.points.length; i += 1) {
-        const start = element.points[i - 1];
-        const end = element.points[i];
-        page.drawLine({
-          color: rgb(color.r, color.g, color.b),
-          end: { x: end.x * size.width, y: size.height - end.y * size.height },
-          opacity: element.opacity,
-          start: { x: start.x * size.width, y: size.height - start.y * size.height },
-          thickness
-        });
-      }
+      drawRoundedPdfStroke(
+        page,
+        element.points,
+        element.color,
+        element.opacity,
+        element.width,
+        element.pageCssWidth,
+        size.width,
+        size.height
+      );
       continue;
     }
 
@@ -15960,6 +16070,7 @@ async function validatePdfWriteCandidate(buffer: ArrayBuffer, expectedPageCount:
       break;
     }
   }
+
   if (!hasPdfHeader) {
     throw new Error("PDF write validation failed: missing PDF header.");
   }

@@ -42,6 +42,25 @@ test("moving imported ink keeps its editable coordinates and uses one rounded ca
   assert.match(source, /traceInkStrokePath\(ctx, stroke\.points, cssWidth, cssHeight\)/);
 });
 
+test("rewriting a dirty PDF page removes every legacy Ink before restoring current strokes", async () => {
+  const source = await readFile(sourceUrl, "utf8");
+  const syncSource = source.slice(
+    source.indexOf("async function syncEditableInkAnnotationsOnPdf"),
+    source.indexOf("function removePdftionInkAnnotationsOnPages")
+  );
+  assert.match(syncSource, /const currentStrokes = dedupeInkElements\(elements\.filter/);
+  assert.match(syncSource, /const untrackedPdfStrokes = extractPdfInkAnnotations\(pdf, pagesToRewrite\)/);
+  assert.match(syncSource, /!currentStrokes\.some\(\(stroke\) =>/);
+  assert.match(syncSource, /removeAllInkAnnotationsOnPages\(pdf, pagesToRewrite\)/);
+  assert.doesNotMatch(syncSource, /removeTargetInkAnnotations\(\s*pdf/);
+  assert.match(source, /return this\.completeInkEditTransaction\(file, elements, pages\);/);
+  assert.match(source, /function drawRoundedPdfStroke\(/);
+  assert.match(source, /page\.drawCircle\(\{/);
+  assert.match(source, /AP: pdf\.context\.obj\(\{ N: appearanceRef \}\)/);
+  assert.match(source, /setLineCap\(LineCapStyle\.Round\)/);
+  assert.match(source, /setLineJoin\(LineJoinStyle\.Round\)/);
+});
+
 test("PDF sessions isolate file state and maintain only live plugin data", async () => {
   const source = await readFile(sourceUrl, "utf8");
   const updateSource = source.slice(source.indexOf("updateFile(file: TFile)"), source.indexOf("private async loadEditableAnnotations"));
@@ -487,7 +506,8 @@ test("editing overlays does not detach the source PDF and guarded ink writes res
   );
 
   assert.match(source, /data\/ink-edit-transactions/);
-  assert.match(source, /beginInkEditTransaction\(file: TFile, pageIndexes: Set<number>\)/);
+  assert.match(source, /beginInkEditTransaction\(file: TFile, pageIndexes: Set<number>\): Promise<boolean>/);
+  assert.match(source, /async getPdfInkPageIndexes\(file: TFile\): Promise<Set<number>>/);
   assert.match(source, /const transactionPages = normalizedPages\.filter\(\(pageIndex\) => pageIndex < pdf\.getPageCount\(\)\)/);
   assert.match(source, /removeAllInkAnnotationsOnPages\(pdf, new Set\(transactionPages\)\)/);
   assert.match(source, /backupAnnotationStatePath/);
@@ -498,8 +518,11 @@ test("editing overlays does not detach the source PDF and guarded ink writes res
   assert.match(source, /Ink verification failed/);
   assert.match(source, /recoverPendingInkEditTransactions\(\)/);
   assert.match(prepareSource, /await this\.importPdfInkForPages\(pageIndexes\)/);
+  assert.match(prepareSource, /await this\.plugin\.beginInkEditTransaction\(this\.file, pageIndexes\)/);
+  assert.match(prepareSource, /this\.detachedInkEditPages\.add\(pageIndex\)/);
+  assert.match(prepareSource, /await this\.reloadNativePdfView\(\)/);
   assert.match(prepareSource, /Array\.isArray\(stroke\.pdfPoints\)/);
-  assert.doesNotMatch(prepareSource, /beginInkEditTransaction|commitDetachedInkPages|modifyBinary|reloadNativePdfView|saveEditableAnnotationState/);
+  assert.doesNotMatch(prepareSource, /commitDetachedInkPages|modifyBinary|saveEditableAnnotationState/);
   assert.match(recoverySource, /await this\.restoreInkEditTransaction\(file, record, true\)/);
   assert.match(recoverySource, /await this\.saveEditableAnnotationState\(file, elements, restoredBytes\)/);
   assert.doesNotMatch(recoverySource, /finishInkEditTransaction/);
@@ -521,6 +544,23 @@ test("editing overlays does not detach the source PDF and guarded ink writes res
   assert.doesNotMatch(source, /this\.detachedInkEditPages\.clear\(\);\s*this\.scheduleEditableInkPrepare\(0, true\)/);
   assert.match(source, /flushSessionsOutsideLeaf\(leaf\)/);
   assert.match(source, /void this\.finishPdfInkEditing\(\)/);
+});
+
+test("PDF ink preparation detaches every ink page once and does not reload on repeated preparation", async () => {
+  const source = await readFile(sourceUrl, "utf8");
+  const prepareSource = source.slice(
+    source.indexOf("private async prepareEditableInkForCurrentPage"),
+    source.indexOf("private scheduleEditableInkPrepare")
+  );
+  const overlayPrepareSource = source.slice(
+    source.indexOf("private async preparePdfInkOverlayForEditing"),
+    source.indexOf("private async commitDetachedInkPages")
+  );
+  assert.match(prepareSource, /if \(this\.pdfInkPreparationComplete\)/);
+  assert.match(prepareSource, /const pageIndexes = await this\.plugin\.getPdfInkPageIndexes\(this\.file\)/);
+  assert.match(overlayPrepareSource, /const detachedNow = await this\.plugin\.beginInkEditTransaction\(this\.file, pageIndexes\)/);
+  assert.match(overlayPrepareSource, /if \(detachedNow\) \{\s*await this\.reloadNativePdfView\(\);/);
+  assert.doesNotMatch(overlayPrepareSource, /await this\.reloadNativePdfView\(\);\s*for \(const pageIndex of pageIndexes\)/);
 });
 
 test("native PDF text selection follows the last highlight or copy action", async () => {

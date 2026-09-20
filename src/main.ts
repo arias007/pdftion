@@ -48,6 +48,67 @@ const STROKE_MIN_POINT_DISTANCE_PX = 0.35;
 const STROKE_INTERPOLATION_STEP_PX = 0.75;
 const VISUAL_EXPORT_PAGE_GAP_RATIO = 0.025;
 let pdfFontkitModulePromise: Promise<PdfFontkitModule> | null = null;
+
+// ---------------------------------------------------------------------------
+// On-demand shared chunks (docx / pptxgenjs / jszip / fontkit).
+// These heavy export libraries ship as separate CommonJS files in the plugin's
+// chunks/ folder and are parsed only when an export actually needs them. This
+// keeps Obsidian's startup cost limited to the annotation core plus pdf-lib.
+// The literal dynamic imports below are kept external by esbuild, so desktop
+// resolves them through CommonJS require. Mobile WebViews fall back to reading
+// the chunk through the vault adapter and evaluating it in a CommonJS wrapper.
+// ---------------------------------------------------------------------------
+type SharedChunkModule = { default?: unknown } & Record<string, unknown>;
+const sharedChunkPromises = new Map<string, Promise<SharedChunkModule>>();
+let sharedChunkRootDir: string | null = null;
+let sharedChunkReader: ((path: string) => Promise<string>) | null = null;
+
+function configureSharedChunks(rootDir: string | null, reader: ((path: string) => Promise<string>) | null): void {
+  sharedChunkRootDir = rootDir;
+  sharedChunkReader = reader;
+}
+
+async function importSharedChunkFile(name: string): Promise<SharedChunkModule> {
+  const loaded = await (name === "docx"
+    ? import("./chunks/docx.js")
+    : name === "fontkit"
+      ? import("./chunks/fontkit.js")
+      : name === "jszip"
+        ? import("./chunks/jszip.js")
+        : import("./chunks/pptxgenjs.js"));
+  return loaded as SharedChunkModule;
+}
+
+function loadSharedChunk<T = SharedChunkModule>(name: string): Promise<T> {
+  let promise = sharedChunkPromises.get(name);
+  if (!promise) {
+    promise = (async () => {
+      let raw: SharedChunkModule;
+      try {
+        raw = await importSharedChunkFile(name);
+      } catch {
+        if (!sharedChunkRootDir || !sharedChunkReader) {
+          throw new Error(`pdftion chunk ${name} is unavailable before plugin initialization.`);
+        }
+        const code = await sharedChunkReader(`${sharedChunkRootDir}/chunks/${name}.js`);
+        const module = { exports: {} as SharedChunkModule };
+        const run = new Function("module", "exports", "require", code) as (
+          module: { exports: SharedChunkModule },
+          exports: SharedChunkModule,
+          require: (id: string) => never
+        ) => void;
+        run(module, module.exports, () => {
+          throw new Error(`pdftion chunk ${name} tried to require an external module.`);
+        });
+        raw = module.exports;
+      }
+      return ((raw as { default?: unknown }).default ?? raw) as SharedChunkModule;
+    })();
+    promise.catch(() => sharedChunkPromises.delete(name));
+    sharedChunkPromises.set(name, promise);
+  }
+  return promise as Promise<T>;
+}
 const PALETTE_COLORS = [
   "#000000",
   "#e03131",
@@ -1678,6 +1739,21 @@ interface PdfInkEditTransactionRecord {
   version: 1;
 }
 
+interface PdfReadCacheEntry {
+  bytes: ArrayBuffer;
+  mtime: number;
+  path: string;
+  pdf: PDFDocument;
+  size: number;
+}
+
+interface PdfFingerprintCacheEntry {
+  fingerprint: PdfFingerprint;
+  mtime: number;
+  path: string;
+  size: number;
+}
+
 export default class PdftionPlugin extends Plugin {
   private annotationFontBytes: Uint8Array | null = null;
   private dataMaintenancePending = false;
@@ -1685,13 +1761,60 @@ export default class PdftionPlugin extends Plugin {
   private dataMaintenanceTimer: number | null = null;
   private inkCommitPromises = new Map<string, Promise<boolean>>();
   private missingPdfSurfaces = new Map<HTMLElement, number>();
+  private pdfReadCache: PdfReadCacheEntry | null = null;
+  private pdfFingerprintCache: PdfFingerprintCacheEntry | null = null;
   private sessions = new Map<HTMLElement, InkSession>();
   private surfaceScanTimers: number[] = [];
   settings: PdftionSettings = { ...DEFAULT_SETTINGS };
 
+  // Reusing one parsed PDFDocument for read-only inspection removes the two
+  // extra full parses per ink-edit toggle (enter used to parse the file three
+  // times: page index scan, stroke import, then the detach transaction).
+  private async getPdfReadCache(file: TFile): Promise<PdfReadCacheEntry> {
+    const stat = file.stat;
+    const cached = this.pdfReadCache;
+    if (cached && cached.path === file.path && cached.mtime === stat.mtime && cached.size === stat.size) {
+      return cached;
+    }
+    const bytes = await this.app.vault.readBinary(file);
+    const pdf = await PDFDocument.load(bytes, { ignoreEncryption: true, updateMetadata: false });
+    const entry: PdfReadCacheEntry = { bytes, mtime: stat.mtime, path: file.path, pdf, size: stat.size };
+    this.pdfReadCache = entry;
+    return entry;
+  }
+
+  private invalidatePdfReadCache(file?: TFile): void {
+    if (!file || this.pdfReadCache?.path === file.path) {
+      this.pdfReadCache = null;
+    }
+  }
+
+  // Checkpointing fingerprints the current PDF on every stroke pause. Keying on
+  // stat avoids re-reading and re-hashing the whole file between edits.
+  private async getPdfFingerprint(file: TFile, currentBytes?: ArrayBuffer): Promise<PdfFingerprint> {
+    const stat = file.stat;
+    if (!currentBytes) {
+      const cached = this.pdfFingerprintCache;
+      if (cached && cached.path === file.path && cached.mtime === stat.mtime && cached.size === stat.size) {
+        return cached.fingerprint;
+      }
+    }
+    const bytes = currentBytes ?? await this.app.vault.readBinary(file);
+    const fingerprint = await fingerprintPdfBytes(bytes, stat.mtime);
+    if (!currentBytes) {
+      this.pdfFingerprintCache = { fingerprint, mtime: stat.mtime, path: file.path, size: stat.size };
+    }
+    return fingerprint;
+  }
+
   async onload(): Promise<void> {
     await this.loadSettings();
-    await this.recoverPendingInkEditTransactions();
+    configureSharedChunks(this.manifest.dir ?? null, (path) => this.app.vault.adapter.read(path));
+    // Crash recovery touches the adapter and JSON files; it does not need to
+    // block plugin activation, so run it right after onload returns.
+    window.setTimeout(() => {
+      void this.recoverPendingInkEditTransactions();
+    }, 0);
     this.applyRuntimeSettings();
     this.addSettingTab(new PdftionSettingTab(this));
 
@@ -2198,8 +2321,7 @@ export default class PdftionPlugin extends Plugin {
 
   async loadPdfInkAnnotations(file: TFile, pageIndexes?: Set<number>): Promise<InkStroke[]> {
     try {
-      const binary = await this.app.vault.readBinary(file);
-      const pdf = await PDFDocument.load(binary, { ignoreEncryption: true, updateMetadata: false });
+      const { pdf } = await this.getPdfReadCache(file);
       return extractPdfInkAnnotations(pdf, pageIndexes);
     } catch (error) {
       console.warn("pdftion could not import PDF ink annotations.", error);
@@ -2235,9 +2357,9 @@ export default class PdftionPlugin extends Plugin {
     );
   }
 
-  async saveEditableAnnotationState(file: TFile, elements: InkElement[], currentBytes: ArrayBuffer): Promise<void> {
+  async saveEditableAnnotationState(file: TFile, elements: InkElement[], currentBytes?: ArrayBuffer): Promise<void> {
     const path = this.getAnnotationStatePath(file);
-    const pdfFingerprint = await fingerprintPdfBytes(currentBytes, file.stat.mtime);
+    const pdfFingerprint = await this.getPdfFingerprint(file, currentBytes);
     await this.ensureAdapterFolder(path.substring(0, path.lastIndexOf("/")));
     await this.app.vault.adapter.write(
       path,
@@ -2460,6 +2582,8 @@ export default class PdftionPlugin extends Plugin {
   }
 
   async beginInkEditTransaction(file: TFile, pageIndexes: Set<number>): Promise<boolean> {
+    // The transaction rewrites the file; force a fresh parse for the mutation.
+    this.invalidatePdfReadCache(file);
     const normalizedPages = Array.from(pageIndexes)
       .filter((pageIndex) => Number.isInteger(pageIndex) && pageIndex >= 0)
       .sort((a, b) => a - b);
@@ -2582,6 +2706,7 @@ export default class PdftionPlugin extends Plugin {
   }
 
   private async completeInkEditTransactionNow(file: TFile, elements: InkElement[], pageIndexes: Set<number>): Promise<boolean> {
+    this.invalidatePdfReadCache(file);
     const record = await this.readInkEditTransaction(file);
     if (!record) {
       return true;
@@ -3342,6 +3467,14 @@ class InkSession {
   private exportRenderFallbackPages = new Set<number>();
   private preparingPdfInkForEditing = false;
   private pdfInkPreparationComplete = false;
+  // Pages whose detach rewrite is still awaiting the native view reload: the
+  // native PDF still paints the ink here, so the overlay must NOT draw its
+  // imported copy yet, otherwise both layers show at once.
+  private inkDetachReloadPendingPages = new Set<number>();
+  // Pages whose ink was just committed back into the PDF: keep drawing the
+  // overlay copy until the reloaded native view actually paints the ink, then
+  // hand display ownership back to the PDF (prevents a persistent duplicate).
+  private inkCommitSettlePages = new Set<number>();
   private pendingEditableInkPrepareAfterSave = false;
   private pendingSaveAfterCurrentSave = false;
   private finishingPdfInkEditing: Promise<boolean> | null = null;
@@ -4542,6 +4675,9 @@ class InkSession {
     try {
       for (const pageIndex of pageIndexes) {
         this.pendingNativeInkHidePages.add(pageIndex);
+        // The native view still paints the original ink until the detach
+        // rewrite is reloaded; suppress the overlay copy in the meantime.
+        this.inkDetachReloadPendingPages.add(pageIndex);
       }
       this.updateExternalInkLayerState();
       await this.importPdfInkForPages(pageIndexes);
@@ -4552,6 +4688,8 @@ class InkSession {
       if (detachedNow) {
         await this.reloadNativePdfView();
       }
+      // The reloaded view no longer contains the native ink, so the overlay
+      // copy becomes the only visible layer from here on.
       for (const pageIndex of pageIndexes) {
         const hasNativeInk = this.strokeHistory.some((stroke) => (
           stroke.pageIndex === pageIndex && Array.isArray(stroke.pdfPoints)
@@ -4559,6 +4697,7 @@ class InkSession {
         if (!hasNativeInk) {
           this.pendingNativeInkHidePages.delete(pageIndex);
         }
+        this.inkDetachReloadPendingPages.delete(pageIndex);
       }
       this.updateExternalInkLayerState();
       this.redrawAll();
@@ -4567,8 +4706,10 @@ class InkSession {
       console.warn("pdftion could not prepare PDF ink annotations for editing.", error);
       for (const pageIndex of pageIndexes) {
         this.pendingNativeInkHidePages.delete(pageIndex);
+        this.inkDetachReloadPendingPages.delete(pageIndex);
       }
       this.updateExternalInkLayerState();
+      this.redrawAll();
     } finally {
       this.preparingPdfInkForEditing = false;
     }
@@ -4584,10 +4725,16 @@ class InkSession {
     const targetFile = this.file;
     const targetPath = targetFile.path;
     const elements = this.getEditableElements().map(cloneElement);
+    for (const pageIndex of pageIndexes) {
+      this.inkCommitSettlePages.add(pageIndex);
+    }
     this.clearAutoSaveTimer();
     this.finishingPdfInkEditing = this.plugin.finishInkEditTransaction(targetFile, elements, pageIndexes)
       .then(async (committed) => {
         if (this.file.path !== targetPath) {
+          for (const pageIndex of pageIndexes) {
+            this.inkCommitSettlePages.delete(pageIndex);
+          }
           return committed;
         }
         if (!committed) {
@@ -4614,10 +4761,21 @@ class InkSession {
           this.deletedPdftionInkIds.clear();
         }
         this.dirty = this.getEditableElements().some((element) => !element.saved);
+        // The ink is back inside the PDF, but the view has not been reloaded
+        // yet. Keep drawing the overlay copy until the reloaded view paints
+        // the native ink, then hand display ownership back to the PDF.
         this.updateExternalInkLayerState();
         this.redrawAll();
         this.pdfInkPreparationComplete = false;
         await this.reloadNativePdfView();
+        await sleepMs(320);
+        if (this.file.path === targetPath) {
+          for (const pageIndex of pageIndexes) {
+            this.inkCommitSettlePages.delete(pageIndex);
+          }
+          this.updateExternalInkLayerState();
+          this.redrawAll();
+        }
         this.scheduleQuietScan();
         return true;
       })
@@ -4643,8 +4801,15 @@ class InkSession {
   }
 
   private async reloadEditableAnnotationsAfterInkRollback(): Promise<void> {
+    const rollbackPages = new Set(this.detachedInkEditPages);
     this.detachedInkEditPages.clear();
     this.pendingNativeInkHidePages.clear();
+    this.inkCommitSettlePages.clear();
+    for (const pageIndex of rollbackPages) {
+      // The restored view still shows the original native ink; suppress the
+      // overlay copy until the reload settles to avoid a double layer.
+      this.inkDetachReloadPendingPages.add(pageIndex);
+    }
     this.dirtyInkPages.clear();
     this.deletedExternalInkIds.clear();
     this.deletedPdftionInkIds.clear();
@@ -4657,6 +4822,8 @@ class InkSession {
     this.annotationLoadPromise = null;
     await this.loadEditableAnnotations();
     await this.reloadNativePdfView();
+    await sleepMs(320);
+    this.inkDetachReloadPendingPages.clear();
     this.updateExternalInkLayerState();
     this.redrawAll();
   }
@@ -8610,6 +8777,21 @@ class InkSession {
     return rect.bottom >= -margin && rect.top <= activeWindow.innerHeight + margin;
   }
 
+  // Who paints external (PDF-native) ink on a page right now. Exactly one
+  // layer may own the display at any moment or the user sees double doodles.
+  private shouldDrawExternalInk(pageIndex: number): boolean {
+    if (this.inkCommitSettlePages.has(pageIndex)) {
+      return true;
+    }
+    if (!this.enabled) {
+      return false;
+    }
+    if (this.inkDetachReloadPendingPages.has(pageIndex)) {
+      return false;
+    }
+    return true;
+  }
+
   private redrawOverlay(overlay: PageOverlay, previewStroke?: InkStroke): void {
     const ctx = overlay.staticCanvas.getContext("2d");
     if (!ctx) {
@@ -8634,7 +8816,11 @@ class InkSession {
       } else if (element.kind === "image") {
         this.drawImageElement(ctx, element, overlay.cssWidth, overlay.cssHeight, selected);
       } else if (element.kind === "stroke") {
-        if (!this.savedInkIsBurnedIntoPdf || !element.saved || Array.isArray(element.pdfPoints)) {
+        if (Array.isArray(element.pdfPoints)) {
+          if (this.shouldDrawExternalInk(element.pageIndex)) {
+            drawStroke(ctx, element, overlay.cssWidth, overlay.cssHeight, selected);
+          }
+        } else if (!this.savedInkIsBurnedIntoPdf || !element.saved) {
           drawStroke(ctx, element, overlay.cssWidth, overlay.cssHeight, selected);
         }
       } else if (!element.saved || !this.savedTextIsBurnedIntoPdf || element.presentation === "comment") {
@@ -10321,8 +10507,11 @@ class InkSession {
         Array.isArray(stroke.pdfPoints)
       ));
       const shouldHidePage =
-        targets.length > 0 ||
-        (this.enabled && (this.pendingNativeInkHidePages.has(overlay.pageIndex) || this.detachedInkEditPages.has(overlay.pageIndex)));
+        this.enabled && (
+          targets.length > 0 ||
+          this.pendingNativeInkHidePages.has(overlay.pageIndex) ||
+          this.detachedInkEditPages.has(overlay.pageIndex)
+        );
       if (!shouldHidePage) {
         overlay.pageEl.classList.remove("pdftion-hide-native-ink-layer");
         continue;
@@ -11242,8 +11431,7 @@ class InkSession {
     const elements = this.getEditableElements().map(cloneElement);
     this.checkpointing = true;
     try {
-      const binary = await this.plugin.app.vault.readBinary(targetFile);
-      await this.plugin.saveEditableAnnotationState(targetFile, elements, binary);
+      await this.plugin.saveEditableAnnotationState(targetFile, elements);
     } catch (error) {
       console.warn("pdftion could not checkpoint editable annotations.", error);
     } finally {
@@ -11362,7 +11550,7 @@ async function embedAnnotationFont(pdf: PDFDocument, fontBytes: Uint8Array) {
 
 function loadPdfFontkitModule(): Promise<PdfFontkitModule> {
   if (!pdfFontkitModulePromise) {
-    pdfFontkitModulePromise = import("@pdf-lib/fontkit");
+    pdfFontkitModulePromise = loadSharedChunk<PdfFontkitModule>("fontkit");
   }
   return pdfFontkitModulePromise;
 }
@@ -14200,8 +14388,8 @@ function renderNativeHtmlRuns(
 }
 
 async function buildPptxFromPageImages(pages: VisualConversionPage[], title: string): Promise<Uint8Array> {
-  const module = await import("pptxgenjs");
-  const PptxGenJS = module.default;
+  const module = await loadSharedChunk("pptxgenjs");
+  const PptxGenJS = (module.default ?? module) as typeof import("pptxgenjs")["default"];
   const pptx = new PptxGenJS();
   const first = pages[0];
   if (!first) {
@@ -14384,6 +14572,7 @@ function buildSelfContainedVisualHtml(file: TFile, pages: VisualConversionPage[]
 }
 
 async function buildDocxFromPageImages(pages: VisualConversionPage[], title: string): Promise<Uint8Array> {
+  const docx = await loadSharedChunk("docx") as typeof import("docx");
   const {
     AlignmentType,
     BorderStyle,
@@ -14401,7 +14590,7 @@ async function buildDocxFromPageImages(pages: VisualConversionPage[], title: str
     TextRun,
     UnderlineType,
     WidthType
-  } = await import("docx");
+  } = docx;
   const nativeDocument = buildNativeExportDocumentFromVisualPages(pages);
   const pageWidthTwips = 11906;
   const pageMarginTwips = 540;
@@ -14581,7 +14770,9 @@ async function injectOfficePreviewPages(
   pageWidthPt: number,
   pageHeightPt: number
 ): Promise<Uint8Array> {
-  const { default: JSZip } = await import("jszip");
+  // jszip's CommonJS entry exports the class directly, so the chunk module is
+  // the constructor itself (no default interop wrapper).
+  const JSZip = await loadSharedChunk("jszip") as unknown as typeof import("jszip");
   const zip = await JSZip.loadAsync(officeBytes);
   const sortedPages = [...pages].sort((a, b) => a.pageIndex - b.pageIndex);
   zip.file("mpe/preview/manifest.json", JSON.stringify({

@@ -248,7 +248,7 @@ test("document exports use native editable text, tables, links, and image-only v
   assert.match(source, /<span style=/);
   assert.doesNotMatch(source, /<svg class="text-layer"|lengthAdjust="spacingAndGlyphs"/);
   assert.match(source, /await buildDocxFromPageImages\(pages, this\.file\.basename\)/);
-  assert.match(source, /loadSharedChunk\("docx"\)/);
+  assert.match(source, /await import\("docx"\)/);
   assert.match(source, /new ImageRun\(\{/);
   assert.match(source, /new TextRun\(\{/);
   assert.match(source, /new Table\(\{/);
@@ -579,7 +579,7 @@ test("native PDF text selection follows the last highlight or copy action", asyn
   assert.match(source, /horizontalOverlap >= 0\.55 && verticalOverlap >= 0\.6/);
 });
 
-test("PPTX dependencies are browser-safe and the release bundle has no dynamic execution outside the chunk loader", async () => {
+test("PPTX dependencies are browser-safe and the release bundle has no dynamic execution", async () => {
   const [config, bundle, manifestText, packageText] = await Promise.all([
     readFile(buildConfigUrl, "utf8"),
     readFile(bundleUrl, "utf8"),
@@ -593,20 +593,11 @@ test("PPTX dependencies are browser-safe and the release bundle has no dynamic e
   assert.match(config, /name: "safe-zip-scheduler"/);
   assert.match(config, /dynamicFunctionCount !== 1 \|\| dynamicScriptCount !== 4/);
   assert.doesNotMatch(bundle, /\beval\s*\(/);
+  assert.doesNotMatch(bundle, /new\s+Function\s*\(/);
   assert.doesNotMatch(bundle, /createElement\s*\(\s*["']script["']/);
-  // Dynamic execution is only permitted inside the on-demand shared chunk
-  // loader (loadSharedChunk), which evaluates local plugin-owned chunk files
-  // for mobile WebViews. Everything else in the bundle must be static.
-  const dynamicFunctionMatches = [...bundle.matchAll(/new\s+Function\s*\(/gu)];
-  assert.equal(dynamicFunctionMatches.length, 1, "new Function is allowed exactly once: inside the shared chunk loader");
-  const matchIndex = dynamicFunctionMatches[0].index ?? 0;
-  const loaderContext = bundle.slice(Math.max(0, matchIndex - 600), matchIndex + 600);
-  assert.match(loaderContext, /chunks\//, "the single new Function must live in the shared chunk loader");
-  // The heavy export libraries must ship as external on-demand chunks.
-  assert.match(bundle, /chunks\/docx\.js/);
-  assert.match(bundle, /chunks\/pptxgenjs\.js/);
-  assert.match(bundle, /chunks\/jszip\.js/);
-  assert.match(bundle, /chunks\/fontkit\.js/);
+  // Single-file distribution: the plugin must stay a self-contained main.js
+  // with the heavy export libraries inlined (no external chunk files).
+  assert.doesNotMatch(bundle, /chunks\/(docx|pptxgenjs|jszip|fontkit)\.js/);
   assert.equal(packageJson.dependencies.pptxgenjs, "^4.0.1");
   assert.equal(packageJson.dependencies.jszip, "^3.10.1");
   assert.equal(manifest.author, "Murat");

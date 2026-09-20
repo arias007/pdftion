@@ -48,67 +48,6 @@ const STROKE_MIN_POINT_DISTANCE_PX = 0.35;
 const STROKE_INTERPOLATION_STEP_PX = 0.75;
 const VISUAL_EXPORT_PAGE_GAP_RATIO = 0.025;
 let pdfFontkitModulePromise: Promise<PdfFontkitModule> | null = null;
-
-// ---------------------------------------------------------------------------
-// On-demand shared chunks (docx / pptxgenjs / jszip / fontkit).
-// These heavy export libraries ship as separate CommonJS files in the plugin's
-// chunks/ folder and are parsed only when an export actually needs them. This
-// keeps Obsidian's startup cost limited to the annotation core plus pdf-lib.
-// The literal dynamic imports below are kept external by esbuild, so desktop
-// resolves them through CommonJS require. Mobile WebViews fall back to reading
-// the chunk through the vault adapter and evaluating it in a CommonJS wrapper.
-// ---------------------------------------------------------------------------
-type SharedChunkModule = { default?: unknown } & Record<string, unknown>;
-const sharedChunkPromises = new Map<string, Promise<SharedChunkModule>>();
-let sharedChunkRootDir: string | null = null;
-let sharedChunkReader: ((path: string) => Promise<string>) | null = null;
-
-function configureSharedChunks(rootDir: string | null, reader: ((path: string) => Promise<string>) | null): void {
-  sharedChunkRootDir = rootDir;
-  sharedChunkReader = reader;
-}
-
-async function importSharedChunkFile(name: string): Promise<SharedChunkModule> {
-  const loaded = await (name === "docx"
-    ? import("./chunks/docx.js")
-    : name === "fontkit"
-      ? import("./chunks/fontkit.js")
-      : name === "jszip"
-        ? import("./chunks/jszip.js")
-        : import("./chunks/pptxgenjs.js"));
-  return loaded as SharedChunkModule;
-}
-
-function loadSharedChunk<T = SharedChunkModule>(name: string): Promise<T> {
-  let promise = sharedChunkPromises.get(name);
-  if (!promise) {
-    promise = (async () => {
-      let raw: SharedChunkModule;
-      try {
-        raw = await importSharedChunkFile(name);
-      } catch {
-        if (!sharedChunkRootDir || !sharedChunkReader) {
-          throw new Error(`pdftion chunk ${name} is unavailable before plugin initialization.`);
-        }
-        const code = await sharedChunkReader(`${sharedChunkRootDir}/chunks/${name}.js`);
-        const module = { exports: {} as SharedChunkModule };
-        const run = new Function("module", "exports", "require", code) as (
-          module: { exports: SharedChunkModule },
-          exports: SharedChunkModule,
-          require: (id: string) => never
-        ) => void;
-        run(module, module.exports, () => {
-          throw new Error(`pdftion chunk ${name} tried to require an external module.`);
-        });
-        raw = module.exports;
-      }
-      return ((raw as { default?: unknown }).default ?? raw) as SharedChunkModule;
-    })();
-    promise.catch(() => sharedChunkPromises.delete(name));
-    sharedChunkPromises.set(name, promise);
-  }
-  return promise as Promise<T>;
-}
 const PALETTE_COLORS = [
   "#000000",
   "#e03131",
@@ -1809,7 +1748,6 @@ export default class PdftionPlugin extends Plugin {
 
   async onload(): Promise<void> {
     await this.loadSettings();
-    configureSharedChunks(this.manifest.dir ?? null, (path) => this.app.vault.adapter.read(path));
     // Crash recovery touches the adapter and JSON files; it does not need to
     // block plugin activation, so run it right after onload returns.
     window.setTimeout(() => {
@@ -4666,6 +4604,39 @@ class InkSession {
     return pages;
   }
 
+  // True when the platform renders native ink as DOM annotation elements that
+  // the existing CSS hiding can actually cover. Only then can editing skip
+  // the file-level detach + view reload entirely.
+  private canHideNativeInkOnPage(overlay: PageOverlay): boolean {
+    const targets = this.strokeHistory.filter((stroke) => (
+      stroke.pageIndex === overlay.pageIndex &&
+      Array.isArray(stroke.pdfPoints)
+    ));
+    if (targets.length === 0) {
+      return false;
+    }
+    const canvasRect = overlay.canvas.getBoundingClientRect();
+    const targetRects = targets
+      .map((stroke) => normalizedStrokeBounds({ ...stroke, points: stroke.pdfPoints ?? stroke.points }))
+      .filter((bounds): bounds is NormalizedBounds => bounds !== null)
+      .map((bounds) => ({
+        bottom: canvasRect.top + bounds.maxY * canvasRect.height + 24,
+        left: canvasRect.left + bounds.minX * canvasRect.width - 24,
+        right: canvasRect.left + bounds.maxX * canvasRect.width + 24,
+        top: canvasRect.top + bounds.minY * canvasRect.height - 24
+      }));
+    if (targetRects.length === 0) {
+      return false;
+    }
+    for (const candidate of this.collectNativeAnnotationElements(overlay.pageEl, true)) {
+      const rect = candidate.getBoundingClientRect();
+      if (rect.width > 0 && rect.height > 0 && targetRects.some((target) => rectsOverlap(target, rect))) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   private async preparePdfInkOverlayForEditing(pageIndexes: Set<number>): Promise<void> {
     if (pageIndexes.size === 0 || this.preparingPdfInkForEditing) {
       return;
@@ -4681,6 +4652,30 @@ class InkSession {
       }
       this.updateExternalInkLayerState();
       await this.importPdfInkForPages(pageIndexes);
+      // Fast path: when the native ink is rendered as DOM annotation elements,
+      // the existing CSS hiding already guarantees a single visible layer, so
+      // rewriting the PDF file and reloading the view is unnecessary. Skipping
+      // both removes the slow conversion window and the double-layer risk.
+      const relevantOverlays = Array.from(this.overlays.values())
+        .filter((overlay) => pageIndexes.has(overlay.pageIndex));
+      const cssHidingCapable = relevantOverlays.length > 0 && relevantOverlays.every((overlay) => (
+        this.canHideNativeInkOnPage(overlay)
+      ));
+      if (cssHidingCapable) {
+        for (const pageIndex of pageIndexes) {
+          this.inkDetachReloadPendingPages.delete(pageIndex);
+          const hasNativeInk = this.strokeHistory.some((stroke) => (
+            stroke.pageIndex === pageIndex && Array.isArray(stroke.pdfPoints)
+          ));
+          if (!hasNativeInk) {
+            this.pendingNativeInkHidePages.delete(pageIndex);
+          }
+        }
+        this.updateExternalInkLayerState();
+        this.redrawAll();
+        this.pdfInkPreparationComplete = true;
+        return;
+      }
       const detachedNow = await this.plugin.beginInkEditTransaction(this.file, pageIndexes);
       for (const pageIndex of pageIndexes) {
         this.detachedInkEditPages.add(pageIndex);
@@ -4894,7 +4889,10 @@ class InkSession {
         pdfPoints,
         pdfSaved: true,
         points: stroke.points.map((point) => ({ ...point })),
-        saved: false
+        // The stroke already exists as a native ink annotation inside the PDF,
+        // so it is "saved" until the user edits it. This keeps a plain
+        // enter-then-exit cycle from rewriting the whole file.
+        saved: true
       });
       return true;
     }
@@ -11550,7 +11548,7 @@ async function embedAnnotationFont(pdf: PDFDocument, fontBytes: Uint8Array) {
 
 function loadPdfFontkitModule(): Promise<PdfFontkitModule> {
   if (!pdfFontkitModulePromise) {
-    pdfFontkitModulePromise = loadSharedChunk<PdfFontkitModule>("fontkit");
+    pdfFontkitModulePromise = import("@pdf-lib/fontkit");
   }
   return pdfFontkitModulePromise;
 }
@@ -14388,8 +14386,8 @@ function renderNativeHtmlRuns(
 }
 
 async function buildPptxFromPageImages(pages: VisualConversionPage[], title: string): Promise<Uint8Array> {
-  const module = await loadSharedChunk("pptxgenjs");
-  const PptxGenJS = (module.default ?? module) as typeof import("pptxgenjs")["default"];
+  const module = await import("pptxgenjs");
+  const PptxGenJS = module.default;
   const pptx = new PptxGenJS();
   const first = pages[0];
   if (!first) {
@@ -14572,7 +14570,7 @@ function buildSelfContainedVisualHtml(file: TFile, pages: VisualConversionPage[]
 }
 
 async function buildDocxFromPageImages(pages: VisualConversionPage[], title: string): Promise<Uint8Array> {
-  const docx = await loadSharedChunk("docx") as typeof import("docx");
+  const docx = await import("docx");
   const {
     AlignmentType,
     BorderStyle,
@@ -14770,9 +14768,7 @@ async function injectOfficePreviewPages(
   pageWidthPt: number,
   pageHeightPt: number
 ): Promise<Uint8Array> {
-  // jszip's CommonJS entry exports the class directly, so the chunk module is
-  // the constructor itself (no default interop wrapper).
-  const JSZip = await loadSharedChunk("jszip") as unknown as typeof import("jszip");
+  const { default: JSZip } = await import("jszip");
   const zip = await JSZip.loadAsync(officeBytes);
   const sortedPages = [...pages].sort((a, b) => a.pageIndex - b.pageIndex);
   zip.file("mpe/preview/manifest.json", JSON.stringify({

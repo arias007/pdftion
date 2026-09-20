@@ -1,5 +1,5 @@
 import esbuild from "esbuild";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 
 const prod = process.argv[2] === "production";
 
@@ -79,41 +79,10 @@ const safeZipScheduler = {
   }
 };
 
-// Heavy export libraries are bundled into on-demand chunks so that plugin
-// startup only parses the small annotation core plus pdf-lib. Each chunk is a
-// self-contained CommonJS file loaded at runtime by loadSharedChunk() in
-// src/main.ts (require on desktop, adapter-read + module wrapper on mobile).
-const sharedChunkSpecs = [
-  { name: "docx", plugins: [safeZipScheduler], request: "docx" },
-  { name: "fontkit", plugins: [], request: "@pdf-lib/fontkit" },
-  { name: "jszip", plugins: [safeZipScheduler], request: "jszip" },
-  { name: "pptxgenjs", plugins: [pptxGenBrowserRuntime], request: "pptxgenjs" }
-];
-
-for (const spec of sharedChunkSpecs) {
-  await mkdir("chunks", { recursive: true });
-  // The plugin package is ESM ("type": "module"), but the chunks are CommonJS.
-  // Without this marker, Node/Electron treats chunks/*.js as ESM and the
-  // module.exports assignment is ignored, producing empty exports.
-  await writeFile("chunks/package.json", '{\n  "type": "commonjs"\n}\n');
-  await esbuild.build({
-    bundle: true,
-    entryPoints: [`./node_modules/${spec.request}`],
-    format: "cjs",
-    logLevel: "info",
-    minify: prod,
-    outfile: `chunks/${spec.name}.js`,
-    platform: "browser",
-    plugins: spec.plugins,
-    target: "es2022",
-    treeShaking: true
-  });
-}
-
 await esbuild.build({
   bundle: true,
   entryPoints: ["src/main.ts"],
-  external: ["obsidian", "./chunks/*"],
+  external: ["obsidian"],
   format: "cjs",
   loader: {
     ".otf": "base64"

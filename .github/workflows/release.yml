@@ -50,6 +50,7 @@ jobs:
       - name: Validate release assets
         run: |
           node --check main.js
+          node --check pdftion-libs.cjs
           node -e "for (const file of ['manifest.json', 'package.json', 'package-lock.json']) JSON.parse(require('fs').readFileSync(file, 'utf8'));"
 
       - name: Attest release assets
@@ -58,6 +59,7 @@ jobs:
           subject-path: |
             manifest.json
             main.js
+            pdftion-libs.cjs
             styles.css
 
       - name: Publish GitHub release
@@ -67,6 +69,7 @@ jobs:
           gh release create "$GITHUB_REF_NAME" \
             manifest.json \
             main.js \
+            pdftion-libs.cjs \
             styles.css \
             --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \

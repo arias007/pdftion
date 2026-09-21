@@ -248,7 +248,10 @@ test("document exports use native editable text, tables, links, and image-only v
   assert.match(source, /<span style=/);
   assert.doesNotMatch(source, /<svg class="text-layer"|lengthAdjust="spacingAndGlyphs"/);
   assert.match(source, /await buildDocxFromPageImages\(pages, this\.file\.basename\)/);
-  assert.match(source, /await import\("docx"\)/);
+  // DOCX/PPTX/JSZip now come from the lazily required pdftion-libs.cjs bundle.
+  assert.match(source, /= getHeavyLibs\(\)\.docx;/);
+  assert.match(source, /= getHeavyLibs\(\)\.jszip;/);
+  assert.match(source, /= getHeavyLibs\(\)\.pptxgenjs;/);
   assert.match(source, /new ImageRun\(\{/);
   assert.match(source, /new TextRun\(\{/);
   assert.match(source, /new Table\(\{/);
@@ -406,8 +409,12 @@ test("placeholder pages, precise stroke hits, and immediate drag redraw stay int
 
   assert.match(source, /return candidate\.clientWidth > 0 && candidate\.clientHeight > 0/);
   assert.match(source, /return strokeContainsPoint\(stroke, point, cssWidth, cssHeight, hitRadius\)/);
-  assert.match(source, /Math\.max\(12, displayWidth \* 2\.4\)/);
-  assert.match(source, /coverBoxContainsPoint\(element, point, overlay\.cssWidth, overlay\.cssHeight, 7\)/);
+  // Two-pass hit testing: the hit zone hugs the visible stroke (half width +
+  // small tolerance) and a strict pass runs before the loose fallback so wide
+  // strokes cannot steal clicks from neighbouring elements.
+  assert.match(source, /const hitRadius = displayWidth \/ 2 \+ tolerance;/);
+  assert.match(source, /for \(const tolerance of \[HIT_TOLERANCE_STRICT_PX, HIT_TOLERANCE_LOOSE_PX\]\)/);
+  assert.match(source, /coverBoxContainsPoint\(element, point, overlay\.cssWidth, overlay\.cssHeight, tolerance\)/);
   assert.doesNotMatch(source, /startedFromFreshSelection|selectionWasExplicitTap/);
   const dragMoveSource = source.slice(
     source.indexOf("private moveSelectionInteraction"),

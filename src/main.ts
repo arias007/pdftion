@@ -23,6 +23,7 @@ import {
   stroke as strokePath
 } from "pdf-lib";
 import { getExtendedPdftionTranslation } from "./i18n";
+import { getHeavyLibs } from "./heavyLibs";
 
 // Mobile WebViews do not expose Obsidian desktop-only activeWindow globals.
 const activeWindow = window;
@@ -34,6 +35,11 @@ type PdfFontkitModule = typeof import("@pdf-lib/fontkit");
 
 const AUTO_SAVE_IDLE_DELAY_MS = 5200;
 const AUTO_SAVE_CLOSE_DELAY_MS = 200;
+// Hit-testing runs in two passes: a strict pass that matches the visible shape
+// (so elements cannot steal clicks from neighbours via an inflated tolerance
+// zone), then a loose fallback pass for imprecise taps.
+const HIT_TOLERANCE_STRICT_PX = 3;
+const HIT_TOLERANCE_LOOSE_PX = 12;
 const DATA_MAINTENANCE_DELETE_DELAY_MS = 30_000;
 const DATA_MAINTENANCE_START_DELAY_MS = 15_000;
 const OVERLAY_HEALTH_CHECK_MS = 5000;
@@ -2244,8 +2250,7 @@ export default class PdftionPlugin extends Plugin {
     if (!(await this.app.vault.adapter.exists(this.getAnnotationStatePath(file)))) {
       return null;
     }
-    const currentBytes = await this.app.vault.readBinary(file);
-    const currentFingerprint = await fingerprintPdfBytes(currentBytes, file.stat.mtime);
+    const currentFingerprint = await this.getPdfFingerprint(file);
     const state = await this.loadVerifiedAnnotationRecord(file, currentFingerprint);
     if (!state) {
       return null;
@@ -2267,9 +2272,20 @@ export default class PdftionPlugin extends Plugin {
     }
   }
 
+  private pdfInkPageIndexCache = new Map<string, { mtime: number; pageIndexes: Set<number>; size: number }>();
+
   async getPdfInkPageIndexes(file: TFile): Promise<Set<number>> {
+    // Parsing the whole PDF just to learn which pages contain ink annotations
+    // is expensive on large documents; cache by path + mtime + size.
+    const stat = file.stat;
+    const cached = this.pdfInkPageIndexCache.get(file.path);
+    if (cached && cached.mtime === stat.mtime && cached.size === stat.size) {
+      return cached.pageIndexes;
+    }
     const strokes = await this.loadPdfInkAnnotations(file);
-    return new Set(strokes.map((stroke) => stroke.pageIndex));
+    const pageIndexes = new Set(strokes.map((stroke) => stroke.pageIndex));
+    this.pdfInkPageIndexCache.set(file.path, { mtime: stat.mtime, pageIndexes, size: stat.size });
+    return pageIndexes;
   }
 
   async saveAnnotationState(file: TFile, elements: InkElement[], basePdfFingerprint: PdfFingerprint, savedBytes: ArrayBuffer): Promise<void> {
@@ -2288,9 +2304,7 @@ export default class PdftionPlugin extends Plugin {
           updatedAt: new Date().toISOString(),
           version: 7,
           elements
-        },
-        null,
-        2
+        }
       )
     );
   }
@@ -2310,9 +2324,7 @@ export default class PdftionPlugin extends Plugin {
           updatedAt: new Date().toISOString(),
           version: 7,
           elements
-        },
-        null,
-        2
+        }
       )
     );
   }
@@ -4456,6 +4468,12 @@ class InkSession {
       }
     }
 
+    // After the native PDF view reloads (ink transaction begin/commit), pdf.js
+    // recreates its annotation layers. Re-applying the native-ink hiding state
+    // here closes the window where both the baked-in annotations and the
+    // overlay strokes are visible at the same time (double-layer doodles).
+    this.updateExternalInkLayerState();
+
     if (repaired) {
       this.redrawAll();
       void this.prepareEditableInkForCurrentPage();
@@ -4833,6 +4851,14 @@ class InkSession {
     } catch (error) {
       console.debug("pdftion could not reload the current PDF view after an ink transaction.", error);
     }
+    // pdf.js rebuilds its page/annotation layers asynchronously after the
+    // reload. Re-apply the native-ink hiding state once rendering settles so
+    // the freshly mounted annotation layers do not flash up as a second,
+    // duplicate doodle layer next to the overlay strokes.
+    this.updateExternalInkLayerState();
+    window.requestAnimationFrame(() => this.updateExternalInkLayerState());
+    window.setTimeout(() => this.updateExternalInkLayerState(), 120);
+    window.setTimeout(() => this.updateExternalInkLayerState(), 420);
   }
 
   private async importPdfInkForPages(pageIndexes?: Set<number>): Promise<boolean> {
@@ -9841,18 +9867,24 @@ class InkSession {
 
   private findElementAt(overlay: PageOverlay, point: InkPoint): InkElement | null {
     const ordered = this.getEditableElementsForPage(overlay.pageIndex).reverse();
-    for (const element of ordered) {
-      if (element.kind === "text" && textBoxContainsPoint(element, point, overlay.cssWidth, overlay.cssHeight)) {
-        return element;
-      }
-      if (element.kind === "image" && imageBoxContainsPoint(element, point, overlay.cssWidth, overlay.cssHeight, 7)) {
-        return element;
-      }
-      if (element.kind === "stroke" && strokeBoxContainsPoint(element, point, overlay.cssWidth, overlay.cssHeight)) {
-        return element;
-      }
-      if (element.kind === "cover" && coverBoxContainsPoint(element, point, overlay.cssWidth, overlay.cssHeight, 7)) {
-        return element;
+    // Strict pass first: only elements whose visible shape truly contains the
+    // point can be picked. A second loose pass adds a small tolerance so
+    // imprecise taps still land, without letting a wide stroke's halo steal
+    // the click from an element that is directly under the pointer.
+    for (const tolerance of [HIT_TOLERANCE_STRICT_PX, HIT_TOLERANCE_LOOSE_PX]) {
+      for (const element of ordered) {
+        if (element.kind === "text" && textBoxContainsPoint(element, point, overlay.cssWidth, overlay.cssHeight, tolerance)) {
+          return element;
+        }
+        if (element.kind === "image" && imageBoxContainsPoint(element, point, overlay.cssWidth, overlay.cssHeight, tolerance)) {
+          return element;
+        }
+        if (element.kind === "stroke" && strokeBoxContainsPoint(element, point, overlay.cssWidth, overlay.cssHeight, tolerance)) {
+          return element;
+        }
+        if (element.kind === "cover" && coverBoxContainsPoint(element, point, overlay.cssWidth, overlay.cssHeight, tolerance)) {
+          return element;
+        }
       }
     }
     return null;
@@ -11426,10 +11458,12 @@ class InkSession {
     }
     const targetFile = this.file;
     const targetPath = targetFile.path;
-    const elements = this.getEditableElements().map(cloneElement);
     this.checkpointing = true;
     try {
-      await this.plugin.saveEditableAnnotationState(targetFile, elements);
+      // JSON.stringify is a synchronous snapshot, so no defensive clone is
+      // needed; the plugin-side fingerprint cache avoids re-reading and
+      // re-hashing the whole PDF on every checkpoint of a large document.
+      await this.plugin.saveEditableAnnotationState(targetFile, this.getEditableElements());
     } catch (error) {
       console.warn("pdftion could not checkpoint editable annotations.", error);
     } finally {
@@ -11548,7 +11582,7 @@ async function embedAnnotationFont(pdf: PDFDocument, fontBytes: Uint8Array) {
 
 function loadPdfFontkitModule(): Promise<PdfFontkitModule> {
   if (!pdfFontkitModulePromise) {
-    pdfFontkitModulePromise = import("@pdf-lib/fontkit");
+    pdfFontkitModulePromise = Promise.resolve(getHeavyLibs().pdfFontkit as PdfFontkitModule);
   }
   return pdfFontkitModulePromise;
 }
@@ -11591,8 +11625,7 @@ async function syncEditableInkAnnotationsOnPdf(pdf: PDFDocument, elements: InkEl
       continue;
     }
     if (!addStandardInkAnnotation(pdf, page, stroke)) {
-      const size = page.getSize();
-      drawStrokeAsPdfLines(page, stroke, size.width, size.height);
+      drawStrokeAsPdfLines(page, stroke, getPageDisplayMapping(page));
     }
   }
 }
@@ -11666,6 +11699,114 @@ function isPdftionInkAnnotation(annot: PDFDict): boolean {
   return nm.startsWith("Pdftion:") || contents.startsWith("Pdftion ") || title === "Pdftion";
 }
 
+type PageDisplayMapping = {
+  cropH: number;
+  cropW: number;
+  cropX: number;
+  cropY: number;
+  rotation: number;
+};
+
+// Build the mapping between PDF default user space and the page as pdf.js
+// displays it. Older code assumed an unrotated page whose CropBox starts at
+// (0,0); on rotated or cropped pages that assumption silently shifted every
+// imported/burned-in stroke, which desynced hit-testing from what was on
+// screen and produced double-layered doodles after entering/leaving edit mode.
+function getPageDisplayMapping(page: ReturnType<PDFDocument["getPage"]>): PageDisplayMapping {
+  const size = page.getSize();
+  let cropX = 0;
+  let cropY = 0;
+  let cropW = size.width;
+  let cropH = size.height;
+  try {
+    const cropBox = page.getCropBox();
+    if (cropBox.width > 0 && cropBox.height > 0) {
+      cropX = cropBox.x;
+      cropY = cropBox.y;
+      cropW = cropBox.width;
+      cropH = cropBox.height;
+    }
+  } catch {
+    // Keep media box fallback.
+  }
+  let rotation = 0;
+  try {
+    rotation = ((page.getRotation().angle % 360) + 360) % 360;
+  } catch {
+    // Keep unrotated fallback.
+  }
+  return { cropH, cropW, cropX, cropY, rotation };
+}
+
+// Default user space point -> normalized display coordinates (u right,
+// v down), matching the pdf.js viewport including /Rotate.
+function userPointToDisplayPoint(mapping: PageDisplayMapping, x: number, y: number): InkPoint {
+  const fu = mapping.cropW > 0 ? (x - mapping.cropX) / mapping.cropW : 0;
+  const fv = mapping.cropH > 0 ? (y - mapping.cropY) / mapping.cropH : 0;
+  switch (mapping.rotation) {
+    case 90:
+      return { x: clamp(fv, 0, 1), y: clamp(fu, 0, 1) };
+    case 180:
+      return { x: clamp(1 - fu, 0, 1), y: clamp(fv, 0, 1) };
+    case 270:
+      return { x: clamp(1 - fv, 0, 1), y: clamp(1 - fu, 0, 1) };
+    default:
+      return { x: clamp(fu, 0, 1), y: clamp(1 - fv, 0, 1) };
+  }
+}
+
+// Normalized display coordinates -> default user space (inverse of above).
+function displayPointToUserPoint(mapping: PageDisplayMapping, u: number, v: number): { x: number; y: number } {
+  let fu: number;
+  let fv: number;
+  switch (mapping.rotation) {
+    case 90:
+      fu = v;
+      fv = u;
+      break;
+    case 180:
+      fu = 1 - u;
+      fv = v;
+      break;
+    case 270:
+      fu = 1 - v;
+      fv = 1 - u;
+      break;
+    default:
+      fu = u;
+      fv = 1 - v;
+      break;
+  }
+  return { x: mapping.cropX + fu * mapping.cropW, y: mapping.cropY + fv * mapping.cropH };
+}
+
+// Displayed-page width/height expressed in user-space units (swap on 90/270).
+function pageDisplayUserWidth(mapping: PageDisplayMapping): number {
+  return mapping.rotation % 180 === 0 ? mapping.cropW : mapping.cropH;
+}
+
+function pageDisplayUserHeight(mapping: PageDisplayMapping): number {
+  return mapping.rotation % 180 === 0 ? mapping.cropH : mapping.cropW;
+}
+
+// Normalized display rect -> axis-aligned user-space rect.
+function displayRectToUserRect(
+  mapping: PageDisplayMapping,
+  ex: number,
+  ey: number,
+  ew: number,
+  eh: number
+): { height: number; width: number; x: number; y: number } {
+  const topLeft = displayPointToUserPoint(mapping, ex, ey);
+  const bottomRight = displayPointToUserPoint(mapping, ex + ew, ey + eh);
+  return {
+    height: Math.abs(bottomRight.y - topLeft.y),
+    width: Math.abs(bottomRight.x - topLeft.x),
+    x: Math.min(topLeft.x, bottomRight.x),
+    y: Math.min(topLeft.y, bottomRight.y)
+  };
+}
+
 function extractPdfInkAnnotations(pdf: PDFDocument, pageIndexes?: Set<number>): InkStroke[] {
   const strokes: InkStroke[] = [];
   const pages = pdf.getPages();
@@ -11674,7 +11815,7 @@ function extractPdfInkAnnotations(pdf: PDFDocument, pageIndexes?: Set<number>): 
       continue;
     }
     const page = pages[pageIndex];
-    const size = page.getSize();
+    const mapping = getPageDisplayMapping(page);
     const annots = page.node.Annots?.();
     if (!annots) {
       continue;
@@ -11684,7 +11825,7 @@ function extractPdfInkAnnotations(pdf: PDFDocument, pageIndexes?: Set<number>): 
       if (!annot) {
         continue;
       }
-      const stroke = externalInkAnnotationToStroke(annot, pageIndex, annotIndex, size.width, size.height);
+      const stroke = externalInkAnnotationToStroke(annot, pageIndex, annotIndex, mapping);
       if (stroke) {
         strokes.push(stroke);
       }
@@ -11697,8 +11838,7 @@ function externalInkAnnotationToStroke(
   annot: PDFDict,
   pageIndex: number,
   annotIndex: number,
-  pageWidth: number,
-  pageHeight: number
+  mapping: PageDisplayMapping
 ): InkStroke | null {
   const subtype = annot.lookupMaybe(PDFName.of("Subtype"), PDFName);
   if (subtype?.decodeText() !== "Ink") {
@@ -11721,10 +11861,7 @@ function externalInkAnnotationToStroke(
       if (typeof x !== "number" || typeof y !== "number") {
         continue;
       }
-      points.push({
-        x: clamp(x / Math.max(1, pageWidth), 0, 1),
-        y: clamp((pageHeight - y) / Math.max(1, pageHeight), 0, 1)
-      });
+      points.push(userPointToDisplayPoint(mapping, x, y));
     }
   }
   if (points.length < 2) {
@@ -11744,8 +11881,8 @@ function externalInkAnnotationToStroke(
     id: pdftionId ?? externalInkStrokeId(pageIndex, annotIndex, annot),
     kind: "stroke",
     opacity: clamp(opacity, 0.01, 1),
-    pageCssHeight: pageHeight,
-    pageCssWidth: pageWidth,
+    pageCssHeight: pageDisplayUserHeight(mapping),
+    pageCssWidth: pageDisplayUserWidth(mapping),
     pageIndex,
     pdfPoints: simplifiedPoints.map((point) => ({ ...point })),
     pdfSaved: true,
@@ -11855,15 +11992,17 @@ function addStandardInkAnnotation(pdf: PDFDocument, page: ReturnType<PDFDocument
   }
 
   try {
+    const mapping = getPageDisplayMapping(page);
     const size = page.getSize();
     const inkPoints = smoothInkPointsForPdf(stroke.points, 1600);
-    const scaledPoints = inkPoints.map((point) => ({
-      x: clamp(point.x, 0, 1) * size.width,
-      y: size.height - clamp(point.y, 0, 1) * size.height
-    }));
+    const scaledPoints = inkPoints.map((point) => displayPointToUserPoint(
+      mapping,
+      clamp(point.x, 0, 1),
+      clamp(point.y, 0, 1)
+    ));
     const xs = scaledPoints.map((point) => point.x);
     const ys = scaledPoints.map((point) => point.y);
-    const thickness = Math.max(0.5, stroke.width * (size.width / Math.max(1, stroke.pageCssWidth)));
+    const thickness = Math.max(0.5, stroke.width * (pageDisplayUserWidth(mapping) / Math.max(1, stroke.pageCssWidth)));
     const padding = Math.max(4, thickness * 2);
     const color = hexToRgb(stroke.color);
     const rectLeft = Math.max(0, Math.min(...xs) - padding);
@@ -11944,11 +12083,11 @@ function addStandardInkAnnotation(pdf: PDFDocument, page: ReturnType<PDFDocument
   }
 }
 
-function drawStrokeAsPdfLines(page: ReturnType<PDFDocument["getPage"]>, stroke: InkStroke, width: number, height: number): void {
+function drawStrokeAsPdfLines(page: ReturnType<PDFDocument["getPage"]>, stroke: InkStroke, mapping: PageDisplayMapping): void {
   if (stroke.points.length < 2) {
     return;
   }
-  drawRoundedPdfStroke(page, stroke.points, stroke.color, stroke.opacity, stroke.width, stroke.pageCssWidth, width, height);
+  drawRoundedPdfStroke(page, stroke.points, stroke.color, stroke.opacity, stroke.width, stroke.pageCssWidth, mapping);
 }
 
 function drawRoundedPdfStroke(
@@ -11958,35 +12097,35 @@ function drawRoundedPdfStroke(
   opacity: number,
   sourceWidth: number,
   sourcePageWidth: number,
-  width: number,
-  height: number
+  mapping: PageDisplayMapping
 ): void {
   if (sourcePoints.length < 2) {
     return;
   }
   const color = hexToRgb(colorHex);
-  const thickness = Math.max(0.5, sourceWidth * (width / Math.max(1, sourcePageWidth)));
+  const thickness = Math.max(0.5, sourceWidth * (pageDisplayUserWidth(mapping) / Math.max(1, sourcePageWidth)));
   const points = smoothInkPointsForPdf(sourcePoints, 1600);
-  for (let i = 1; i < points.length; i += 1) {
-    const start = points[i - 1];
-    const end = points[i];
+  const userPoints = points.map((point) => displayPointToUserPoint(mapping, point.x, point.y));
+  for (let i = 1; i < userPoints.length; i += 1) {
+    const start = userPoints[i - 1];
+    const end = userPoints[i];
     page.drawLine({
       color: rgb(color.r, color.g, color.b),
-      end: { x: end.x * width, y: height - end.y * height },
+      end: { x: end.x, y: end.y },
       opacity,
-      start: { x: start.x * width, y: height - start.y * height },
+      start: { x: start.x, y: start.y },
       thickness
     });
   }
   // pdf-lib line joins are viewer-dependent. Circles at the sampled points make
   // both joins and endpoints round even in viewers that render each segment sharply.
-  for (const point of points) {
+  for (const point of userPoints) {
     page.drawCircle({
       color: rgb(color.r, color.g, color.b),
       opacity,
       size: thickness / 2,
-      x: point.x * width,
-      y: height - point.y * height
+      x: point.x,
+      y: point.y
     });
   }
 }
@@ -12002,17 +12141,18 @@ async function drawVisibleInkElementsOnPdf(pdf: PDFDocument, elements: InkElemen
     if (!page) {
       continue;
     }
-    const size = page.getSize();
+    const mapping = getPageDisplayMapping(page);
 
     if (element.kind === "cover") {
       const color = hexToRgb(element.color);
+      const rect = displayRectToUserRect(mapping, element.x, element.y, element.width, element.height);
       page.drawRectangle({
         color: rgb(color.r, color.g, color.b),
-        height: element.height * size.height,
+        height: rect.height,
         opacity: element.opacity,
-        width: element.width * size.width,
-        x: element.x * size.width,
-        y: size.height - (element.y + element.height) * size.height
+        width: rect.width,
+        x: rect.x,
+        y: rect.y
       });
       continue;
     }
@@ -12028,8 +12168,7 @@ async function drawVisibleInkElementsOnPdf(pdf: PDFDocument, elements: InkElemen
         element.opacity,
         element.width,
         element.pageCssWidth,
-        size.width,
-        size.height
+        mapping
       );
       continue;
     }
@@ -12039,18 +12178,19 @@ async function drawVisibleInkElementsOnPdf(pdf: PDFDocument, elements: InkElemen
       const embedded = element.dataUrl.startsWith("data:image/jpeg") || element.dataUrl.startsWith("data:image/jpg")
         ? await pdf.embedJpg(bytes)
         : await pdf.embedPng(bytes);
+      const rect = displayRectToUserRect(mapping, element.x, element.y, element.width, element.height);
       page.drawImage(embedded, {
-        height: element.height * size.height,
+        height: rect.height,
         opacity: element.opacity,
-        width: element.width * size.width,
-        x: element.x * size.width,
-        y: size.height - (element.y + element.height) * size.height
+        width: rect.width,
+        x: rect.x,
+        y: rect.y
       });
       continue;
     }
 
     if (element.presentation === "comment") {
-      addStandardTextCommentAnnotation(pdf, page, element, size.width, size.height);
+      addStandardTextCommentAnnotation(pdf, page, element, mapping);
       continue;
     }
 
@@ -12059,20 +12199,23 @@ async function drawVisibleInkElementsOnPdf(pdf: PDFDocument, elements: InkElemen
     }
 
     const color = hexToRgb(element.color);
-    const scale = size.width / Math.max(1, element.pageCssWidth);
+    const scale = pageDisplayUserWidth(mapping) / Math.max(1, element.pageCssWidth);
     const fontSize = Math.max(1, element.fontSize * scale);
-    const lineHeight = fontSize * 1.2;
-    let y = size.height - element.y * size.height - fontSize;
+    const fontSizeNorm = fontSize / Math.max(0.000001, pageDisplayUserHeight(mapping));
+    const lineHeightUser = fontSize * 1.2;
+    let lineV = element.y;
     for (const line of element.text.split(/\r?\n/)) {
+      const baseline = displayPointToUserPoint(mapping, element.x, lineV + fontSizeNorm);
       page.drawText(line || " ", {
         color: rgb(color.r, color.g, color.b),
         font,
         opacity: element.opacity,
+        rotate: degrees(mapping.rotation),
         size: fontSize,
-        x: element.x * size.width,
-        y
+        x: baseline.x,
+        y: baseline.y
       });
-      y -= lineHeight;
+      lineV += lineHeightUser / Math.max(0.000001, pageDisplayUserHeight(mapping));
     }
   }
 }
@@ -14386,8 +14529,7 @@ function renderNativeHtmlRuns(
 }
 
 async function buildPptxFromPageImages(pages: VisualConversionPage[], title: string): Promise<Uint8Array> {
-  const module = await import("pptxgenjs");
-  const PptxGenJS = module.default;
+  const PptxGenJS = getHeavyLibs().pptxgenjs;
   const pptx = new PptxGenJS();
   const first = pages[0];
   if (!first) {
@@ -14768,7 +14910,7 @@ async function injectOfficePreviewPages(
   pageWidthPt: number,
   pageHeightPt: number
 ): Promise<Uint8Array> {
-  const { default: JSZip } = await import("jszip");
+  const JSZip = getHeavyLibs().jszip;
   const zip = await JSZip.loadAsync(officeBytes);
   const sortedPages = [...pages].sort((a, b) => a.pageIndex - b.pageIndex);
   zip.file("mpe/preview/manifest.json", JSON.stringify({
@@ -15414,23 +15556,25 @@ function textBounds(text: InkText, cssWidth: number, cssHeight: number): { maxX:
   };
 }
 
-function strokeBoxContainsPoint(stroke: InkStroke, point: InkPoint, cssWidth: number, cssHeight: number): boolean {
+function strokeBoxContainsPoint(stroke: InkStroke, point: InkPoint, cssWidth: number, cssHeight: number, tolerancePx: number = HIT_TOLERANCE_LOOSE_PX): boolean {
   if (stroke.points.length === 0) {
     return false;
   }
   const displayWidth = strokeDisplayWidth(stroke, cssWidth);
-  const hitRadius = stroke.source === "external-ink"
-    ? Math.max(16, displayWidth * 3)
-    : Math.max(12, displayWidth * 2.4);
+  const tolerance = stroke.source === "external-ink" ? tolerancePx + 4 : tolerancePx;
+  // Keep the hit zone glued to the visible stroke: half the rendered width
+  // plus a small tolerance. Wide highlighter/watercolor strokes no longer
+  // reach far beyond what the user actually sees.
+  const hitRadius = displayWidth / 2 + tolerance;
   if (stroke.points.length === 1) {
-    return normalizedDistance(stroke.points[0], point, cssWidth, cssHeight) <= hitRadius;
+    return normalizedDistance(stroke.points[0], point, cssWidth, cssHeight) <= hitRadius + 2;
   }
   return strokeContainsPoint(stroke, point, cssWidth, cssHeight, hitRadius);
 }
 
-function textBoxContainsPoint(text: InkText, point: InkPoint, cssWidth: number, cssHeight: number): boolean {
+function textBoxContainsPoint(text: InkText, point: InkPoint, cssWidth: number, cssHeight: number, tolerancePx: number = HIT_TOLERANCE_LOOSE_PX): boolean {
   const box = textBounds(text, cssWidth, cssHeight);
-  const pad = Math.max(11, text.fontSize * 0.5);
+  const pad = tolerancePx + Math.max(2, text.fontSize * 0.35);
   const px = point.x * cssWidth;
   const py = point.y * cssHeight;
   return px >= box.minX - pad && px <= box.maxX + pad && py >= box.minY - pad && py <= box.maxY + pad;
@@ -15605,12 +15749,15 @@ function addStandardTextCommentAnnotation(
   pdf: PDFDocument,
   page: ReturnType<PDFDocument["getPage"]>,
   comment: InkText,
-  pageWidth: number,
-  pageHeight: number
+  mapping: PageDisplayMapping
 ): void {
-  const iconSize = Math.max(16, Math.min(28, comment.fontSize * 1.65)) * (pageWidth / Math.max(1, comment.pageCssWidth));
-  const x = comment.x * pageWidth;
-  const y = pageHeight - comment.y * pageHeight;
+  const iconSize = Math.max(16, Math.min(28, comment.fontSize * 1.65)) * (pageDisplayUserWidth(mapping) / Math.max(1, comment.pageCssWidth));
+  const anchor = displayPointToUserPoint(mapping, comment.x, comment.y);
+  const end = displayPointToUserPoint(mapping, comment.x + iconSize / Math.max(0.000001, pageDisplayUserWidth(mapping)), comment.y + iconSize / Math.max(0.000001, pageDisplayUserHeight(mapping)));
+  const rectLeft = Math.min(anchor.x, end.x);
+  const rectRight = Math.max(anchor.x, end.x);
+  const rectBottom = Math.min(anchor.y, end.y);
+  const rectTop = Math.max(anchor.y, end.y);
   const annotation = pdf.context.obj({
     C: pdf.context.obj([hexToRgb(comment.color).r, hexToRgb(comment.color).g, hexToRgb(comment.color).b]),
     Contents: PDFHexString.fromText(comment.text),
@@ -15619,7 +15766,7 @@ function addStandardTextCommentAnnotation(
     Name: PDFName.of("Comment"),
     NM: PDFHexString.fromText(`PdftionComment:${comment.id}`),
     Open: false,
-    Rect: pdf.context.obj([x, Math.max(0, y - iconSize), Math.min(pageWidth, x + iconSize), Math.min(pageHeight, y)]),
+    Rect: pdf.context.obj([rectLeft, rectBottom, rectRight, rectTop]),
     Subtype: PDFName.of("Text"),
     T: PDFHexString.fromText("Pdftion"),
     Type: PDFName.of("Annot")
@@ -15999,7 +16146,7 @@ function strokeContainsPoint(
   point: InkPoint,
   cssWidth: number,
   cssHeight: number,
-  eraserWidth = 10
+  hitRadius = 10
 ): boolean {
   if (stroke.points.length < 2) {
     return false;
@@ -16007,7 +16154,7 @@ function strokeContainsPoint(
 
   const px = point.x * cssWidth;
   const py = point.y * cssHeight;
-  const radius = Math.max(eraserWidth, strokeDisplayWidth(stroke, cssWidth) * 2.2);
+  const radius = Math.max(1, hitRadius);
   const box = strokeBounds(stroke, cssWidth, cssHeight);
   if (!box || px < box.minX - radius || px > box.maxX + radius || py < box.minY - radius || py > box.maxY + radius) {
     return false;

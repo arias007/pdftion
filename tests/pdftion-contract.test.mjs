@@ -248,10 +248,7 @@ test("document exports use native editable text, tables, links, and image-only v
   assert.match(source, /<span style=/);
   assert.doesNotMatch(source, /<svg class="text-layer"|lengthAdjust="spacingAndGlyphs"/);
   assert.match(source, /await buildDocxFromPageImages\(pages, this\.file\.basename\)/);
-  // DOCX/PPTX/JSZip now come from the lazily required pdftion-libs.cjs bundle.
-  assert.match(source, /= getHeavyLibs\(\)\.docx;/);
-  assert.match(source, /= getHeavyLibs\(\)\.jszip;/);
-  assert.match(source, /= getHeavyLibs\(\)\.pptxgenjs;/);
+  assert.match(source, /await import\("docx"\)/);
   assert.match(source, /new ImageRun\(\{/);
   assert.match(source, /new TextRun\(\{/);
   assert.match(source, /new Table\(\{/);

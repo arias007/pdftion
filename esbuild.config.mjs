@@ -79,30 +79,10 @@ const safeZipScheduler = {
   }
 };
 
-const heavyOutfile = "pdftion-libs.cjs";
-
-// Heavy export stack (DOCX / PPTX / JSZip / fontkit) ships as its own bundle
-// and is required lazily by main.js, so Obsidian startup does not pay its
-// parse + execute cost. The JSZip/DOCX scheduler sanitizer and the pptxgenjs
-// browser-runtime patch must run here because the sources live in this bundle.
-await esbuild.build({
-  bundle: true,
-  entryPoints: ["src/heavyEntry.ts"],
-  external: ["obsidian"],
-  format: "cjs",
-  logLevel: "info",
-  minify: prod,
-  outfile: heavyOutfile,
-  platform: "browser",
-  plugins: [pptxGenBrowserRuntime, safeZipScheduler],
-  target: "es2022",
-  treeShaking: true
-});
-
 await esbuild.build({
   bundle: true,
   entryPoints: ["src/main.ts"],
-  external: ["obsidian", "./pdftion-libs.cjs"],
+  external: ["obsidian"],
   format: "cjs",
   loader: {
     ".otf": "base64"
@@ -111,15 +91,14 @@ await esbuild.build({
   minify: prod,
   outfile: "main.js",
   platform: "browser",
-  plugins: [],
+  plugins: [pptxGenBrowserRuntime, safeZipScheduler],
   sourcemap: prod ? false : "inline",
   target: "es2022",
   treeShaking: true
 });
 
 if (prod) {
-  for (const outputPath of [heavyOutfile, "main.js"]) {
-    const output = await readFile(outputPath, "utf8");
-    await writeFile(outputPath, output.replace(/[ \t]+$/gmu, ""), "utf8");
-  }
+  const outputPath = "main.js";
+  const output = await readFile(outputPath, "utf8");
+  await writeFile(outputPath, output.replace(/[ \t]+$/gmu, ""), "utf8");
 }

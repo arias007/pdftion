@@ -23,7 +23,6 @@ import {
   stroke as strokePath
 } from "pdf-lib";
 import { getExtendedPdftionTranslation } from "./i18n";
-import { getHeavyLibs } from "./heavyLibs";
 
 // Mobile WebViews do not expose Obsidian desktop-only activeWindow globals.
 const activeWindow = window;
@@ -11582,7 +11581,7 @@ async function embedAnnotationFont(pdf: PDFDocument, fontBytes: Uint8Array) {
 
 function loadPdfFontkitModule(): Promise<PdfFontkitModule> {
   if (!pdfFontkitModulePromise) {
-    pdfFontkitModulePromise = Promise.resolve(getHeavyLibs().pdfFontkit as PdfFontkitModule);
+    pdfFontkitModulePromise = import("@pdf-lib/fontkit");
   }
   return pdfFontkitModulePromise;
 }
@@ -14529,7 +14528,8 @@ function renderNativeHtmlRuns(
 }
 
 async function buildPptxFromPageImages(pages: VisualConversionPage[], title: string): Promise<Uint8Array> {
-  const PptxGenJS = getHeavyLibs().pptxgenjs;
+  const module = await import("pptxgenjs");
+  const PptxGenJS = module.default;
   const pptx = new PptxGenJS();
   const first = pages[0];
   if (!first) {
@@ -14910,7 +14910,7 @@ async function injectOfficePreviewPages(
   pageWidthPt: number,
   pageHeightPt: number
 ): Promise<Uint8Array> {
-  const JSZip = getHeavyLibs().jszip;
+  const JSZip = (await import("jszip")).default;
   const zip = await JSZip.loadAsync(officeBytes);
   const sortedPages = [...pages].sort((a, b) => a.pageIndex - b.pageIndex);
   zip.file("mpe/preview/manifest.json", JSON.stringify({

@@ -1,5 +1,7 @@
 # Pdftion
 
+![Pdftion demo](assets/pdftion-demo.gif)
+
 Pdftion is a PDF annotation and editing plugin for note-focused PDF workflows. It adds editable ink, highlights, text overlays, cover blocks, image overlays, visual PDF/DOCX/PPTX/PNG/HTML export, NoteDraw-aware Markdown conversion, and an AI-friendly operation API to PDF views and embedded PDF previews.
 
 The plugin is designed for quick annotation inside a note vault: open a PDF, press the pen button in the PDF toolbar, write or edit on the page, and let Pdftion save editable annotation data automatically. When you need a portable file, use the share menu to export a burned-in PDF copy that matches the visible annotated view.

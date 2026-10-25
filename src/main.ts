@@ -1114,8 +1114,15 @@ interface NativePdfTextContentLike {
 }
 
 interface NativePdfAnnotationLike {
+  borderStyle?: { width?: number };
+  color?: ArrayLike<number> | null;
+  contents?: string;
   dest?: string | unknown[];
+  id?: string;
+  inkLists?: number[][];
+  opacity?: number;
   rect?: number[];
+  subtype?: string;
   unsafeUrl?: string;
   url?: string;
 }
@@ -1123,6 +1130,8 @@ interface NativePdfAnnotationLike {
 interface NativePdfPageLike {
   getAnnotations?: (options?: { intent?: string }) => Promise<NativePdfAnnotationLike[]>;
   getTextContent?: () => Promise<NativePdfTextContentLike>;
+  getViewport?: (options: { scale?: number; rotation?: number }) => NativePdfViewportLike;
+  rotate?: number;
   render?: (options: {
     canvas: HTMLCanvasElement;
     canvasContext: CanvasRenderingContext2D;
@@ -1157,8 +1166,13 @@ interface NativePdfViewerLike {
 
 interface NativePdfViewerAppLike {
   forceRendering?: () => void;
+  pdfDocument?: NativePdfDocumentProxyLike;
   pdfRenderingQueue?: NativePdfRenderingQueueLike;
   pdfViewer?: NativePdfViewerLike;
+}
+
+interface NativePdfDocumentProxyLike {
+  getPage?: (pageNumber: number) => Promise<NativePdfPageLike>;
 }
 
 interface InkPoint {
@@ -2272,18 +2286,90 @@ export default class PdftionPlugin extends Plugin {
   }
 
   private pdfInkPageIndexCache = new Map<string, { mtime: number; pageIndexes: Set<number>; size: number }>();
+  private pdfInkPageIndexStore: Record<string, { mtime: number; pages: number[]; size: number }> | null = null;
+
+  private getPdfInkPageIndexStorePath(): string {
+    return `${this.manifest.dir}/data/ink-page-index.json`;
+  }
+
+  private async loadPdfInkPageIndexStore(): Promise<Record<string, { mtime: number; pages: number[]; size: number }>> {
+    if (this.pdfInkPageIndexStore) {
+      return this.pdfInkPageIndexStore;
+    }
+    this.pdfInkPageIndexStore = {};
+    try {
+      const parsed = JSON.parse(await this.app.vault.adapter.read(this.getPdfInkPageIndexStorePath())) as unknown;
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        this.pdfInkPageIndexStore = parsed as Record<string, { mtime: number; pages: number[]; size: number }>;
+      }
+    } catch {
+      // No cached index yet.
+    }
+    return this.pdfInkPageIndexStore;
+  }
+
+  private async savePdfInkPageIndexStore(): Promise<void> {
+    const store = this.pdfInkPageIndexStore;
+    if (!store) {
+      return;
+    }
+    const entries = Object.entries(store);
+    if (entries.length > 400) {
+      this.pdfInkPageIndexStore = Object.fromEntries(entries.slice(entries.length - 400));
+    }
+    try {
+      await this.ensureAdapterFolder(`${this.manifest.dir}/data`);
+      await this.app.vault.adapter.write(this.getPdfInkPageIndexStorePath(), JSON.stringify(this.pdfInkPageIndexStore));
+    } catch (error) {
+      console.debug("pdftion could not persist the PDF ink page index.", error);
+    }
+  }
+
+  invalidatePdfInkPageIndex(file?: TFile): void {
+    if (!file) {
+      this.pdfInkPageIndexCache.clear();
+      if (this.pdfInkPageIndexStore) {
+        this.pdfInkPageIndexStore = {};
+      }
+      return;
+    }
+    this.pdfInkPageIndexCache.delete(file.path);
+    if (this.pdfInkPageIndexStore) {
+      delete this.pdfInkPageIndexStore[file.path];
+    }
+  }
 
   async getPdfInkPageIndexes(file: TFile): Promise<Set<number>> {
-    // Parsing the whole PDF just to learn which pages contain ink annotations
-    // is expensive on large documents; cache by path + mtime + size.
+    // Parsing a whole PDF just to learn which pages contain ink annotations is
+    // expensive on large documents (seconds for a 50 MB scan), so keep the
+    // answer in memory and on disk, and rule ink out from the raw bytes first.
     const stat = file.stat;
     const cached = this.pdfInkPageIndexCache.get(file.path);
     if (cached && cached.mtime === stat.mtime && cached.size === stat.size) {
       return cached.pageIndexes;
     }
-    const strokes = await this.loadPdfInkAnnotations(file);
-    const pageIndexes = new Set(strokes.map((stroke) => stroke.pageIndex));
+    const store = await this.loadPdfInkPageIndexStore();
+    const stored = store[file.path];
+    if (stored && stored.mtime === stat.mtime && stored.size === stat.size && Array.isArray(stored.pages)) {
+      const restored = new Set(stored.pages.filter((pageIndex) => Number.isInteger(pageIndex) && pageIndex >= 0));
+      this.pdfInkPageIndexCache.set(file.path, { mtime: stat.mtime, pageIndexes: restored, size: stat.size });
+      return restored;
+    }
+    let pageIndexes = new Set<number>();
+    try {
+      const bytes = await this.app.vault.readBinary(file);
+      if (bytesMayContainInkAnnotations(bytes)) {
+        const pdf = await PDFDocument.load(bytes, { ignoreEncryption: true, updateMetadata: false });
+        this.pdfReadCache = { bytes, mtime: stat.mtime, path: file.path, pdf, size: stat.size };
+        pageIndexes = new Set(extractPdfInkAnnotations(pdf).map((stroke) => stroke.pageIndex));
+      }
+    } catch (error) {
+      console.warn("pdftion could not index the PDF ink annotations; leaving them for the viewer-based import.", error);
+      return pageIndexes;
+    }
     this.pdfInkPageIndexCache.set(file.path, { mtime: stat.mtime, pageIndexes, size: stat.size });
+    store[file.path] = { mtime: stat.mtime, pages: Array.from(pageIndexes).sort((a, b) => a - b), size: stat.size };
+    await this.savePdfInkPageIndexStore();
     return pageIndexes;
   }
 
@@ -2530,9 +2616,9 @@ export default class PdftionPlugin extends Plugin {
     return visiblePdf ?? visibleOther ?? matchedPdf ?? matchedOther;
   }
 
-  async beginInkEditTransaction(file: TFile, pageIndexes: Set<number>): Promise<boolean> {
-    // The transaction rewrites the file; force a fresh parse for the mutation.
-    this.invalidatePdfReadCache(file);
+    async beginInkEditTransaction(file: TFile, pageIndexes: Set<number>): Promise<boolean> {
+    // Reuse the already parsed document: a fresh pdf-lib parse of a 50 MB file
+    // costs seconds and this runs right after the ink pages were indexed.
     const normalizedPages = Array.from(pageIndexes)
       .filter((pageIndex) => Number.isInteger(pageIndex) && pageIndex >= 0)
       .sort((a, b) => a - b);
@@ -2548,8 +2634,7 @@ export default class PdftionPlugin extends Plugin {
       if (additionalPages.length === 0) {
         return false;
       }
-      const currentBytes = await this.app.vault.readBinary(file);
-      const pdf = await PDFDocument.load(currentBytes, { ignoreEncryption: true, updateMetadata: false });
+      const { pdf } = await this.getPdfReadCache(file);
       const validAdditionalPages = additionalPages.filter((pageIndex) => pageIndex < pdf.getPageCount());
       if (validAdditionalPages.length === 0) {
         return false;
@@ -2564,6 +2649,7 @@ export default class PdftionPlugin extends Plugin {
         const saved = await pdf.save({ addDefaultPage: false, useObjectStreams: false });
         const detachedBytes = new ArrayBuffer(saved.byteLength);
         new Uint8Array(detachedBytes).set(saved);
+        this.invalidatePdfReadCache(file);
         await this.app.vault.modifyBinary(file, detachedBytes);
         return true;
       } catch (error) {
@@ -2576,8 +2662,7 @@ export default class PdftionPlugin extends Plugin {
     const safeKey = safeAnnotationKey(file.path);
     const backupPdfPath = `${dir}/${safeKey}.pdf`;
     const transactionPath = `${dir}/${safeKey}.json`;
-    const currentBytes = await this.app.vault.readBinary(file);
-    const pdf = await PDFDocument.load(currentBytes, { ignoreEncryption: true, updateMetadata: false });
+    const { bytes: currentBytes, pdf } = await this.getPdfReadCache(file);
     const transactionPages = normalizedPages.filter((pageIndex) => pageIndex < pdf.getPageCount());
     if (transactionPages.length === 0) {
       return false;
@@ -2610,6 +2695,7 @@ export default class PdftionPlugin extends Plugin {
       const saved = await pdf.save({ addDefaultPage: false, useObjectStreams: false });
       const detachedBytes = new ArrayBuffer(saved.byteLength);
       new Uint8Array(detachedBytes).set(saved);
+      this.invalidatePdfReadCache(file);
       await this.app.vault.modifyBinary(file, detachedBytes);
       return true;
     } catch (error) {
@@ -3416,6 +3502,12 @@ class InkSession {
   private exportRenderFallbackPages = new Set<number>();
   private preparingPdfInkForEditing = false;
   private pdfInkPreparationComplete = false;
+  // Pages already probed for native ink. Kept so scrolling re-checks only the
+  // pages that just came into view instead of rescanning the whole document.
+  private inkCheckedPages = new Set<number>();
+  // Pages where the viewer does not expose annotation DOM, so the only way to
+  // suppress the native ink is the file-level detach rewrite.
+  private viewerAnnotationDomMissingPages = new Set<number>();
   // Pages whose detach rewrite is still awaiting the native view reload: the
   // native PDF still paints the ink here, so the overlay must NOT draw its
   // imported copy yet, otherwise both layers show at once.
@@ -3689,6 +3781,8 @@ class InkSession {
     this.coverHistory = [];
     this.imageHistory = [];
     this.nativeInkScannedPages.clear();
+    this.inkCheckedPages.clear();
+    this.viewerAnnotationDomMissingPages.clear();
     this.clearLayerLongPress();
     this.layerMenu?.remove();
     this.layerMenu = null;
@@ -3739,9 +3833,10 @@ class InkSession {
       return;
     }
     const pdfInkStrokes: InkStroke[] = [];
+    const stateElements = (state?.elements ?? []).filter((element) => !isStaleImportedNativeInk(element));
     const loadedElements: InkElement[] = [
-      ...(state?.elements ?? []),
-      ...pdfInkStrokes.filter((stroke) => !(state?.elements ?? []).some((element) => (
+      ...stateElements,
+      ...pdfInkStrokes.filter((stroke) => !stateElements.some((element) => (
         element.id === stroke.id ||
         (element.kind === "stroke" && isSamePdfInkStrokeCandidate(element, stroke))
       )))
@@ -4548,9 +4643,6 @@ class InkSession {
         this.pendingEditableInkPrepareAfterSave = true;
         return;
       }
-      if (this.pdfInkPreparationComplete) {
-        return;
-      }
       if (this.detachedInkEditPages.size > 0) {
         for (const pageIndex of this.detachedInkEditPages) {
           this.pendingNativeInkHidePages.add(pageIndex);
@@ -4559,12 +4651,26 @@ class InkSession {
         this.updateExternalInkLayerState();
         return;
       }
-      const pageIndexes = await this.plugin.getPdfInkPageIndexes(this.file);
+      const candidatePages = this.getInkPrepareCandidatePages(force);
+      const pageIndexes = new Set<number>();
+      for (const pageIndex of candidatePages) {
+        if (!this.inkCheckedPages.has(pageIndex)) {
+          pageIndexes.add(pageIndex);
+        }
+      }
+      // Steady state while scrolling inside already prepared pages.
       if (pageIndexes.size === 0) {
         this.pdfInkPreparationComplete = true;
         return;
       }
+      if (this.preparingPdfInkForEditing) {
+        // A batch is already running; retry shortly so pages that scrolled into
+        // view meanwhile are not skipped.
+        this.scheduleEditableInkPrepare(320, force);
+        return;
+      }
       await this.preparePdfInkOverlayForEditing(pageIndexes);
+      this.pdfInkPreparationComplete = true;
     } catch (error) {
       console.warn("pdftion could not prepare PDF ink for editable mode.", error);
     }
@@ -4621,78 +4727,70 @@ class InkSession {
     return pages;
   }
 
-  // True when the platform renders native ink as DOM annotation elements that
-  // the existing CSS hiding can actually cover. Only then can editing skip
-  // the file-level detach + view reload entirely.
-  private canHideNativeInkOnPage(overlay: PageOverlay): boolean {
-    const targets = this.strokeHistory.filter((stroke) => (
-      stroke.pageIndex === overlay.pageIndex &&
-      Array.isArray(stroke.pdfPoints)
-    ));
-    if (targets.length === 0) {
-      return false;
-    }
-    const canvasRect = overlay.canvas.getBoundingClientRect();
-    const targetRects = targets
-      .map((stroke) => normalizedStrokeBounds({ ...stroke, points: stroke.pdfPoints ?? stroke.points }))
-      .filter((bounds): bounds is NormalizedBounds => bounds !== null)
-      .map((bounds) => ({
-        bottom: canvasRect.top + bounds.maxY * canvasRect.height + 24,
-        left: canvasRect.left + bounds.minX * canvasRect.width - 24,
-        right: canvasRect.left + bounds.maxX * canvasRect.width + 24,
-        top: canvasRect.top + bounds.minY * canvasRect.height - 24
-      }));
-    if (targetRects.length === 0) {
-      return false;
-    }
-    for (const candidate of this.collectNativeAnnotationElements(overlay.pageEl, true)) {
-      const rect = candidate.getBoundingClientRect();
-      if (rect.width > 0 && rect.height > 0 && targetRects.some((target) => rectsOverlap(target, rect))) {
-        return true;
+  private getOverlayForPage(pageIndex: number): PageOverlay | null {
+    for (const overlay of this.overlays.values()) {
+      if (overlay.pageIndex === pageIndex) {
+        return overlay;
       }
     }
+    return null;
+  }
+
+  // Only the pages currently in (or near) the viewport are prepared. Importing
+  // ink for a whole 300-page document before the first stroke could be drawn
+  // was the main reason entering edit mode felt slow on large PDFs.
+  private getInkPrepareCandidatePages(force = false): Set<number> {
+    const pages = new Set<number>();
+    const viewportHeight = activeWindow.innerHeight || activeDocument.documentElement.clientHeight || 1;
+    const margin = force ? 480 : 200;
+    const candidates: Array<{ overlay: PageOverlay; visibleHeight: number }> = [];
+    for (const overlay of this.overlays.values()) {
+      const rect = overlay.pageEl.getBoundingClientRect();
+      if (rect.bottom >= -margin && rect.top <= viewportHeight + margin) {
+        candidates.push({
+          overlay,
+          visibleHeight: Math.max(0, Math.min(rect.bottom, viewportHeight) - Math.max(rect.top, 0))
+        });
+      }
+    }
+    candidates.sort((a, b) => (
+      b.visibleHeight - a.visibleHeight || a.overlay.pageIndex - b.overlay.pageIndex
+    ));
+    for (const item of candidates.slice(0, 4)) {
+      pages.add(item.overlay.pageIndex);
+    }
+    if (pages.size === 0) {
+      const overlay = this.getVisibleOverlay() ?? Array.from(this.overlays.values()).sort((a, b) => a.pageIndex - b.pageIndex)[0];
+      if (overlay) {
+        pages.add(overlay.pageIndex);
+      }
+    }
+    return pages;
+  }
+
+  private async pageExposesAnnotationDom(overlay: PageOverlay): Promise<boolean> {
+    if (this.viewerAnnotationDomMissingPages.has(overlay.pageIndex)) {
+      return false;
+    }
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      if (overlay.pageEl.querySelector(
+        ".annotationLayer > *, .annotationEditorLayer > *, [data-annotation-id], [data-pdf-annotation-id]"
+      )) {
+        return true;
+      }
+      if (attempt < 3) {
+        await sleepMs(90);
+      }
+    }
+    this.viewerAnnotationDomMissingPages.add(overlay.pageIndex);
     return false;
   }
 
-  private async preparePdfInkOverlayForEditing(pageIndexes: Set<number>): Promise<void> {
-    if (pageIndexes.size === 0 || this.preparingPdfInkForEditing) {
-      return;
+  private async detachNativeInkPages(pageIndexes: Set<number>): Promise<void> {
+    for (const pageIndex of pageIndexes) {
+      this.inkDetachReloadPendingPages.add(pageIndex);
     }
-
-    this.preparingPdfInkForEditing = true;
     try {
-      for (const pageIndex of pageIndexes) {
-        this.pendingNativeInkHidePages.add(pageIndex);
-        // The native view still paints the original ink until the detach
-        // rewrite is reloaded; suppress the overlay copy in the meantime.
-        this.inkDetachReloadPendingPages.add(pageIndex);
-      }
-      this.updateExternalInkLayerState();
-      await this.importPdfInkForPages(pageIndexes);
-      // Fast path: when the native ink is rendered as DOM annotation elements,
-      // the existing CSS hiding already guarantees a single visible layer, so
-      // rewriting the PDF file and reloading the view is unnecessary. Skipping
-      // both removes the slow conversion window and the double-layer risk.
-      const relevantOverlays = Array.from(this.overlays.values())
-        .filter((overlay) => pageIndexes.has(overlay.pageIndex));
-      const cssHidingCapable = relevantOverlays.length > 0 && relevantOverlays.every((overlay) => (
-        this.canHideNativeInkOnPage(overlay)
-      ));
-      if (cssHidingCapable) {
-        for (const pageIndex of pageIndexes) {
-          this.inkDetachReloadPendingPages.delete(pageIndex);
-          const hasNativeInk = this.strokeHistory.some((stroke) => (
-            stroke.pageIndex === pageIndex && Array.isArray(stroke.pdfPoints)
-          ));
-          if (!hasNativeInk) {
-            this.pendingNativeInkHidePages.delete(pageIndex);
-          }
-        }
-        this.updateExternalInkLayerState();
-        this.redrawAll();
-        this.pdfInkPreparationComplete = true;
-        return;
-      }
       const detachedNow = await this.plugin.beginInkEditTransaction(this.file, pageIndexes);
       for (const pageIndex of pageIndexes) {
         this.detachedInkEditPages.add(pageIndex);
@@ -4700,8 +4798,11 @@ class InkSession {
       if (detachedNow) {
         await this.reloadNativePdfView();
       }
-      // The reloaded view no longer contains the native ink, so the overlay
-      // copy becomes the only visible layer from here on.
+    } catch (error) {
+      console.warn("pdftion could not detach the native PDF ink for editing.", error);
+    } finally {
+      // The reloaded view no longer contains the native ink, so the overlay copy
+      // becomes the only visible layer from here on.
       for (const pageIndex of pageIndexes) {
         const hasNativeInk = this.strokeHistory.some((stroke) => (
           stroke.pageIndex === pageIndex && Array.isArray(stroke.pdfPoints)
@@ -4713,7 +4814,46 @@ class InkSession {
       }
       this.updateExternalInkLayerState();
       this.redrawAll();
-      this.pdfInkPreparationComplete = true;
+    }
+  }
+
+  private async preparePdfInkOverlayForEditing(pageIndexes: Set<number>): Promise<void> {
+    if (pageIndexes.size === 0 || this.preparingPdfInkForEditing) {
+      return;
+    }
+
+    this.preparingPdfInkForEditing = true;
+    try {
+      for (const pageIndex of pageIndexes) {
+        this.inkCheckedPages.add(pageIndex);
+        this.pendingNativeInkHidePages.add(pageIndex);
+      }
+      this.updateExternalInkLayerState();
+      await this.importPdfInkForPages(pageIndexes);
+
+      const detachPages = new Set<number>();
+      for (const pageIndex of pageIndexes) {
+        const hasNativeInk = this.strokeHistory.some((stroke) => (
+          stroke.pageIndex === pageIndex && Array.isArray(stroke.pdfPoints)
+        ));
+        if (!hasNativeInk) {
+          this.pendingNativeInkHidePages.delete(pageIndex);
+          continue;
+        }
+        if (this.detachedInkEditPages.has(pageIndex)) {
+          continue;
+        }
+        const overlay = this.getOverlayForPage(pageIndex);
+        const hideWithCss = overlay ? await this.pageExposesAnnotationDom(overlay) : false;
+        if (!hideWithCss) {
+          detachPages.add(pageIndex);
+        }
+      }
+      this.updateExternalInkLayerState();
+      this.redrawAll();
+      if (detachPages.size > 0) {
+        await this.detachNativeInkPages(detachPages);
+      }
     } catch (error) {
       console.warn("pdftion could not prepare PDF ink annotations for editing.", error);
       for (const pageIndex of pageIndexes) {
@@ -4832,6 +4972,8 @@ class InkSession {
     this.loadedAnnotationState = false;
     this.annotationLoadToken += 1;
     this.annotationLoadPromise = null;
+    this.inkCheckedPages.clear();
+    this.viewerAnnotationDomMissingPages.clear();
     await this.loadEditableAnnotations();
     await this.reloadNativePdfView();
     await sleepMs(320);
@@ -4860,6 +5002,66 @@ class InkSession {
     window.setTimeout(() => this.updateExternalInkLayerState(), 420);
   }
 
+  private getNativePdfDocumentProxy(): NativePdfDocumentProxyLike | null {
+    const view = this.leaf.view as unknown as {
+      viewer?: { child?: { pdfDocument?: NativePdfDocumentProxyLike } };
+    };
+    return view.viewer?.child?.pdfDocument ?? this.getNativePdfViewerApp()?.pdfDocument ?? null;
+  }
+
+  // Preferred ink source: the viewer already parsed the document, so asking it
+  // for annotations costs milliseconds instead of a fresh multi-second pdf-lib
+  // parse, and it survives PDFs that pdf-lib refuses to load.
+  private async readInkStrokesFromNativeViewer(pageIndexes: Set<number> | undefined): Promise<InkStroke[] | null> {
+    const viewer = this.getNativePdfViewerApp()?.pdfViewer ?? null;
+    const documentProxy = this.getNativePdfDocumentProxy();
+    if (!viewer && !documentProxy) {
+      return null;
+    }
+    const targets = pageIndexes
+      ? Array.from(pageIndexes).sort((a, b) => a - b)
+      : Array.from(this.overlays.values()).map((overlay) => overlay.pageIndex).sort((a, b) => a - b);
+    if (targets.length === 0) {
+      return null;
+    }
+    let resolvedPages = 0;
+    const strokes: InkStroke[] = [];
+    for (const pageIndex of targets) {
+      const pageView = viewer?.getPageView?.(pageIndex) ?? viewer?._pages?.[pageIndex] ?? null;
+      let page = pageView?.pdfPage ?? null;
+      if (!page && documentProxy?.getPage) {
+        try {
+          page = await documentProxy.getPage(pageIndex + 1);
+        } catch {
+          page = null;
+        }
+      }
+      if (!page?.getAnnotations) {
+        continue;
+      }
+      const viewport = pageView?.viewport ?? (page.getViewport ? page.getViewport({ scale: 1 }) : null);
+      let annotations: NativePdfAnnotationLike[];
+      try {
+        annotations = await page.getAnnotations({ intent: "display" });
+      } catch {
+        continue;
+      }
+      resolvedPages += 1;
+      for (const annotation of annotations) {
+        strokes.push(...pdfJsInkAnnotationToStrokes(annotation, pageIndex, viewport));
+      }
+    }
+    return resolvedPages === 0 ? null : strokes;
+  }
+
+  private async loadNativeInkStrokesForPages(pageIndexes: Set<number> | undefined): Promise<InkStroke[]> {
+    const fromViewer = await this.readInkStrokesFromNativeViewer(pageIndexes);
+    if (fromViewer !== null) {
+      return fromViewer;
+    }
+    return this.plugin.loadPdfInkAnnotations(this.file, pageIndexes);
+  }
+
   private async importPdfInkForPages(pageIndexes?: Set<number>): Promise<boolean> {
     if (pageIndexes?.size === 0) {
       return false;
@@ -4871,7 +5073,7 @@ class InkSession {
       return false;
     }
     const targetPath = this.file.path;
-    const pdfInkStrokes = await this.plugin.loadPdfInkAnnotations(this.file, pagesToScan);
+    const pdfInkStrokes = await this.loadNativeInkStrokesForPages(pagesToScan);
     if (this.file.path !== targetPath) {
       return false;
     }
@@ -8856,16 +9058,16 @@ class InkSession {
     }
 
     if (showEditableSelectionControls && this.selectionDrag?.mode === "marquee" && this.selectionDrag.pageIndex === overlay.pageIndex) {
-      drawMarqueeBox(ctx, this.selectionDrag.start, this.selectionDrag.current, overlay.cssWidth, overlay.cssHeight);
+      drawMarqueeBox(ctx, this.selectionDrag.start, this.selectionDrag.current, overlay.cssWidth, overlay.cssHeight, overlay.dpr);
     }
 
     const selected = orderedElements.filter((element) => this.selectedStrokeIds.has(element.id));
     if (showEditableSelectionControls && selected.length > 0) {
-      drawSelectionGroup(ctx, selected, overlay.cssWidth, overlay.cssHeight);
+      drawSelectionGroup(ctx, selected, overlay.cssWidth, overlay.cssHeight, overlay.dpr);
     }
 
     if (showEditableSelectionControls && this.nativeSelection?.pageIndex === overlay.pageIndex) {
-      drawNativeSelection(ctx, this.nativeSelection, overlay.cssWidth, overlay.cssHeight);
+      drawNativeSelection(ctx, this.nativeSelection, overlay.cssWidth, overlay.cssHeight, overlay.dpr);
     }
 
     if (this.cropPreview?.pageIndexes.has(overlay.pageIndex)) {
@@ -10684,7 +10886,7 @@ class InkSession {
       return null;
     }
 
-    return findResizeHandleAt(bounds, point, overlay.cssWidth, overlay.cssHeight, 8, 0);
+    return findResizeHandleAt(bounds, point, overlay.cssWidth, overlay.cssHeight, 12, 0);
   }
 
   private resizeSelectedElements(drag: SelectionDragState, point: InkPoint): void {
@@ -11806,6 +12008,52 @@ function displayRectToUserRect(
   };
 }
 
+// Native ink that was only imported for editing is re-read from the PDF page by
+// page. Persisting those copies doubled the annotation state and could paint a
+// stale duplicate once a page had not been re-imported yet.
+function isStaleImportedNativeInk(element: InkElement): boolean {
+  return (
+    element.kind === "stroke" &&
+    element.source === "external-ink" &&
+    Array.isArray(element.pdfPoints) &&
+    element.pdfSaved === true &&
+    element.externalDirty !== true
+  );
+}
+
+const PDF_INK_TOKEN = [0x2f, 0x49, 0x6e, 0x6b]; // "/Ink"
+const PDF_OBJSTM_TOKEN = [0x2f, 0x4f, 0x62, 0x6a, 0x53, 0x74, 0x6d]; // "/ObjStm"
+
+function bufferContainsAsciiToken(bytes: Uint8Array, token: number[]): boolean {
+  const first = token[0];
+  const limit = bytes.length - token.length;
+  for (let index = 0; index <= limit; index += 1) {
+    if (bytes[index] !== first) {
+      continue;
+    }
+    let matched = true;
+    for (let offset = 1; offset < token.length; offset += 1) {
+      if (bytes[index + offset] !== token[offset]) {
+        matched = false;
+        break;
+      }
+    }
+    if (matched) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function bytesMayContainInkAnnotations(buffer: ArrayBuffer): boolean {
+  // Annotation dictionaries live either in plain object text or inside
+  // compressed object streams. A byte-level scan takes single-digit
+  // milliseconds on a 50 MB file (decoding it to a string took over a second)
+  // and lets us skip a multi-second pdf-lib parse for files with no ink.
+  const bytes = new Uint8Array(buffer);
+  return bufferContainsAsciiToken(bytes, PDF_INK_TOKEN) || bufferContainsAsciiToken(bytes, PDF_OBJSTM_TOKEN);
+}
+
 function extractPdfInkAnnotations(pdf: PDFDocument, pageIndexes?: Set<number>): InkStroke[] {
   const strokes: InkStroke[] = [];
   const pages = pdf.getPages();
@@ -11824,36 +12072,125 @@ function extractPdfInkAnnotations(pdf: PDFDocument, pageIndexes?: Set<number>): 
       if (!annot) {
         continue;
       }
-      const stroke = externalInkAnnotationToStroke(annot, pageIndex, annotIndex, mapping);
-      if (stroke) {
-        strokes.push(stroke);
+      const stroke = externalInkAnnotationToStrokes(annot, pageIndex, annotIndex, mapping);
+      if (stroke.length > 0) {
+        strokes.push(...stroke);
       }
     }
   }
   return strokes;
 }
 
-function externalInkAnnotationToStroke(
+// Convert a pdf.js ink annotation into editable strokes. pdf.js reports ink
+// paths in default user space, so the page viewport transform (which already
+// carries crop box offset and /Rotate) is the exact mapping the viewer used.
+function pdfJsInkAnnotationToStrokes(
+  annot: NativePdfAnnotationLike,
+  pageIndex: number,
+  viewport: NativePdfViewportLike | null
+): InkStroke[] {
+  if (annot.subtype !== "Ink") {
+    return [];
+  }
+  const transform = viewport?.transform;
+  const viewWidth = viewport?.width ?? 0;
+  const viewHeight = viewport?.height ?? 0;
+  if (!Array.isArray(transform) || transform.length < 6 || viewWidth <= 0 || viewHeight <= 0) {
+    return [];
+  }
+  const lists = Array.isArray(annot.inkLists) ? annot.inkLists : [];
+  if (lists.length === 0) {
+    return [];
+  }
+  const scale = typeof viewport?.scale === "number" && viewport.scale > 0 ? viewport.scale : 1;
+  const [a, b, c, d, e, f] = transform;
+  const toPoint = (x: number, y: number): InkPoint => ({
+    x: clamp((a * x + c * y + e) / viewWidth, 0, 1),
+    y: clamp((b * x + d * y + f) / viewHeight, 0, 1)
+  });
+
+  const paths: InkPoint[][] = [];
+  for (const path of lists) {
+    if (!Array.isArray(path)) {
+      continue;
+    }
+    const points: InkPoint[] = [];
+    for (let index = 0; index + 1 < path.length; index += 2) {
+      const x = Number(path[index]);
+      const y = Number(path[index + 1]);
+      if (!Number.isFinite(x) || !Number.isFinite(y)) {
+        continue;
+      }
+      points.push(toPoint(x, y));
+    }
+    if (points.length === 1) {
+      points.push({ ...points[0] });
+    }
+    if (points.length >= 2) {
+      paths.push(points);
+    }
+  }
+  if (paths.length === 0) {
+    return [];
+  }
+
+  const colorData = annot.color;
+  const color = colorData && colorData.length >= 3
+    ? rgbToHex(Number(colorData[0]) || 0, Number(colorData[1]) || 0, Number(colorData[2]) || 0)
+    : "#000000";
+  const opacity = clamp(typeof annot.opacity === "number" ? annot.opacity : 1, 0.01, 1);
+  const width = clamp(typeof annot.borderStyle?.width === "number" ? annot.borderStyle.width : 2, 0.5, 96);
+  const contents = typeof annot.contents === "string" ? annot.contents : "";
+  const pdftionId = contents.match(/^Pdftion\s+(.+)$/)?.[1]?.trim() || undefined;
+  const annotationKey = typeof annot.id === "string" && annot.id.length > 0
+    ? annot.id
+    : `rect-${Math.round((annot.rect?.[0] ?? 0) * 100)}-${Math.round((annot.rect?.[1] ?? 0) * 100)}`;
+  const baseId = pdftionId ?? `external-ink-${pageIndex}-${safeAnnotationKey(annotationKey)}`;
+  const multiplePaths = paths.length > 1;
+
+  return paths.map((points, pathIndex) => {
+    const simplifiedPoints = simplifyInkPoints(points, 900);
+    return {
+      color,
+      id: `${baseId}${multiplePaths ? `:p${pathIndex}` : ""}`,
+      kind: "stroke" as const,
+      opacity,
+      pageCssHeight: viewHeight / scale,
+      pageCssWidth: viewWidth / scale,
+      pageIndex,
+      pdfPoints: simplifiedPoints.map((point) => ({ ...point })),
+      pdfSaved: true,
+      points: simplifiedPoints,
+      saved: true,
+      source: (pdftionId ? "pdftion" : "external-ink") as InkStroke["source"],
+      tool: "pen" as const,
+      width
+    };
+  });
+}
+
+function externalInkAnnotationToStrokes(
   annot: PDFDict,
   pageIndex: number,
   annotIndex: number,
   mapping: PageDisplayMapping
-): InkStroke | null {
+): InkStroke[] {
   const subtype = annot.lookupMaybe(PDFName.of("Subtype"), PDFName);
   if (subtype?.decodeText() !== "Ink") {
-    return null;
+    return [];
   }
   const inkList = annot.lookupMaybe(PDFName.of("InkList"), PDFArray);
   if (!inkList || inkList.size() === 0) {
-    return null;
+    return [];
   }
 
-  const points: InkPoint[] = [];
+  const paths: InkPoint[][] = [];
   for (let pathIndex = 0; pathIndex < inkList.size(); pathIndex += 1) {
     const path = inkList.lookupMaybe(pathIndex, PDFArray);
     if (!path) {
       continue;
     }
+    const points: InkPoint[] = [];
     for (let pointIndex = 0; pointIndex + 1 < path.size(); pointIndex += 2) {
       const x = path.lookupMaybe(pointIndex, PDFNumber)?.asNumber();
       const y = path.lookupMaybe(pointIndex + 1, PDFNumber)?.asNumber();
@@ -11862,35 +12199,60 @@ function externalInkAnnotationToStroke(
       }
       points.push(userPointToDisplayPoint(mapping, x, y));
     }
+    if (points.length === 0) {
+      continue;
+    }
+    // A single tap is still a visible dot; duplicating the point keeps it
+    // drawable instead of silently dropping the stroke.
+    paths.push(points.length === 1 ? [points[0], { ...points[0] }] : points);
   }
-  if (points.length < 2) {
-    return null;
+  if (paths.length === 0) {
+    return [];
   }
 
   const color = readPdfColor(annot.lookupMaybe(PDFName.of("C"), PDFArray));
   const opacity = annot.lookupMaybe(PDFName.of("CA"), PDFNumber)?.asNumber() ?? 1;
-  const border = annot.lookupMaybe(PDFName.of("Border"), PDFArray);
-  const borderWidth = border?.lookupMaybe(2, PDFNumber)?.asNumber() ?? 2;
+  const width = resolveInkBorderWidth(annot);
   const pdftionId = pdftionInkStrokeId(annot);
   const groupId = decodePdfText(annot.lookupMaybe(PDFName.of("PdftionGroup"), PDFString, PDFHexString)).trim() || undefined;
-  const simplifiedPoints = simplifyInkPoints(points, 900);
-  return {
-    color,
-    groupId,
-    id: pdftionId ?? externalInkStrokeId(pageIndex, annotIndex, annot),
-    kind: "stroke",
-    opacity: clamp(opacity, 0.01, 1),
-    pageCssHeight: pageDisplayUserHeight(mapping),
-    pageCssWidth: pageDisplayUserWidth(mapping),
-    pageIndex,
-    pdfPoints: simplifiedPoints.map((point) => ({ ...point })),
-    pdfSaved: true,
-    points: simplifiedPoints,
-    saved: true,
-    source: pdftionId ? "pdftion" : "external-ink",
-    tool: "pen",
-    width: clamp(borderWidth, 0.5, 96)
-  };
+  const fallbackId = externalInkStrokeId(pageIndex, annotIndex, annot);
+  // Every InkList entry is its own polyline. Merging them into one stroke drew
+  // a straight jump across the page wherever the pen was lifted.
+  const multiplePaths = paths.length > 1;
+  return paths.map((points, pathIndex) => {
+    const simplifiedPoints = simplifyInkPoints(points, 900);
+    return {
+      color,
+      groupId,
+      id: `${pdftionId ?? fallbackId}${multiplePaths ? `:p${pathIndex}` : ""}`,
+      kind: "stroke" as const,
+      opacity: clamp(opacity, 0.01, 1),
+      pageCssHeight: pageDisplayUserHeight(mapping),
+      pageCssWidth: pageDisplayUserWidth(mapping),
+      pageIndex,
+      pdfPoints: simplifiedPoints.map((point) => ({ ...point })),
+      pdfSaved: true,
+      points: simplifiedPoints,
+      saved: true,
+      source: (pdftionId ? "pdftion" : "external-ink") as InkStroke["source"],
+      tool: "pen" as const,
+      width
+    };
+  });
+}
+
+// The visual weight of an ink annotation lives in /BS /W when present; /Border
+// only carries a fallback width and defaults to 1. Reading /Border first made
+// imported marker strokes render as hairlines.
+function resolveInkBorderWidth(annot: PDFDict): number {
+  const borderStyle = annot.lookupMaybe(PDFName.of("BS"), PDFDict);
+  const styleWidth = borderStyle?.lookupMaybe(PDFName.of("W"), PDFNumber)?.asNumber();
+  if (typeof styleWidth === "number" && Number.isFinite(styleWidth) && styleWidth > 0) {
+    return clamp(styleWidth, 0.5, 96);
+  }
+  const border = annot.lookupMaybe(PDFName.of("Border"), PDFArray);
+  const borderWidth = border?.lookupMaybe(2, PDFNumber)?.asNumber();
+  return clamp(typeof borderWidth === "number" && Number.isFinite(borderWidth) ? borderWidth : 2, 0.5, 96);
 }
 
 function pdftionInkStrokeId(annot: PDFDict): string | null {
@@ -15328,7 +15690,13 @@ function drawCoverElement(ctx: CanvasRenderingContext2D, cover: InkCover, cssWid
   ctx.restore();
 }
 
-function drawSelectionGroup(ctx: CanvasRenderingContext2D, elements: InkElement[], cssWidth: number, cssHeight: number): void {
+function drawSelectionGroup(
+  ctx: CanvasRenderingContext2D,
+  elements: InkElement[],
+  cssWidth: number,
+  cssHeight: number,
+  dpr = 1
+): void {
   const box = normalizedElementsBounds(elements);
   if (!box) {
     return;
@@ -15338,43 +15706,63 @@ function drawSelectionGroup(ctx: CanvasRenderingContext2D, elements: InkElement[
   const y = box.minY * cssHeight;
   const width = (box.maxX - box.minX) * cssWidth;
   const height = (box.maxY - box.minY) * cssHeight;
+  // Snap every edge to a device pixel so a 1px frame stays a crisp hairline
+  // instead of a blurry 2px band on a 2x/3x screen.
+  const hairline = 1 / dpr;
+  const snap = (value: number): number => Math.round(value * dpr) / dpr + hairline / 2;
 
   ctx.save();
   ctx.globalAlpha = 1;
+  ctx.lineCap = "butt";
+  ctx.lineJoin = "miter";
+  ctx.strokeStyle = "rgba(28, 126, 214, 0.62)";
+  ctx.lineWidth = hairline;
+  ctx.strokeRect(snap(x), snap(y), Math.max(0, Math.round(width * dpr) / dpr), Math.max(0, Math.round(height * dpr) / dpr));
+
+  // Corner brackets instead of fat square handles: readable, still precise, and
+  // they leave the selected content visible underneath.
+  const arm = clamp(Math.min(width, height) * 0.4, 7, 13);
+  const corners: Array<{ dx: number; dy: number; x: number; y: number }> = [
+    { dx: 1, dy: 1, x, y },
+    { dx: -1, dy: 1, x: x + width, y },
+    { dx: 1, dy: -1, x, y: y + height },
+    { dx: -1, dy: -1, x: x + width, y: y + height }
+  ];
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+  ctx.lineWidth = Math.max(1.4 * hairline, 1.6 * hairline);
   ctx.strokeStyle = "#1c7ed6";
-  ctx.lineWidth = 1.8;
-  ctx.setLineDash([7, 4]);
-  ctx.strokeRect(x, y, width, height);
-  ctx.setLineDash([]);
-
-  for (const handle of getSelectionHandlePoints(box)) {
-    const size = 10;
-    const hx = handle.point.x * cssWidth;
-    const hy = handle.point.y * cssHeight;
-    ctx.fillStyle = "#ffffff";
-    ctx.strokeStyle = "#1c7ed6";
-    ctx.lineWidth = 2;
-    ctx.fillRect(hx - size / 2, hy - size / 2, size, size);
-    ctx.strokeRect(hx - size / 2, hy - size / 2, size, size);
+  ctx.beginPath();
+  for (const corner of corners) {
+    ctx.moveTo(snap(corner.x + corner.dx * arm), snap(corner.y));
+    ctx.lineTo(snap(corner.x), snap(corner.y));
+    ctx.lineTo(snap(corner.x), snap(corner.y + corner.dy * arm));
   }
-
+  ctx.stroke();
   ctx.restore();
 }
 
-function drawNativeSelection(ctx: CanvasRenderingContext2D, selection: PdfNativeObject, cssWidth: number, cssHeight: number): void {
+function drawNativeSelection(
+  ctx: CanvasRenderingContext2D,
+  selection: PdfNativeObject,
+  cssWidth: number,
+  cssHeight: number,
+  dpr = 1
+): void {
   const x = selection.x * cssWidth;
   const y = selection.y * cssHeight;
   const width = selection.width * cssWidth;
   const height = selection.height * cssHeight;
+  const hairline = 1 / dpr;
+  const snap = (value: number): number => Math.round(value * dpr) / dpr + hairline / 2;
 
   ctx.save();
   ctx.globalAlpha = 1;
-  ctx.strokeStyle = "#0ca678";
-  ctx.fillStyle = selection.kind === "text" ? "rgba(12, 166, 120, 0.10)" : "rgba(12, 166, 120, 0.06)";
-  ctx.lineWidth = 1.8;
-  ctx.setLineDash([5, 4]);
+  ctx.strokeStyle = "rgba(12, 166, 120, 0.85)";
+  ctx.fillStyle = selection.kind === "text" ? "rgba(12, 166, 120, 0.07)" : "rgba(12, 166, 120, 0.05)";
+  ctx.lineWidth = hairline;
   ctx.fillRect(x, y, width, height);
-  ctx.strokeRect(x, y, width, height);
+  ctx.strokeRect(snap(x), snap(y), Math.max(0, Math.round(width * dpr) / dpr), Math.max(0, Math.round(height * dpr) / dpr));
   ctx.restore();
 }
 
@@ -15492,20 +15880,21 @@ function median(values: number[]): number {
   return sorted[Math.floor(sorted.length / 2)];
 }
 
-function drawMarqueeBox(ctx: CanvasRenderingContext2D, start: InkPoint, end: InkPoint, cssWidth: number, cssHeight: number): void {
+function drawMarqueeBox(ctx: CanvasRenderingContext2D, start: InkPoint, end: InkPoint, cssWidth: number, cssHeight: number, dpr = 1): void {
   const minX = Math.min(start.x, end.x) * cssWidth;
   const minY = Math.min(start.y, end.y) * cssHeight;
   const width = Math.abs(end.x - start.x) * cssWidth;
   const height = Math.abs(end.y - start.y) * cssHeight;
+  const hairline = 1 / dpr;
 
   ctx.save();
   ctx.globalAlpha = 1;
-  ctx.strokeStyle = "#228be6";
-  ctx.fillStyle = "rgba(34, 139, 230, 0.1)";
-  ctx.lineWidth = 1.5;
-  ctx.setLineDash([6, 4]);
+  ctx.strokeStyle = "rgba(34, 139, 230, 0.9)";
+  ctx.fillStyle = "rgba(34, 139, 230, 0.06)";
+  ctx.lineWidth = hairline;
+  ctx.setLineDash([5, 3]);
   ctx.fillRect(minX, minY, width, height);
-  ctx.strokeRect(minX, minY, width, height);
+  ctx.strokeRect(Math.round(minX * dpr) / dpr + hairline / 2, Math.round(minY * dpr) / dpr + hairline / 2, width, height);
   ctx.restore();
 }
 

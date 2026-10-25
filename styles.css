@@ -244,34 +244,20 @@ body.pdftion-menu-boost .pdftion-embed-actions .clickable-icon {
   visibility: hidden;
 }
 
-body.pdftion-editing-active .annotationLayer,
-body.pdftion-editing-active .annotationEditorLayer,
-body.pdftion-editing-active .annotationEditorParams,
-body.pdftion-editing-active .annotationEditorToolbar,
-body.pdftion-editing-active .editorParamsToolbar,
-body.pdftion-editing-active [data-annotation-id],
-body.pdftion-editing-active [data-pdf-annotation-id],
-body.pdftion-editing-active .popupAnnotation,
-body.pdftion-editing-active .pdf-annotation-popup,
-body.pdftion-editing-active .pdf-annotation-menu,
-body.pdftion-editing-active .pdfAnnotationPopup {
-  display: none;
-  opacity: 0;
-  pointer-events: none;
-  visibility: hidden;
-}
-
-body.pdftion-editing-active .annotationLayer .popupWrapper,
-body.pdftion-editing-active .annotationLayer .popup,
-body.pdftion-editing-active .annotationEditorLayer .popupWrapper,
-body.pdftion-editing-active .annotationEditorLayer .popup,
-body.pdftion-editing-active .annotationEditorParams,
-body.pdftion-editing-active .annotationEditorToolbar,
-body.pdftion-editing-active .editorParamsToolbar,
-body.pdftion-editing-active .popupAnnotation,
-body.pdftion-editing-active .pdf-annotation-popup,
-body.pdftion-editing-active .pdf-annotation-menu,
-body.pdftion-editing-active .pdfAnnotationPopup {
+/* Never hide annotations document-wide: a background PDF tab kept its ink
+   invisible while another PDF was being edited. Hiding is per page, applied
+   only once the overlay copy of that page's ink is ready. */
+.pdftion-root.pdftion-enabled .annotationLayer .popupWrapper,
+.pdftion-root.pdftion-enabled .annotationLayer .popup,
+.pdftion-root.pdftion-enabled .annotationEditorLayer .popupWrapper,
+.pdftion-root.pdftion-enabled .annotationEditorLayer .popup,
+.pdftion-root.pdftion-enabled .annotationEditorParams,
+.pdftion-root.pdftion-enabled .annotationEditorToolbar,
+.pdftion-root.pdftion-enabled .editorParamsToolbar,
+.pdftion-root.pdftion-enabled .popupAnnotation,
+.pdftion-root.pdftion-enabled .pdf-annotation-popup,
+.pdftion-root.pdftion-enabled .pdf-annotation-menu,
+.pdftion-root.pdftion-enabled .pdfAnnotationPopup {
   display: none;
   pointer-events: none;
   visibility: hidden;

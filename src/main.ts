@@ -41,7 +41,10 @@ const HIT_TOLERANCE_STRICT_PX = 3;
 const HIT_TOLERANCE_LOOSE_PX = 12;
 const DATA_MAINTENANCE_DELETE_DELAY_MS = 30_000;
 const DATA_MAINTENANCE_START_DELAY_MS = 15_000;
-const OVERLAY_HEALTH_CHECK_MS = 5000;
+const OVERLAY_HEALTH_CHECK_MS = 12_000;
+// While annotating, the cover state is re-derived often: overlays appear and
+// disappear as pages scroll, and a stale cover shows doubled or missing ink.
+const INK_COVER_REFRESH_MS = 900;
 const OVERLAY_MAX_DPR = 2;
 const PDF_ZOOM_SETTLE_DELAY_MS = 160;
 const PDF_SURFACE_MISSING_GRACE_MS = 2500;
@@ -1327,7 +1330,9 @@ interface AnnotationStateRecord {
   filePath?: string;
   overlayAnnotationsOnly?: boolean;
   overlayTextOnly?: boolean;
-  pdfFingerprint: PdfFingerprint;
+  // Absent when a record was written before fingerprinting, so a missing value
+  // must never block reading (it only blocks a write that needs to trust it).
+  pdfFingerprint?: PdfFingerprint;
   updatedAt?: string;
   version?: number;
 }
@@ -1739,6 +1744,12 @@ export default class PdftionPlugin extends Plugin {
     const entry: PdfReadCacheEntry = { bytes, mtime: stat.mtime, path: file.path, pdf, size: stat.size };
     this.pdfReadCache = entry;
     return entry;
+  }
+
+  // Public accessor for the parsed document; unlike loadPdfInkAnnotations it
+  // lets the caller distinguish "no ink" from "could not parse".
+  async getPdfReadCacheForInk(file: TFile): Promise<PdfReadCacheEntry> {
+    return this.getPdfReadCache(file);
   }
 
   private invalidatePdfReadCache(file?: TFile): void {
@@ -2263,8 +2274,11 @@ export default class PdftionPlugin extends Plugin {
     if (!(await this.app.vault.adapter.exists(this.getAnnotationStatePath(file)))) {
       return null;
     }
-    const currentFingerprint = await this.getPdfFingerprint(file);
-    const state = await this.loadVerifiedAnnotationRecord(file, currentFingerprint);
+    // Reading the annotations must not hash the PDF: SHA-256 over a 55 MB file
+    // costs ~1.1 s on the phone and used to block every entry into edit mode.
+    // The fingerprint is verified where being wrong would actually lose data
+    // (before a rewrite / burn-in), not here.
+    const state = await this.loadAnnotationRecord(file);
     if (!state) {
       return null;
     }
@@ -2452,6 +2466,53 @@ export default class PdftionPlugin extends Plugin {
 
   private getBasePdfPath(file: TFile, sha256: string): string {
     return `${this.manifest.dir}/data/base-pdfs/${safeAnnotationKey(file.path)}--${sha256}.pdf`;
+  }
+
+  // Fingerprint-free load: the record is trusted unless it plainly belongs to
+  // another file. Callers that rewrite the PDF re-verify against the current
+  // bytes before touching anything.
+  private async loadAnnotationRecord(file: TFile): Promise<AnnotationStateRecord | null> {
+    const raw = await this.readAnnotationRecordJson(file);
+    if (!raw) {
+      return null;
+    }
+    if (raw.filePath !== file.path) {
+      console.warn("pdftion removed annotation state assigned to another PDF.", file.path, raw.filePath);
+      await this.removeAdapterFile(this.getAnnotationStatePath(file));
+      return null;
+    }
+    return raw;
+  }
+
+  private async readAnnotationRecordJson(file: TFile): Promise<AnnotationStateRecord | null> {
+    try {
+      const raw = await this.app.vault.adapter.read(this.getAnnotationStatePath(file));
+      const parsed = JSON.parse(raw) as {
+        basePdfFingerprint?: unknown;
+        elements?: unknown;
+        filePath?: unknown;
+        overlayAnnotationsOnly?: unknown;
+        overlayTextOnly?: unknown;
+        pdfFingerprint?: unknown;
+        updatedAt?: unknown;
+        version?: unknown;
+      };
+      if (!Array.isArray(parsed.elements)) {
+        return null;
+      }
+      return {
+        basePdfFingerprint: isPdfFingerprint(parsed.basePdfFingerprint) ? parsed.basePdfFingerprint : undefined,
+        elements: parsed.elements.filter(isInkElement),
+        filePath: typeof parsed.filePath === "string" ? parsed.filePath : undefined,
+        overlayAnnotationsOnly: parsed.overlayAnnotationsOnly === true,
+        overlayTextOnly: parsed.overlayTextOnly === true,
+        pdfFingerprint: isPdfFingerprint(parsed.pdfFingerprint) ? parsed.pdfFingerprint : undefined,
+        updatedAt: typeof parsed.updatedAt === "string" ? parsed.updatedAt : undefined,
+        version: typeof parsed.version === "number" ? parsed.version : undefined
+      };
+    } catch {
+      return null;
+    }
   }
 
   private async loadVerifiedAnnotationRecord(file: TFile, currentFingerprint: PdfFingerprint): Promise<AnnotationStateRecord | null> {
@@ -2827,6 +2888,32 @@ export default class PdftionPlugin extends Plugin {
     return true;
   }
 
+  // Remove kept pages from a pending transaction record. A page that still has
+  // native ink was clearly not detached, so the leftover record only blocks it.
+  async dropInkEditTransactionForPages(file: TFile, pagesWithNativeInk: Set<number>): Promise<void> {
+    if (pagesWithNativeInk.size === 0) {
+      return;
+    }
+    const record = await this.readInkEditTransaction(file);
+    if (!record) {
+      return;
+    }
+    const remaining = record.pageIndexes.filter((pageIndex) => !pagesWithNativeInk.has(pageIndex));
+    if (remaining.length === record.pageIndexes.length) {
+      return;
+    }
+    try {
+      if (remaining.length === 0) {
+        await this.deleteInkEditTransaction(record);
+      } else {
+        await this.writeInkEditTransaction(file, { ...record, pageIndexes: remaining });
+      }
+      console.info(`pdftion dropped a stale ink transaction record for ${file.path}.`);
+    } catch (error) {
+      console.warn("pdftion could not drop a stale ink transaction record.", error);
+    }
+  }
+
   async getInkEditTransactionPages(file: TFile): Promise<Set<number>> {
     const record = await this.readInkEditTransaction(file);
     return new Set(record?.phase === "editing" ? record.pageIndexes : []);
@@ -2928,6 +3015,12 @@ export default class PdftionPlugin extends Plugin {
         }
         if (record.phase === "committed") {
           await this.deleteInkEditTransaction(record);
+          continue;
+        }
+        if (!(await this.app.vault.adapter.exists(record.backupPdfPath))) {
+          // Nothing to restore from; the record alone would block these pages.
+          await this.deleteInkEditTransaction(record);
+          console.info(`pdftion dropped an unrecoverable ink transaction record for ${file.path}.`);
           continue;
         }
         const elements = await this.readPendingInkEditElements(file);
@@ -3505,9 +3598,20 @@ class InkSession {
   // Pages already probed for native ink. Kept so scrolling re-checks only the
   // pages that just came into view instead of rescanning the whole document.
   private inkCheckedPages = new Set<number>();
-  // Pages where the viewer does not expose annotation DOM, so the only way to
-  // suppress the native ink is the file-level detach rewrite.
-  private viewerAnnotationDomMissingPages = new Set<number>();
+  private inkDetachFailureNotified = false;
+  // Native Ink annotation count per page, straight from the viewer. This is the
+  // ground truth for "is there anything on this page that has to be hidden?".
+  private nativeInkCountByPage = new Map<number, number>();
+  // Native annotations successfully turned into editable strokes, per page.
+  private convertedInkByPage = new Map<number, { count: number; ids: Set<string> }>();
+  // Pages whose native ink is currently covered by the overlay copy.
+  private nativeInkCoveredPages = new Set<number>();
+  private pageInkUnknownAttempts = new Map<number, number>();
+  private staleTransactionPages = new Set<number>();
+  private inkSweepToken = 0;
+  private inkCoverTimer: number | null = null;
+  private prepareAllInkPromise: Promise<void> | null = null;
+  private inkSweepFilePath = "";
   // Pages whose detach rewrite is still awaiting the native view reload: the
   // native PDF still paints the ink here, so the overlay must NOT draw its
   // imported copy yet, otherwise both layers show at once.
@@ -3781,8 +3885,10 @@ class InkSession {
     this.coverHistory = [];
     this.imageHistory = [];
     this.nativeInkScannedPages.clear();
+    this.nativeInkCountByPage.clear();
+    this.pageInkUnknownAttempts.clear();
+    this.staleTransactionPages.clear();
     this.inkCheckedPages.clear();
-    this.viewerAnnotationDomMissingPages.clear();
     this.clearLayerLongPress();
     this.layerMenu?.remove();
     this.layerMenu = null;
@@ -3833,7 +3939,16 @@ class InkSession {
       return;
     }
     const pdfInkStrokes: InkStroke[] = [];
-    const stateElements = (state?.elements ?? []).filter((element) => !isStaleImportedNativeInk(element));
+    // The transaction has to be known first: a page whose ink was stripped from
+    // the file keeps its only copy in the annotation state, so those elements
+    // must survive this filter or the user's strokes really get lost.
+    const transactionPages = await this.plugin.getInkEditTransactionPages(this.file);
+    if (loadToken !== this.annotationLoadToken || this.file.path !== filePath) {
+      return;
+    }
+    const stateElements = (state?.elements ?? []).filter((element) => (
+      !isRedundantNativeInkMirror(element, transactionPages)
+    ));
     const loadedElements: InkElement[] = [
       ...stateElements,
       ...pdfInkStrokes.filter((stroke) => !stateElements.some((element) => (
@@ -3861,10 +3976,6 @@ class InkSession {
     this.textHistory = elements.filter((element): element is InkText => element.kind === "text");
     this.coverHistory = elements.filter((element): element is InkCover => element.kind === "cover");
     this.imageHistory = elements.filter((element): element is InkImage => element.kind === "image");
-    const transactionPages = await this.plugin.getInkEditTransactionPages(this.file);
-    if (loadToken !== this.annotationLoadToken || this.file.path !== filePath) {
-      return;
-    }
     this.detachedInkEditPages = transactionPages;
     this.savedInkIsBurnedIntoPdf = state !== null && !state.overlayAnnotationsOnly && this.strokeHistory.some((stroke) => !Array.isArray(stroke.pdfPoints));
     this.savedTextIsBurnedIntoPdf = state !== null && !state.overlayAnnotationsOnly && !state.overlayTextOnly && this.textHistory.length > 0;
@@ -3909,6 +4020,9 @@ class InkSession {
 
     if (this.enabled) {
       this.rememberNativeInkHidePagesForCurrentPages();
+      // A page that scrolled into view gets its overlay now; apply the cover
+      // immediately so it never shows both the native and the editable copy.
+      this.updateExternalInkLayerState();
     }
     this.redrawAll();
     this.scheduleEditableInkPrepare(120);
@@ -4503,7 +4617,7 @@ class InkSession {
     if (this.nativeAnnotationPopupTimer !== null) {
       return;
     }
-    this.nativeAnnotationPopupTimer = window.setInterval(() => this.hideNativePdfAnnotationPopups(), 180);
+    this.nativeAnnotationPopupTimer = window.setInterval(() => this.hideNativePdfAnnotationPopups(), 500);
   }
 
   private stopNativeAnnotationPopupSuppressor(): void {
@@ -4591,15 +4705,29 @@ class InkSession {
       this.scanPages();
       this.primeNativeInkHidingForCurrentPages(true);
       this.startOverlayHealthCheck();
+      this.startInkCoverRefresh();
       this.startNativeAnnotationPopupSuppressor();
       this.scheduleEditableInkPrepare(0, true);
-      window.setTimeout(() => this.scheduleEditableInkPrepare(0, true), 260);
-      window.setTimeout(() => this.scheduleEditableInkPrepare(0, true), 760);
+      this.inkSweepFilePath = this.file.path;
+      window.setTimeout(() => {
+        if (this.enabled) {
+          void this.sweepAllInkPages();
+        }
+      }, 420);
+      // One retry only: the viewer sometimes mounts its page/annotation layer a
+      // frame after the toolbar appears. Repeated blind re-schedules used to
+      // re-run the whole preparation three times on every entry.
+      window.setTimeout(() => {
+        if (this.enabled && !this.pdfInkPreparationComplete) {
+          this.scheduleEditableInkPrepare(0, true);
+        }
+      }, 320);
       if (options.notice !== false) {
         new Notice(uiText("PDF 批注已开启。", "PDF annotation enabled."));
       }
     } else {
       this.stopOverlayHealthCheck();
+      this.stopInkCoverRefresh();
       this.stopNativeAnnotationPopupSuppressor();
       this.clearCurrentStroke();
       this.recentInkGroup = null;
@@ -4625,55 +4753,101 @@ class InkSession {
       this.toolbar?.remove();
       this.toolbar = null;
       this.pdfInkPreparationComplete = false;
+      // Re-arm the per-page import for the next entry, but leave the imported
+      // strokes in memory so a re-entry is instant.
+      this.inkCheckedPages.clear();
+      this.nativeInkScannedPages.clear();
+      this.pageInkUnknownAttempts.clear();
+      this.inkSweepToken += 1;
+      // Hand the native annotations back to the viewer: without this the page
+      // keeps the hide class and its ink stays invisible after leaving edit
+      // mode, which looks like leftover/ghost content.
+      this.updateExternalInkLayerState();
+      this.restoreHiddenNativeInkAnnotations();
+      // A background pass may already be past its last guard, so settle once
+      // more after it had time to finish: nothing may stay hidden once editing
+      // is off.
+      window.setTimeout(() => {
+        if (!this.enabled && !this.destroyed) {
+          this.updateExternalInkLayerState();
+          this.restoreHiddenNativeInkAnnotations();
+        }
+      }, 400);
       void this.finishPdfInkEditing();
       this.redrawAll();
     }
   }
 
-  private async prepareEditableInkForCurrentPage(force = false): Promise<void> {
-    try {
-      if (this.conversionInProgress) {
-        return;
-      }
-      await this.loadEditableAnnotations();
-      if (!this.enabled) {
-        return;
-      }
-      if (this.saving) {
-        this.pendingEditableInkPrepareAfterSave = true;
-        return;
-      }
-      if (this.detachedInkEditPages.size > 0) {
-        for (const pageIndex of this.detachedInkEditPages) {
-          this.pendingNativeInkHidePages.add(pageIndex);
+  // One pass, no per-page machinery: ask the viewer for every page's ink at
+  // once (milliseconds, because it already parsed the document), merge the
+  // strokes and record exactly how much converted per page. Hiding is then a
+  // pure function of those numbers, so it can never disagree with what is drawn.
+  private async prepareEditableInkForCurrentPage(): Promise<void> {
+    if (this.conversionInProgress || !this.enabled) {
+      return;
+    }
+    if (this.prepareAllInkPromise) {
+      return this.prepareAllInkPromise;
+    }
+    this.prepareAllInkPromise = (async () => {
+      try {
+        await this.loadEditableAnnotations();
+        if (!this.enabled) {
+          return;
+        }
+        const documentProxy = this.getNativePdfDocumentProxy() as (NativePdfDocumentProxyLike & { numPages?: number }) | null;
+        const total = typeof documentProxy?.numPages === "number" ? documentProxy.numPages : 0;
+        if (total <= 0) {
+          // Viewer not ready yet (still loading); retry shortly.
+          this.scheduleEditableInkPrepare(400, true);
+          return;
+        }
+        const targets = new Set<number>();
+        for (let pageIndex = 0; pageIndex < total; pageIndex += 1) {
+          targets.add(pageIndex);
+        }
+        const loaded = await this.loadNativeInkStrokesForPages(targets);
+        if (!this.enabled) {
+          return;
+        }
+        if (!loaded.ok) {
+          this.scheduleEditableInkPrepare(600, true);
+          return;
+        }
+        for (const pageIndex of targets) {
+          this.nativeInkCountByPage.set(pageIndex, 0);
+          this.convertedInkByPage.delete(pageIndex);
+        }
+        for (const [pageIndex, entry] of loaded.converted) {
+          this.convertedInkByPage.set(pageIndex, { count: entry.count, ids: new Set(entry.ids) });
+        }
+        for (const stroke of loaded.strokes) {
+          this.nativeInkCountByPage.set(stroke.pageIndex, (this.nativeInkCountByPage.get(stroke.pageIndex) ?? 0) + 1);
+        }
+        let changed = false;
+        for (const stroke of loaded.strokes) {
+          changed = this.mergePdfInkStrokeForEditing(stroke) || changed;
+        }
+        if (changed) {
+          this.strokeHistory = dedupeInkElements(this.strokeHistory)
+            .filter((element): element is InkStroke => element.kind === "stroke");
+          this.dirty = true;
+        }
+        for (const pageIndex of targets) {
+          this.inkCheckedPages.add(pageIndex);
+          this.nativeInkScannedPages.add(pageIndex);
         }
         this.pdfInkPreparationComplete = true;
         this.updateExternalInkLayerState();
-        return;
+        this.redrawAll();
+      } catch (error) {
+        console.warn("pdftion could not import the PDF ink annotations.", error);
+        this.scheduleEditableInkPrepare(800, true);
+      } finally {
+        this.prepareAllInkPromise = null;
       }
-      const candidatePages = this.getInkPrepareCandidatePages(force);
-      const pageIndexes = new Set<number>();
-      for (const pageIndex of candidatePages) {
-        if (!this.inkCheckedPages.has(pageIndex)) {
-          pageIndexes.add(pageIndex);
-        }
-      }
-      // Steady state while scrolling inside already prepared pages.
-      if (pageIndexes.size === 0) {
-        this.pdfInkPreparationComplete = true;
-        return;
-      }
-      if (this.preparingPdfInkForEditing) {
-        // A batch is already running; retry shortly so pages that scrolled into
-        // view meanwhile are not skipped.
-        this.scheduleEditableInkPrepare(320, force);
-        return;
-      }
-      await this.preparePdfInkOverlayForEditing(pageIndexes);
-      this.pdfInkPreparationComplete = true;
-    } catch (error) {
-      console.warn("pdftion could not prepare PDF ink for editable mode.", error);
-    }
+    })();
+    return this.prepareAllInkPromise;
   }
 
   private scheduleEditableInkPrepare(delay = 160, force = false): void {
@@ -4687,7 +4861,7 @@ class InkSession {
       const runForce = this.inkPrepareTimerForce;
       this.inkPrepareTimerForce = false;
       this.inkPrepareTimer = null;
-      void this.prepareEditableInkForCurrentPage(runForce);
+      void this.prepareEditableInkForCurrentPage();
     }, delay);
   }
 
@@ -4768,22 +4942,78 @@ class InkSession {
     return pages;
   }
 
-  private async pageExposesAnnotationDom(overlay: PageOverlay): Promise<boolean> {
-    if (this.viewerAnnotationDomMissingPages.has(overlay.pageIndex)) {
-      return false;
-    }
-    for (let attempt = 0; attempt < 4; attempt += 1) {
-      if (overlay.pageEl.querySelector(
-        ".annotationLayer > *, .annotationEditorLayer > *, [data-annotation-id], [data-pdf-annotation-id]"
-      )) {
-        return true;
+  // Decide who hides this page's native ink.
+  // "css"     - the annotation layer is rendered, so hiding that layer is enough.
+  // "detach"  - last resort: rewrite the PDF because the viewer paints the ink
+  //             somewhere CSS cannot reach.
+  // "unknown" - the page has not been rendered yet; retry later.
+  private classifyNativeInkHiding(overlay: PageOverlay): "css" | "detach" | "unknown" {
+    const pageIndex = overlay.pageIndex;
+    const nativeInkCount = this.nativeInkCountByPage.get(pageIndex) ?? 0;
+    if (nativeInkCount === 0) {
+      // Nothing in the file to hide: rewriting it here was pure waste and the
+      // main reason entering edit mode took seconds on large PDFs.
+      this.pendingNativeInkHidePages.delete(pageIndex);
+      if (this.detachedInkEditPages.delete(pageIndex)) {
+        this.staleTransactionPages.add(pageIndex);
       }
-      if (attempt < 3) {
-        await sleepMs(90);
+      return "css";
+    }
+    if (this.detachedInkEditPages.has(pageIndex)) {
+      // The file still carries ink, so this page was never really detached; an
+      // old transaction record was blocking it and making the ink unimportable.
+      this.detachedInkEditPages.delete(pageIndex);
+      this.staleTransactionPages.add(pageIndex);
+    }
+    const domAnnotations = overlay.pageEl.querySelectorAll(
+      ".annotationLayer > *, .annotationEditorLayer > *, [data-annotation-id], [data-pdf-annotation-id]"
+    ).length;
+    if (domAnnotations > 0) {
+      // The hide rule covers the whole annotation layer of the page, so one
+      // rendered node is enough proof that CSS can take care of it.
+      return "css";
+    }
+    const attempts = (this.pageInkUnknownAttempts.get(pageIndex) ?? 0) + 1;
+    this.pageInkUnknownAttempts.set(pageIndex, attempts);
+    // Give the viewer time to render first; rewriting the file was far more
+    // disruptive than briefly showing the native copy.
+    return attempts >= 6 ? "detach" : "unknown";
+  }
+
+  // Converting a page costs a few milliseconds now that the ink is read from
+  // the viewer instead of re-parsing the file, so the whole document is swept in
+  // the background right after the visible page is ready. Without this, doodles
+  // on any page the user had not scrolled to stayed native — which is exactly
+  // what looked like "some strokes cannot be edited and stay on top".
+  private async sweepAllInkPages(): Promise<void> {
+    const token = ++this.inkSweepToken;
+    const doc = this.getNativePdfDocumentProxy() as (NativePdfDocumentProxyLike & { numPages?: number }) | null;
+    const total = typeof doc?.numPages === "number" ? doc.numPages : 0;
+    if (!doc?.getPage || total <= 0) {
+      return;
+    }
+    const pending: number[] = [];
+    for (let pageIndex = 0; pageIndex < total; pageIndex += 1) {
+      if (!this.inkCheckedPages.has(pageIndex)) {
+        pending.push(pageIndex);
       }
     }
-    this.viewerAnnotationDomMissingPages.add(overlay.pageIndex);
-    return false;
+    for (let index = 0; index < pending.length; index += 6) {
+      if (token !== this.inkSweepToken || !this.enabled || this.destroyed) {
+        return;
+      }
+      if (this.file.path !== this.inkSweepFilePath) {
+        return;
+      }
+      if (this.preparingPdfInkForEditing || this.saving) {
+        await sleepMs(120);
+        index -= 6;
+        continue;
+      }
+      const chunk = new Set(pending.slice(index, index + 6));
+      await this.preparePdfInkOverlayForEditing(chunk);
+      await sleepMs(24);
+    }
   }
 
   private async detachNativeInkPages(pageIndexes: Set<number>): Promise<void> {
@@ -4800,6 +5030,15 @@ class InkSession {
       }
     } catch (error) {
       console.warn("pdftion could not detach the native PDF ink for editing.", error);
+      // Without the detach the viewer keeps painting its own copy of the ink,
+      // so tell the user instead of leaving the page silently uneditable.
+      if (!this.inkDetachFailureNotified) {
+        this.inkDetachFailureNotified = true;
+        new Notice(uiText(
+          "这个 PDF 的原生墨迹无法转为可编辑（文件写入失败），页面上的旧笔迹暂时只能查看。",
+          "The native ink in this PDF could not be detached (file write failed); existing strokes stay read-only for now."
+        ), 6000);
+      }
     } finally {
       // The reloaded view no longer contains the native ink, so the overlay copy
       // becomes the only visible layer from here on.
@@ -4825,11 +5064,16 @@ class InkSession {
     this.preparingPdfInkForEditing = true;
     try {
       for (const pageIndex of pageIndexes) {
-        this.inkCheckedPages.add(pageIndex);
         this.pendingNativeInkHidePages.add(pageIndex);
       }
       this.updateExternalInkLayerState();
       await this.importPdfInkForPages(pageIndexes);
+      if (!this.enabled || this.destroyed) {
+        // Edit mode was left while the import was running. Re-applying the
+        // cover now would hide ink that no overlay is drawing any more.
+        this.updateExternalInkLayerState();
+        return;
+      }
 
       const detachPages = new Set<number>();
       for (const pageIndex of pageIndexes) {
@@ -4838,21 +5082,46 @@ class InkSession {
         ));
         if (!hasNativeInk) {
           this.pendingNativeInkHidePages.delete(pageIndex);
+          this.inkCheckedPages.add(pageIndex);
           continue;
         }
         if (this.detachedInkEditPages.has(pageIndex)) {
+          this.inkCheckedPages.add(pageIndex);
           continue;
         }
         const overlay = this.getOverlayForPage(pageIndex);
-        const hideWithCss = overlay ? await this.pageExposesAnnotationDom(overlay) : false;
-        if (!hideWithCss) {
-          detachPages.add(pageIndex);
+        if (!overlay) {
+          // No overlay yet (page is outside the retained window). The import is
+          // done, so this page is resolved; the cover is applied the moment the
+          // overlay appears.
+          this.inkCheckedPages.add(pageIndex);
+          continue;
         }
+        const hiding = this.classifyNativeInkHiding(overlay);
+        if (hiding === "css") {
+          this.inkCheckedPages.add(pageIndex);
+        } else if (hiding === "detach") {
+          detachPages.add(pageIndex);
+          this.inkCheckedPages.add(pageIndex);
+        }
+        // "unknown": the page has not been painted yet, so its annotation DOM
+        // does not exist either. Leave it unchecked so a later pass retries;
+        // detaching now would rewrite the whole file for nothing.
+      }
+      // Drop transaction records whose pages still carry ink in the file: those
+      // pages were never really detached, and keeping the record made the ink
+      // permanently unimportable (the "cannot convert my doodles" bug).
+      if (this.staleTransactionPages.size > 0) {
+        await this.plugin.dropInkEditTransactionForPages(this.file, new Set(this.staleTransactionPages));
+        this.staleTransactionPages.clear();
       }
       this.updateExternalInkLayerState();
       this.redrawAll();
       if (detachPages.size > 0) {
-        await this.detachNativeInkPages(detachPages);
+        // Detaching rewrites the whole file, so never do more than one page per
+        // pass: the first page stays responsive and the rest follow later.
+        const first = Array.from(detachPages)[0];
+        await this.detachNativeInkPages(new Set([first]));
       }
     } catch (error) {
       console.warn("pdftion could not prepare PDF ink annotations for editing.", error);
@@ -4973,7 +5242,7 @@ class InkSession {
     this.annotationLoadToken += 1;
     this.annotationLoadPromise = null;
     this.inkCheckedPages.clear();
-    this.viewerAnnotationDomMissingPages.clear();
+    this.pageInkUnknownAttempts.clear();
     await this.loadEditableAnnotations();
     await this.reloadNativePdfView();
     await sleepMs(320);
@@ -5004,15 +5273,28 @@ class InkSession {
 
   private getNativePdfDocumentProxy(): NativePdfDocumentProxyLike | null {
     const view = this.leaf.view as unknown as {
-      viewer?: { child?: { pdfDocument?: NativePdfDocumentProxyLike } };
+      viewer?: { child?: { pdfDocument?: NativePdfDocumentProxyLike; _pdfDocument?: NativePdfDocumentProxyLike } };
     };
-    return view.viewer?.child?.pdfDocument ?? this.getNativePdfViewerApp()?.pdfDocument ?? null;
+    const child = view.viewer?.child;
+    const app = this.getNativePdfViewerApp() as unknown as {
+      pdfDocument?: NativePdfDocumentProxyLike;
+      pdfViewer?: { pdfDocument?: NativePdfDocumentProxyLike; _pdfDocument?: NativePdfDocumentProxyLike };
+    } | null;
+    // Obsidian's bundled viewer keeps the document proxy on the viewer object
+    // (`pdfViewer.pdfDocument`), not on the wrapper, and exposes no
+    // getPageView/_pages, so this is the only handle on the parsed document.
+    return child?.pdfDocument ?? child?._pdfDocument
+      ?? app?.pdfViewer?.pdfDocument ?? app?.pdfViewer?._pdfDocument
+      ?? app?.pdfDocument ?? null;
   }
 
   // Preferred ink source: the viewer already parsed the document, so asking it
   // for annotations costs milliseconds instead of a fresh multi-second pdf-lib
   // parse, and it survives PDFs that pdf-lib refuses to load.
-  private async readInkStrokesFromNativeViewer(pageIndexes: Set<number> | undefined): Promise<InkStroke[] | null> {
+  private async readInkStrokesFromNativeViewer(
+    pageIndexes: Set<number> | undefined,
+    converted?: Map<number, { count: number; ids: Set<string> }>
+  ): Promise<InkStroke[] | null> {
     const viewer = this.getNativePdfViewerApp()?.pdfViewer ?? null;
     const documentProxy = this.getNativePdfDocumentProxy();
     if (!viewer && !documentProxy) {
@@ -5027,7 +5309,8 @@ class InkSession {
     let resolvedPages = 0;
     const strokes: InkStroke[] = [];
     for (const pageIndex of targets) {
-      const pageView = viewer?.getPageView?.(pageIndex) ?? viewer?._pages?.[pageIndex] ?? null;
+      const pageView = (viewer?.getPageView?.(pageIndex) ?? viewer?._pages?.[pageIndex]
+        ?? (viewer as unknown as { page?: NativePdfPageViewLike } | null)?.page ?? null) as NativePdfPageViewLike | null;
       let page = pageView?.pdfPage ?? null;
       if (!page && documentProxy?.getPage) {
         try {
@@ -5048,18 +5331,42 @@ class InkSession {
       }
       resolvedPages += 1;
       for (const annotation of annotations) {
-        strokes.push(...pdfJsInkAnnotationToStrokes(annotation, pageIndex, viewport));
+        const produced = pdfJsInkAnnotationToStrokes(annotation, pageIndex, viewport);
+        if (produced.length === 0) {
+          continue;
+        }
+        strokes.push(...produced);
+        if (converted) {
+          const entry = converted.get(pageIndex) ?? { count: 0, ids: new Set<string>() };
+          entry.count += 1;
+          if (typeof annotation.id === "string" && annotation.id.length > 0) {
+            entry.ids.add(annotation.id);
+          }
+          converted.set(pageIndex, entry);
+        }
       }
     }
     return resolvedPages === 0 ? null : strokes;
   }
 
-  private async loadNativeInkStrokesForPages(pageIndexes: Set<number> | undefined): Promise<InkStroke[]> {
-    const fromViewer = await this.readInkStrokesFromNativeViewer(pageIndexes);
+  // ok=false means "not answered yet" (viewer not ready and the file could not
+  // be parsed). The caller must not mark those pages as scanned, otherwise the
+  // ink would stay uneditable for the rest of the session.
+  private async loadNativeInkStrokesForPages(
+    pageIndexes: Set<number> | undefined
+  ): Promise<{ ok: boolean; strokes: InkStroke[]; converted: Map<number, { count: number; ids: Set<string> }> }> {
+    const converted = new Map<number, { count: number; ids: Set<string> }>();
+    const fromViewer = await this.readInkStrokesFromNativeViewer(pageIndexes, converted);
     if (fromViewer !== null) {
-      return fromViewer;
+      return { ok: true, strokes: fromViewer, converted };
     }
-    return this.plugin.loadPdfInkAnnotations(this.file, pageIndexes);
+    try {
+      const { pdf } = await this.plugin.getPdfReadCacheForInk(this.file);
+      return { ok: true, strokes: extractPdfInkAnnotations(pdf, pageIndexes), converted };
+    } catch (error) {
+      console.warn("pdftion could not read PDF ink annotations yet; will retry.", error);
+      return { ok: false, strokes: [], converted };
+    }
   }
 
   private async importPdfInkForPages(pageIndexes?: Set<number>): Promise<boolean> {
@@ -5073,12 +5380,31 @@ class InkSession {
       return false;
     }
     const targetPath = this.file.path;
-    const pdfInkStrokes = await this.loadNativeInkStrokesForPages(pagesToScan);
+    const loaded = await this.loadNativeInkStrokesForPages(pagesToScan);
     if (this.file.path !== targetPath) {
+      return false;
+    }
+    if (!loaded.ok) {
       return false;
     }
     for (const pageIndex of pagesToScan ?? []) {
       this.nativeInkScannedPages.add(pageIndex);
+    }
+    const pdfInkStrokes = loaded.strokes;
+    for (const pageIndex of pagesToScan ?? []) {
+      this.nativeInkCountByPage.set(pageIndex, 0);
+      this.convertedInkByPage.delete(pageIndex);
+    }
+    for (const pageIndex of pagesToScan ?? []) {
+      const converted = loaded.converted.get(pageIndex);
+      if (converted) {
+        this.convertedInkByPage.set(pageIndex, { count: converted.count, ids: new Set(converted.ids) });
+      }
+    }
+    // Without per-annotation ids (pdf-lib fallback) the counts still tell us
+    // whether every annotation of the page made it into the overlay.
+    for (const stroke of pdfInkStrokes) {
+      this.nativeInkCountByPage.set(stroke.pageIndex, (this.nativeInkCountByPage.get(stroke.pageIndex) ?? 0) + 1);
     }
     if (pdfInkStrokes.length === 0) {
       return false;
@@ -6954,7 +7280,9 @@ class InkSession {
       ".menu",
       "[role='menu']"
     ];
-    for (const candidate of Array.from(activeDocument.querySelectorAll<HTMLElement>(selectors.join(",")))) {
+    // Scoped to this PDF view: a document-wide query every frame range was the
+    // single biggest source of jank while annotating (forced layout per node).
+    for (const candidate of Array.from(this.rootEl.querySelectorAll<HTMLElement>(selectors.join(",")))) {
       if (candidate.closest(".pdftion-root, .pdftion-toolbar, .pdftion-panel, .pdftion-palette-panel, .pdftion-text-menu, .pdftion-comment-popover, .pdftion-native-selection-menu")) {
         continue;
       }
@@ -9004,17 +9332,18 @@ class InkSession {
 
   // Who paints external (PDF-native) ink on a page right now. Exactly one
   // layer may own the display at any moment or the user sees double doodles.
-  private shouldDrawExternalInk(pageIndex: number): boolean {
-    if (this.inkCommitSettlePages.has(pageIndex)) {
+  // Exactly one layer may paint a stroke that also lives in the PDF. The DOM
+  // hide class is the ground truth: draw the overlay copy only while the native
+  // annotation layer is actually hidden, so leaving edit mode (class removed)
+  // or a half-prepared page can never show the same ink twice.
+  private shouldDrawPdfBackedInk(overlay: PageOverlay, pageIndex: number): boolean {
+    if (this.detachedInkEditPages.has(pageIndex)) {
+      // The ink was stripped from the file, so the overlay is the only copy.
       return true;
     }
-    if (!this.enabled) {
-      return false;
-    }
-    if (this.inkDetachReloadPendingPages.has(pageIndex)) {
-      return false;
-    }
-    return true;
+    // Draw the editable copy only where the native layer is hidden, so the same
+    // stroke can never be painted twice.
+    return this.enabled && this.nativeInkCoveredPages.has(pageIndex);
   }
 
   private redrawOverlay(overlay: PageOverlay, previewStroke?: InkStroke): void {
@@ -9042,7 +9371,7 @@ class InkSession {
         this.drawImageElement(ctx, element, overlay.cssWidth, overlay.cssHeight, selected);
       } else if (element.kind === "stroke") {
         if (Array.isArray(element.pdfPoints)) {
-          if (this.shouldDrawExternalInk(element.pageIndex)) {
+          if (this.shouldDrawPdfBackedInk(overlay, element.pageIndex)) {
             drawStroke(ctx, element, overlay.cssWidth, overlay.cssHeight, selected);
           }
         } else if (!this.savedInkIsBurnedIntoPdf || !element.saved) {
@@ -10730,60 +11059,91 @@ class InkSession {
   }
 
   private updateExternalInkLayerState(): void {
-    const activePages = new Set<number>();
-
-    for (const overlay of this.overlays.values()) {
-      const targets = this.strokeHistory.filter((stroke) => (
-        stroke.pageIndex === overlay.pageIndex &&
-        Array.isArray(stroke.pdfPoints)
-      ));
-      const shouldHidePage =
-        this.enabled && (
-          targets.length > 0 ||
-          this.pendingNativeInkHidePages.has(overlay.pageIndex) ||
-          this.detachedInkEditPages.has(overlay.pageIndex)
-        );
-      if (!shouldHidePage) {
-        overlay.pageEl.classList.remove("pdftion-hide-native-ink-layer");
+    // One rule, applied per page, with no geometry guessing:
+    //   every native Ink annotation on the page became an editable stroke
+    //     -> hide that page's native annotation layer, draw the editable copy
+    //   anything left unconverted
+    //     -> keep the native layer visible and do NOT draw a copy
+    // That makes a double layer impossible by construction.
+    const fully = new Set<number>();
+    for (const pageEl of Array.from(this.rootEl.querySelectorAll<HTMLElement>(".page"))) {
+      const raw = pageEl.getAttribute("data-page-number");
+      const pageNumber = raw ? Number.parseInt(raw, 10) : Number.NaN;
+      if (!Number.isFinite(pageNumber)) {
         continue;
       }
-
-      activePages.add(overlay.pageIndex);
-      overlay.pageEl.classList.add("pdftion-hide-native-ink-layer");
-
-      for (const layer of this.collectNativeAnnotationElements(overlay.pageEl, false)) {
-        this.hideNativeAnnotationElement(layer);
-      }
-
-      const canvasRect = overlay.canvas.getBoundingClientRect();
-      const targetRects = targets
-        .map((stroke) => normalizedStrokeBounds({ ...stroke, points: stroke.pdfPoints ?? stroke.points }))
-        .filter((bounds): bounds is NormalizedBounds => bounds !== null)
-        .map((bounds) => {
-          const pad = 24;
-          return {
-            bottom: canvasRect.top + bounds.maxY * canvasRect.height + pad,
-            left: canvasRect.left + bounds.minX * canvasRect.width - pad,
-            right: canvasRect.left + bounds.maxX * canvasRect.width + pad,
-            top: canvasRect.top + bounds.minY * canvasRect.height - pad
-        };
-      });
-      if (targetRects.length === 0) {
-        continue;
-      }
-
-      for (const candidate of this.collectNativeAnnotationElements(overlay.pageEl, true)) {
-        const rect = candidate.getBoundingClientRect();
-        if (rect.width <= 0 || rect.height <= 0) {
-          continue;
-        }
-        if (targetRects.some((target) => rectsOverlap(target, rect))) {
-          this.hideNativeAnnotationElement(candidate);
-        }
+      const pageIndex = pageNumber - 1;
+      const nativeCount = this.nativeInkCountByPage.get(pageIndex) ?? 0;
+      const detached = this.detachedInkEditPages.has(pageIndex);
+      const converted = this.convertedInkByPage.get(pageIndex);
+      const convertedCount = converted?.count ?? 0;
+      const pageConverted = detached || (nativeCount > 0 && convertedCount >= nativeCount);
+      // The page may only be hidden while an overlay exists to draw its copy.
+      // Without this an overlay that is torn down (page scrolled away, view
+      // reloaded) would leave the ink hidden and nothing on screen — the
+      // "my doodles disappeared" case.
+      const overlay = this.getOverlayForPage(pageIndex);
+      if (this.enabled && pageConverted && overlay) {
+        pageEl.classList.add("pdftion-hide-native-ink-layer");
+        fully.add(pageIndex);
+      } else {
+        pageEl.classList.remove("pdftion-hide-native-ink-layer");
       }
     }
+    this.nativeInkCoveredPages = fully;
+    this.revealUncoveredNativeInk(fully);
+    this.restoreHiddenNativeInkAnnotations(fully);
+    // CSS-level sweep: an element-level hide can survive a plugin reload (the
+    // class stays in the DOM while the bookkeeping map is gone), which made ink
+    // invisible with nothing drawn on top. Clearing it here is idempotent.
+    for (const pageEl of Array.from(this.rootEl.querySelectorAll<HTMLElement>(".page"))) {
+      const raw = pageEl.getAttribute("data-page-number");
+      const pageNumber = raw ? Number.parseInt(raw, 10) : Number.NaN;
+      const pageIndex = Number.isFinite(pageNumber) ? pageNumber - 1 : null;
+      if (pageIndex !== null && fully.has(pageIndex)) {
+        continue;
+      }
+      for (const hidden of Array.from(pageEl.querySelectorAll<HTMLElement>(".pdftion-hide-native-annotation-element"))) {
+        hidden.classList.remove("pdftion-hide-native-annotation-element");
+      }
+      pageEl.classList.remove("pdftion-hide-native-ink-layer");
+    }
+  }
 
-    this.restoreHiddenNativeInkAnnotations(activePages);
+  // Hand back anything that is still hidden while its page is not covered.
+  // Elements are re-created whenever the viewer repaints an annotation layer, so
+  // a stale hidden reference is exactly what produced "leftover" doodles.
+  private revealUncoveredNativeInk(coveredPages: Set<number>): void {
+    for (const [element, snapshot] of Array.from(this.hiddenNativeAnnotationStyles)) {
+      const pageEl = element.closest(".page");
+      const raw = pageEl?.getAttribute("data-page-number");
+      const pageNumber = raw ? Number.parseInt(raw, 10) : Number.NaN;
+      const pageIndex = Number.isFinite(pageNumber) ? pageNumber - 1 : null;
+      if (pageIndex !== null && coveredPages.has(pageIndex) && element.isConnected) {
+        continue;
+      }
+      if (element.isConnected) {
+        this.restoreHiddenNativeAnnotationElement(element, snapshot);
+      }
+      this.hiddenNativeAnnotationStyles.delete(element);
+    }
+  }
+
+  private startInkCoverRefresh(): void {
+    this.stopInkCoverRefresh();
+    this.inkCoverTimer = window.setInterval(() => {
+      if (!this.enabled || this.destroyed || this.isInteracting()) {
+        return;
+      }
+      this.updateExternalInkLayerState();
+    }, INK_COVER_REFRESH_MS);
+  }
+
+  private stopInkCoverRefresh(): void {
+    if (this.inkCoverTimer !== null) {
+      window.clearInterval(this.inkCoverTimer);
+      this.inkCoverTimer = null;
+    }
   }
 
   private scheduleExternalInkLayerUpdate(): void {
@@ -12008,16 +12368,18 @@ function displayRectToUserRect(
   };
 }
 
-// Native ink that was only imported for editing is re-read from the PDF page by
-// page. Persisting those copies doubled the annotation state and could paint a
-// stale duplicate once a page had not been re-imported yet.
-function isStaleImportedNativeInk(element: InkElement): boolean {
+// A plain mirror of ink that still lives in the PDF is redundant: the page is
+// re-read from the file on demand. Those copies doubled the state file and
+// reappeared as ghosts after the ink had been changed elsewhere. Copies that
+// belong to a detached page are the only remaining copy, so they are kept.
+function isRedundantNativeInkMirror(element: InkElement, detachedPages: Set<number>): boolean {
   return (
     element.kind === "stroke" &&
     element.source === "external-ink" &&
     Array.isArray(element.pdfPoints) &&
     element.pdfSaved === true &&
-    element.externalDirty !== true
+    element.externalDirty !== true &&
+    !detachedPages.has(element.pageIndex)
   );
 }
 
@@ -12098,6 +12460,8 @@ function pdfJsInkAnnotationToStrokes(
   if (!Array.isArray(transform) || transform.length < 6 || viewWidth <= 0 || viewHeight <= 0) {
     return [];
   }
+  // pdf.js hands the paths over as typed arrays (Float32Array), not plain
+  // arrays; Array.isArray rejects them and every stroke silently disappeared.
   const lists = Array.isArray(annot.inkLists) ? annot.inkLists : [];
   if (lists.length === 0) {
     return [];
@@ -12111,13 +12475,14 @@ function pdfJsInkAnnotationToStrokes(
 
   const paths: InkPoint[][] = [];
   for (const path of lists) {
-    if (!Array.isArray(path)) {
+    if (!path || typeof (path as ArrayLike<number>).length !== "number") {
       continue;
     }
+    const values = path as ArrayLike<number>;
     const points: InkPoint[] = [];
-    for (let index = 0; index + 1 < path.length; index += 2) {
-      const x = Number(path[index]);
-      const y = Number(path[index + 1]);
+    for (let index = 0; index + 1 < values.length; index += 2) {
+      const x = Number(values[index]);
+      const y = Number(values[index + 1]);
       if (!Number.isFinite(x) || !Number.isFinite(y)) {
         continue;
       }
@@ -15715,13 +16080,13 @@ function drawSelectionGroup(
   ctx.globalAlpha = 1;
   ctx.lineCap = "butt";
   ctx.lineJoin = "miter";
-  ctx.strokeStyle = "rgba(28, 126, 214, 0.62)";
+  ctx.strokeStyle = "rgba(28, 126, 214, 0.72)";
   ctx.lineWidth = hairline;
   ctx.strokeRect(snap(x), snap(y), Math.max(0, Math.round(width * dpr) / dpr), Math.max(0, Math.round(height * dpr) / dpr));
 
   // Corner brackets instead of fat square handles: readable, still precise, and
   // they leave the selected content visible underneath.
-  const arm = clamp(Math.min(width, height) * 0.4, 7, 13);
+  const arm = clamp(Math.min(width, height) * 0.4, 8, 14);
   const corners: Array<{ dx: number; dy: number; x: number; y: number }> = [
     { dx: 1, dy: 1, x, y },
     { dx: -1, dy: 1, x: x + width, y },
@@ -15730,7 +16095,9 @@ function drawSelectionGroup(
   ];
   ctx.lineCap = "round";
   ctx.lineJoin = "round";
-  ctx.lineWidth = Math.max(1.4 * hairline, 1.6 * hairline);
+  // 2 device pixels: still a hairline on a 3x screen, but it reads as an
+  // intentional corner marker instead of a rendering artifact.
+  ctx.lineWidth = 2 * hairline;
   ctx.strokeStyle = "#1c7ed6";
   ctx.beginPath();
   for (const corner of corners) {

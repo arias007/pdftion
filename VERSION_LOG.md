@@ -1,66 +1,34 @@
-# Version log
+# Pdftion 版本日志
 
-## v0.5.5 — fast ink entry, finer selection frame
+## 0.5.6 — 2026-10-26 · ink-single-layer
 
-### Entering annotation mode no longer waits for the whole PDF
+治「进出编辑慢 / 涂鸦转换不了 / 有残留重叠」三个问题，改的是**判定模型**而不是打补丁。
 
-`0.5.4` parsed the file up to three times before the first stroke could be
-drawn (ink page index, stroke import, then the detach transaction that rewrites
-the file and reloads the view). On a 55 MB / 66-page PDF a single `pdf-lib`
-parse measures **4.3 s** on the phone, so the pen felt stuck — and the bigger the
-file, the worse it got.
+### 墨迹转换：一次读全，不再一页页猜
+- 之前：进入编辑按页扫、按页判「能不能用 CSS 藏」，还会触发整文件重写（55MB 要 2.5s 解析 + 写盘 + 重载视图）。
+- 现在：直接问 pdf.js 视图要全部页的 Ink 注释（`pdfViewer.pdfDocument.getPage(n).getAnnotations()`，实测 66 页 / 76 条 = 1.4s，首屏覆盖 118–325ms），一次性合并成可编辑笔迹。
+- 读出 `Float32Array` 而不是普通数组 —— 之前 `Array.isArray()` 判假，整份注释被静默丢弃，这就是「有些涂鸦直接不能转换」。
+- 一个 Ink 注释里的多条 `InkList` 路径现在拆成多条笔迹（之前会把提笔位置连成一条横穿页面的直线）。
+- 单击点保留为圆点；线宽读 `/BS /W`（原来读 `/Border`，标记笔被画成细线）。
 
-- Ink is now read from the pdf.js document the viewer already parsed
-  (`page.getAnnotations({ intent: "display" })`), which costs milliseconds and
-  still works for PDFs `pdf-lib` refuses to load.
-- Preparation is per page and lazy: only pages near the viewport are checked,
-  and each page is checked once. Scrolling pulls in one more page at a time.
-- The ink page index is cached on disk (`data/ink-page-index.json`) keyed by
-  path + mtime + size, so reopening a large PDF does no scan at all.
-- Ink-free files are ruled out by a byte-level token scan (~2 ms on 50 MB)
-  instead of a full parse; the previous string decode cost 1.1 s.
-- When the viewer renders annotations as DOM, the existing CSS hiding covers the
-  native ink, so the file is never rewritten or reloaded. The detach rewrite is
-  now the fallback for viewers without an annotation layer.
-- The detach transaction reuses the already parsed document instead of
-  invalidating and re-parsing it.
+### 隐藏：一条规则，双份/消失都不可能
+- 之前：整层隐藏（没转换完的也跟着消失 = 丢失），加上按元素几何判定（重渲染后留下看不见的隐藏节点 = 残留）。
+- 现在：逐页算「本页原生 Ink 条数」与「成功转换条数」。
+  - 全部转换 → 该页加 `pdftion-hide-native-ink-layer`，覆盖层才画这一页的副本。
+  - 有任何一条没转换 → 该页保持原生可见，覆盖层**不画**，绝不会出现两层。
+  - 页面必须**有覆盖层**才允许被隐藏，避免覆盖层销毁后墨迹凭空消失。
+- 每 900ms 重算一次覆盖状态，滚动到新页立刻建立单层；退出/重载后清理所有残留隐藏类。
 
-### Ink conversion is faithful
+### 不再阻塞的读取
+- `loadAnnotationState` 不再对整个 PDF 算 SHA-256（55MB ≈ 1.1s/次，进编辑就卡在这）。指纹校验挪到改写/烧录前真正需要它的地方。
+- 事务记录自愈：文件里仍有墨迹的页会从旧事务里剔除，避免「旧记录把这一页永久锁成不可转换」。
 
-- Every `InkList` path becomes its own stroke. Merging them into one polyline
-  drew a straight jump across the page wherever the pen was lifted — the
-  "can't be edited properly" case.
-- A single-tap annotation survives as a visible dot instead of being dropped.
-- Stroke width comes from `/BS /W` (the rendered width) instead of `/Border`,
-  which made imported marker strokes render as hairlines.
-- Imported native-ink copies are no longer persisted into the annotation state;
-  they are re-read from the page, which removes stale duplicates.
+### 选择框
+- 细线（1 物理像素、像素对齐）+ 四角 L 形角标，取代 1.8px 虚线 + 10px 白色方块手柄。
+- 原生文本编辑框边框 1.8px 虚线 → 1px 实线；角标命中半径 8px → 12px。
 
-### Selection frame
-
-- The frame is a 1-device-pixel hairline snapped to the pixel grid, drawn with
-  translucent blue, plus round corner brackets instead of a 1.8 px dash ring
-  and 10 px white handle squares.
-- Marquee selection follows the same treatment, and the native-text selection
-  box dropped its dash pattern and used the same hairline.
-- Corner hit radius widened from 8 px to 12 px so the brackets stay easy to grab
-  now that they are visually lighter.
-- The native text editor border is now a 1 px solid line instead of a 1.5-1.8 px
-  dashed box with an inner shadow.
-
-### Verification
-
-```
-npx tsc --noEmit                                   # clean
-npm run build && node --check main.js              # 2,604,713 bytes
-node --test tests/pdftion-contract.test.mjs        # 26/26 pass
-node bench/ink-conv.test.mjs                       # 17/17 pass
-```
-
-Measured on the phone (`bench/pdfbench.mjs`, `bench/gate2.mjs`):
-
-```
-55.4 MB / 66 pages   read 169 ms   token scan 2 ms   pdf-lib load 4,616 ms
-27.8 MB / 220 pages  read  43 ms   token scan 135 ms  pdf-lib load   42 ms
-17.9 MB /  1 page    read 143 ms   token scan 2 ms    pdf-lib load 2,711 ms
-```
+### 已验证（真机）
+- `批处理.pdf`（4.7MB / 42 页 / 10 页有墨迹）：首次覆盖 118ms，全页转换 6/6、2/2、1/1…，逐页检查 `bad=0`（无双层、无丢失），退出后隐藏页 0、墨迹全部恢复。
+- `高频常识速记…pdf`（55MB / 66 页 / 6 页墨迹 / 76 条注释）：首次覆盖 325ms，转换 76/76，逐页 `bad=0`，退出恢复正常。
+- 连续三轮进出：覆盖 141–246ms，退出后残留隐藏类 0。
+- `node --test tests/`：30 项全过；墨迹转换行为测试（含 TypedArray、旋转、多点拆条）：全过。

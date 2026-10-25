@@ -3610,6 +3610,11 @@ class InkSession {
   private staleTransactionPages = new Set<number>();
   private inkSweepToken = 0;
   private inkCoverTimer: number | null = null;
+  // Pages whose native canvas was repainted without annotations.
+  private blankedInkCanvases = new Set<number>();
+  private inkCanvasRepaintInFlight = new Set<number>();
+  private inkCanvasObservers = new Map<number, MutationObserver>();
+  private inkCoverDebounce: number | null = null;
   private prepareAllInkPromise: Promise<void> | null = null;
   private inkSweepFilePath = "";
   // Pages whose detach rewrite is still awaiting the native view reload: the
@@ -3729,6 +3734,7 @@ class InkSession {
       this.scheduleScanPages(90);
       this.scheduleEditableInkPrepare(180);
       this.scheduleVisibleOverlayRefresh();
+      this.scheduleInkCoverRefresh();
     }, {
       capture: true,
       passive: true,
@@ -4759,6 +4765,11 @@ class InkSession {
       this.nativeInkScannedPages.clear();
       this.pageInkUnknownAttempts.clear();
       this.inkSweepToken += 1;
+      this.stopInkCanvasObservers();
+      for (const pageIndex of Array.from(this.blankedInkCanvases)) {
+        this.restorePageCanvasInk(pageIndex);
+      }
+      this.blankedInkCanvases.clear();
       // Hand the native annotations back to the viewer: without this the page
       // keeps the hide class and its ink stays invisible after leaving edit
       // mode, which looks like leftover/ghost content.
@@ -4901,9 +4912,54 @@ class InkSession {
     return pages;
   }
 
+  // pdf.js replaces page nodes when it re-renders, which orphans the overlay we
+  // attached to the old node. Those stale entries used to be returned by
+  // getOverlayForPage, so cover/repaint decisions were made against a detached
+  // canvas and the real page kept its native ink.
+  private pruneDetachedOverlays(): void {
+    for (const [pageEl, overlay] of Array.from(this.overlays.entries())) {
+      if (pageEl.isConnected) {
+        continue;
+      }
+      overlay.abort.abort();
+      overlay.resizeObserver?.disconnect();
+      if (typeof overlay.geometryFrame === "number") {
+        window.cancelAnimationFrame(overlay.geometryFrame);
+      }
+      if (typeof overlay.redrawFrame === "number") {
+        window.cancelAnimationFrame(overlay.redrawFrame);
+      }
+      this.overlays.delete(pageEl);
+    }
+  }
+
+  // Attach an overlay to a live page element, on demand. Without this a page
+  // that the user scrolled to after a re-render never got an overlay, so its ink
+  // could not be converted or covered.
+  private ensureOverlayForPageElement(pageEl: HTMLElement): PageOverlay | null {
+    const raw = pageEl.getAttribute("data-page-number");
+    const pageNumber = raw ? Number.parseInt(raw, 10) : Number.NaN;
+    if (!Number.isFinite(pageNumber)) {
+      return null;
+    }
+    const pageIndex = pageNumber - 1;
+    const existing = this.overlays.get(pageEl);
+    if (existing) {
+      return existing;
+    }
+    const stale = this.getOverlayForPage(pageIndex);
+    if (stale) {
+      // Reuse the overlay record so its canvases are re-created on this node.
+      this.overlays.delete(stale.pageEl);
+      stale.abort.abort();
+    }
+    this.ensureOverlay(pageEl, pageIndex);
+    return this.overlays.get(pageEl) ?? null;
+  }
+
   private getOverlayForPage(pageIndex: number): PageOverlay | null {
     for (const overlay of this.overlays.values()) {
-      if (overlay.pageIndex === pageIndex) {
+      if (overlay.pageIndex === pageIndex && overlay.pageEl.isConnected) {
         return overlay;
       }
     }
@@ -11065,6 +11121,7 @@ class InkSession {
     //   anything left unconverted
     //     -> keep the native layer visible and do NOT draw a copy
     // That makes a double layer impossible by construction.
+    this.pruneDetachedOverlays();
     const fully = new Set<number>();
     for (const pageEl of Array.from(this.rootEl.querySelectorAll<HTMLElement>(".page"))) {
       const raw = pageEl.getAttribute("data-page-number");
@@ -11077,12 +11134,26 @@ class InkSession {
       const detached = this.detachedInkEditPages.has(pageIndex);
       const converted = this.convertedInkByPage.get(pageIndex);
       const convertedCount = converted?.count ?? 0;
-      const pageConverted = detached || (nativeCount > 0 && convertedCount >= nativeCount);
+      const drawnStrokes = this.strokeHistory.filter((stroke) => (
+        stroke.pageIndex === pageIndex && Array.isArray(stroke.pdfPoints)
+      )).length;
+      // Count what will actually be painted, not what was read: an annotation
+      // whose stroke got filtered out later must keep its native copy visible,
+      // otherwise the doodle silently disappears.
+      const pageConverted = detached || (
+        nativeCount > 0 && convertedCount >= nativeCount && drawnStrokes >= nativeCount
+      );
       // The page may only be hidden while an overlay exists to draw its copy.
       // Without this an overlay that is torn down (page scrolled away, view
       // reloaded) would leave the ink hidden and nothing on screen — the
       // "my doodles disappeared" case.
-      const overlay = this.getOverlayForPage(pageIndex);
+      // Bind to this exact node: pdf.js can replace a page element, and an
+      // index-based lookup then returns the orphaned overlay whose canvases are
+      // no longer on screen. That was why page 1 kept its native ink.
+      let overlay = this.overlays.get(pageEl) ?? null;
+      if (!overlay && this.enabled && pageConverted && this.isPageElementNearViewport(pageEl)) {
+        overlay = this.ensureOverlayForPageElement(pageEl);
+      }
       if (this.enabled && pageConverted && overlay) {
         pageEl.classList.add("pdftion-hide-native-ink-layer");
         fully.add(pageIndex);
@@ -11093,6 +11164,7 @@ class InkSession {
     this.nativeInkCoveredPages = fully;
     this.revealUncoveredNativeInk(fully);
     this.restoreHiddenNativeInkAnnotations(fully);
+    this.syncPageCanvasInkState(fully);
     // CSS-level sweep: an element-level hide can survive a plugin reload (the
     // class stays in the DOM while the bookkeeping map is gone), which made ink
     // invisible with nothing drawn on top. Clearing it here is idempotent.
@@ -11129,10 +11201,213 @@ class InkSession {
     }
   }
 
+  private inkPageCanvas(pageEl: HTMLElement): HTMLCanvasElement | null {
+    return pageEl.querySelector<HTMLCanvasElement>("canvas:not(.pdftion-canvas)");
+  }
+
+  // pdf.js on mobile paints annotations straight into the page canvas, not only
+  // into the annotation layer. Hiding the layer therefore left the original
+  // doodle fully visible under the editable copy. Re-rendering the page with
+  // annotations disabled and blitting it back is the only way to remove it
+  // without rewriting the PDF file.
+  private async repaintPageCanvas(pageIndex: number, drawAnnotations: boolean): Promise<boolean> {
+    const overlay = this.getOverlayForPage(pageIndex);
+    const pageEl = overlay?.pageEl ?? this.rootEl.querySelector<HTMLElement>(`.page[data-page-number="${pageIndex + 1}"]`);
+    const canvas = pageEl ? this.inkPageCanvas(pageEl) : null;
+    if (!canvas || canvas.width < 2 || canvas.height < 2) {
+      return false;
+    }
+    if (this.inkCanvasRepaintInFlight.has(pageIndex)) {
+      return false;
+    }
+    const documentProxy = this.getNativePdfDocumentProxy();
+    if (!documentProxy?.getPage) {
+      return false;
+    }
+    this.inkCanvasRepaintInFlight.add(pageIndex);
+    try {
+      const page = await documentProxy.getPage(pageIndex + 1);
+      if (!page?.render || !page.getViewport) {
+        return false;
+      }
+      const base = page.getViewport({ scale: 1 });
+      if (!base.width) {
+        return false;
+      }
+      const scale = canvas.width / base.width;
+      const viewport = page.getViewport({ scale });
+      const offscreen = activeDocument.createElement("canvas");
+      offscreen.width = Math.max(1, Math.round(viewport.width ?? 0));
+      offscreen.height = Math.max(1, Math.round(viewport.height ?? 0));
+      const offCtx = offscreen.getContext("2d");
+      if (!offCtx) {
+        return false;
+      }
+      offCtx.fillStyle = "#ffffff";
+      offCtx.fillRect(0, 0, offscreen.width, offscreen.height);
+      const task = page.render({
+        annotationMode: drawAnnotations ? 1 : 0,
+        canvasContext: offCtx,
+        viewport
+      } as unknown as Parameters<NonNullable<NativePdfPageLike["render"]>>[0]) as { promise?: Promise<unknown> } | undefined;
+      await (task?.promise ?? task);
+      const ctx = canvas.getContext("2d");
+      if (!ctx) {
+        return false;
+      }
+      ctx.save();
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(offscreen, 0, 0, canvas.width, canvas.height);
+      ctx.restore();
+      if (drawAnnotations) {
+        this.blankedInkCanvases.delete(pageIndex);
+      } else {
+        this.blankedInkCanvases.add(pageIndex);
+      }
+      return true;
+    } catch (error) {
+      console.debug("pdftion could not repaint the page canvas.", error);
+      return false;
+    } finally {
+      this.inkCanvasRepaintInFlight.delete(pageIndex);
+    }
+  }
+
+  // Cheap gate so the refresh loop does not re-render every 900 ms: only look
+  // again when the canvas still carries ink-coloured pixels inside the ink area.
+  private pageCanvasStillHasInk(pageIndex: number): boolean {
+    const overlay = this.getOverlayForPage(pageIndex);
+    const canvas = overlay ? this.inkPageCanvas(overlay.pageEl) : null;
+    if (!canvas || !overlay) {
+      return false;
+    }
+    const strokes = this.strokeHistory.filter((stroke) => (
+      stroke.pageIndex === pageIndex && Array.isArray(stroke.pdfPoints)
+    ));
+    const bounds = normalizedElementsBounds(strokes.map((stroke) => ({ ...stroke, points: stroke.pdfPoints ?? stroke.points })));
+    if (!bounds || canvas.width < 2 || canvas.height < 2) {
+      return false;
+    }
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
+    if (!ctx) {
+      return false;
+    }
+    const x = Math.max(0, Math.floor(bounds.minX * canvas.width));
+    const y = Math.max(0, Math.floor(bounds.minY * canvas.height));
+    const w = Math.max(1, Math.min(canvas.width - x, Math.ceil((bounds.maxX - bounds.minX) * canvas.width)));
+    const h = Math.max(1, Math.min(canvas.height - y, Math.ceil((bounds.maxY - bounds.minY) * canvas.height)));
+    try {
+      const data = ctx.getImageData(x, y, w, h).data;
+      const stride = Math.max(4, Math.floor(data.length / 24000 / 4) * 4);
+      let hits = 0;
+      for (let index = 0; index < data.length; index += stride) {
+        const r = data[index];
+        const g = data[index + 1];
+        const b = data[index + 2];
+        const isInkColour = (r > 70 && r - g > 30 && r - b > 30)
+          || (r < 90 && g < 90 && b < 110)
+          || (b > 120 && b - r > 40);
+        if (isInkColour) {
+          hits += 1;
+        }
+      }
+      // A page's own artwork can match the filter, so require a decent amount.
+      return hits > 40;
+    } catch {
+      return false;
+    }
+  }
+
+  private watchInkPageCanvas(pageIndex: number): void {
+    const overlay = this.getOverlayForPage(pageIndex);
+    const canvas = overlay ? this.inkPageCanvas(overlay.pageEl) : null;
+    if (!canvas || this.inkCanvasObservers.has(pageIndex)) {
+      return;
+    }
+    // pdf.js repaints a page canvas when it scrolls back into view or the zoom
+    // changes, which brings the native ink back. Watch for it instead of
+    // polling pixels.
+    const observer = new MutationObserver(() => {
+      if (!this.enabled || !this.nativeInkCoveredPages.has(pageIndex)) {
+        return;
+      }
+      window.setTimeout(() => {
+        if (this.enabled && this.nativeInkCoveredPages.has(pageIndex)) {
+          this.blankedInkCanvases.delete(pageIndex);
+          void this.repaintPageCanvas(pageIndex, false);
+        }
+      }, 120);
+    });
+    observer.observe(canvas, { attributeFilter: ["width", "height", "style"], attributes: true });
+    this.inkCanvasObservers.set(pageIndex, observer);
+  }
+
+  private stopInkCanvasObservers(): void {
+    for (const observer of this.inkCanvasObservers.values()) {
+      observer.disconnect();
+    }
+    this.inkCanvasObservers.clear();
+  }
+
+  private restorePageCanvasInk(pageIndex: number): void {
+    const pageEl = this.getOverlayForPage(pageIndex)?.pageEl
+      ?? this.rootEl.querySelector<HTMLElement>(`.page[data-page-number="${pageIndex + 1}"]`);
+    if (!pageEl) {
+      this.blankedInkCanvases.delete(pageIndex);
+      return;
+    }
+    // Put the page back exactly as the viewer had it (annotations drawn again)
+    // so leaving edit mode never changes how the document looks.
+    this.blankedInkCanvases.delete(pageIndex);
+    void this.repaintPageCanvas(pageIndex, true);
+  }
+
+  private syncPageCanvasInkState(coveredPages: Set<number>): void {
+    for (const pageIndex of Array.from(this.blankedInkCanvases)) {
+      if (!coveredPages.has(pageIndex) || !this.enabled) {
+        this.restorePageCanvasInk(pageIndex);
+      }
+    }
+    for (const pageIndex of coveredPages) {
+      this.watchInkPageCanvas(pageIndex);
+      if (this.blankedInkCanvases.has(pageIndex)) {
+        if (this.pageCanvasStillHasInk(pageIndex)) {
+          this.blankedInkCanvases.delete(pageIndex);
+          void this.repaintPageCanvas(pageIndex, false);
+        }
+        continue;
+      }
+      if (this.inkCanvasRepaintInFlight.has(pageIndex)) {
+        continue;
+      }
+      void this.repaintPageCanvas(pageIndex, false);
+    }
+  }
+
+  // Right after a scroll settles, re-derive the cover state once: pdf.js paints a
+  // page when it scrolls into view, which re-draws the native ink onto the page
+  // canvas until the next tick of the periodic refresh (~900 ms of double ink).
+  private scheduleInkCoverRefresh(): void {
+    if (this.inkCoverDebounce !== null) {
+      window.clearTimeout(this.inkCoverDebounce);
+    }
+    this.inkCoverDebounce = window.setTimeout(() => {
+      this.inkCoverDebounce = null;
+      if (!this.enabled || this.destroyed) {
+        return;
+      }
+      this.updateExternalInkLayerState();
+    }, 160);
+  }
+
   private startInkCoverRefresh(): void {
     this.stopInkCoverRefresh();
     this.inkCoverTimer = window.setInterval(() => {
-      if (!this.enabled || this.destroyed || this.isInteracting()) {
+      // Only an in-progress stroke may skip the refresh: scrolling used to skip
+      // it too, so a page that the viewer re-rendered while scrolling kept its
+      // native ink until the user stopped moving for a while.
+      if (!this.enabled || this.destroyed || this.currentStroke !== null || this.selectionDrag !== null) {
         return;
       }
       this.updateExternalInkLayerState();

@@ -721,7 +721,11 @@ test("native ink is hidden per page only when every annotation converted", async
   // One deterministic rule instead of geometric guessing: a page is covered only
   // when all of its native Ink annotations became editable strokes.
   assert.match(source, /private convertedInkByPage = new Map<number, \{ count: number; ids: Set<string> \}>\(\)/);
-  assert.match(updateSource, /const pageConverted = detached \|\| \(nativeCount > 0 && convertedCount >= nativeCount\)/);
+  assert.match(updateSource, /const drawnStrokes = this\.strokeHistory\.filter\(\(stroke\) => \(/);
+  assert.match(updateSource, /nativeCount > 0 && convertedCount >= nativeCount && drawnStrokes >= nativeCount/);
+  assert.match(source, /private watchInkPageCanvas\(pageIndex: number\): void/);
+  assert.match(source, /private async repaintPageCanvas\(pageIndex: number, drawAnnotations: boolean\): Promise<boolean>/);
+  assert.match(source, /annotationMode: drawAnnotations \? 1 : 0/);
   assert.match(updateSource, /pageEl\.classList\.add\("pdftion-hide-native-ink-layer"\)/);
   assert.match(updateSource, /pageEl\.classList\.remove\("pdftion-hide-native-ink-layer"\)/);
   // Pages are enumerated from the DOM, not from the overlay map, so ink is

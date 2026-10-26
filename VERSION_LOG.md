@@ -1,5 +1,63 @@
 # VERSION LOG
 
+## 0.6.2 — 2026-10-26
+
+Same enter flow as 0.6.1 (detach, no special case). What changes is how much work
+that flow does.
+
+### Leaving edit mode: 4.9 s → 15–45 ms on an unchanged document
+
+`finishInkEditTransaction` already compared the overlay against the enter-time
+baseline, but on a file with no earlier annotation state there was no baseline to
+compare against, so every exit fell through to a full rewrite: parse, save,
+write, then verify by parsing again. Now the baseline is written at enter time
+even when no state file existed, so an untouched session is answered by restoring
+the recorded bytes — a sequential 1:1 copy.
+
+| file | exit before | exit after | parses before | parses after |
+| --- | --- | --- | --- | --- |
+| 6.1 MB / 42 pages | 1 825 ms | 43 ms | 2 | 0 |
+| 18.7 MB / 1 page | 4 862 ms | 15 ms | 2 | 0 |
+| 58.6 MB / 66 pages | 9 966 ms | 227 ms | 2 | 0 |
+
+A restore also keeps the document byte-identical, so the ink count stays exactly
+as it was (30/30 on the probe file — the rewrite path merged a duplicate legacy
+annotation and produced 29).
+
+### The read-back verification no longer blocks leaving
+
+It re-parses the whole document, so it now runs after the spinner stops. If it
+fails, the pre-edit state is restored and a notice is shown.
+
+### Entering edit mode
+
+- The verified annotation side-car already lists every ink annotation in the
+  exact file (it is rejected when the fingerprint stops matching), so the import
+  parse is skipped when it is available.
+- The bytes and the parse already in hand are reused instead of reading the
+  document a second time: 2 reads of 59 MB before, 1 now.
+- A detach computed for the same bytes is remembered and replayed, turning a
+  parse + save into a file copy. Capped at 32 MB, because holding the extra copy
+  is exactly the wrong thing when the renderer is about to allocate another one.
+- The detach cache stores a hash of the source bytes, not the bytes: identity
+  does not cost a second copy of the document.
+
+### Crash mitigation for large documents
+
+`PDFDocument.load` on the 58.6 MB / 66 page probe file takes 5.2–8.2 s and leaves
+330 MB of RSS (140 MB JS heap) behind; the detach save peaks at 390 MB. Reloading
+the native view immediately afterwards asks pdf.js to read the same 59 MB again,
+and that second allocation is what took the renderer down. A collector yield now
+sits between them — 260 ms normally, 700 ms when the JS heap is already past 55%
+of its limit.
+
+### Tests
+
+`tests/fast-exit.test.mjs` pins the unchanged-exit fast path, the baseline
+requirement, the detach replay, the hash-based identity and the 32 MB cap. Full
+suite: 46 passing. `tests/ink-roundtrip.mjs` on 6.1 MB / 18.7 MB: ink stable over
+three cycles with exits in 15–43 ms.
+
 ## 0.6.1 — 2026-10-26
 
 Reverts the 0.6.0 lazy detach on the enter path (it could not enter edit mode on

@@ -510,10 +510,10 @@ test("editing overlays does not detach the source PDF and guarded ink writes res
   );
 
   assert.match(source, /data\/ink-edit-transactions/);
-  assert.match(source, /beginInkEditTransaction\(file: TFile, pageIndexes: Set<number>\): Promise<boolean>/);
+  assert.match(source, /beginInkEditTransaction\(\s*file: TFile,\s*pageIndexes: Set<number>,\s*baselineElements\?: InkElement\[\]\s*\): Promise<boolean>/);
   assert.match(source, /async getPdfInkPageIndexes\(file: TFile\): Promise<Set<number>>/);
-  assert.match(source, /const transactionPages = normalizedPages\.filter\(\(pageIndex\) => pageIndex < pdf\.getPageCount\(\)\)/);
-  assert.match(source, /removeAllInkAnnotationsOnPages\(pdf, new Set\(transactionPages\)\)/);
+  assert.match(source, /const transactionPages = normalizedPages\.filter\(\(pageIndex\) => pageIndex < pageCount\)/);
+  assert.match(source, /removeAllInkAnnotationsOnPages\(pdf!, new Set\(transactionPages\)\)/);
   assert.match(source, /backupAnnotationStatePath/);
   assert.match(source, /completeInkEditTransaction\(\s*file: TFile,\s*elements: InkElement\[\],\s*pageIndexes: Set<number>,\s*hooks\?: InkCommitHooks\s*\)/);
   assert.match(source, /finishInkEditTransaction\(\s*file: TFile,\s*elements: InkElement\[\],\s*pageIndexes: Set<number>,\s*hooks\?: InkCommitHooks\s*\)/);
@@ -522,7 +522,7 @@ test("editing overlays does not detach the source PDF and guarded ink writes res
   assert.match(source, /Ink verification failed/);
   assert.match(source, /recoverPendingInkEditTransactions\(\)/);
   assert.match(prepareSource, /await this\.importPdfInkForPages\(pageIndexes\)/);
-  assert.match(prepareSource, /await this\.plugin\.beginInkEditTransaction\(this\.file, pageIndexes\)/);
+  assert.match(prepareSource, /await this\.plugin\.beginInkEditTransaction\(\s*this\.file,\s*pageIndexes,/);
   assert.match(prepareSource, /this\.detachedInkEditPages\.add\(pageIndex\)/);
   assert.match(prepareSource, /await this\.reloadNativePdfView\(\)/);
   assert.match(prepareSource, /Array\.isArray\(stroke\.pdfPoints\)/);
@@ -562,8 +562,8 @@ test("PDF ink preparation detaches every ink page once and does not reload on re
   );
   assert.match(prepareSource, /if \(this\.pdfInkPreparationComplete\)/);
   assert.match(prepareSource, /const pageIndexes = await this\.plugin\.getPdfInkPageIndexes\(this\.file\)/);
-  assert.match(overlayPrepareSource, /const detachedNow = await this\.plugin\.beginInkEditTransaction\(this\.file, pageIndexes\)/);
-  assert.match(overlayPrepareSource, /if \(detachedNow\) \{\s*await this\.reloadNativePdfView\(\);/);
+  assert.match(overlayPrepareSource, /const detachedNow = await this\.plugin\.beginInkEditTransaction\(\s*this\.file,\s*pageIndexes,/);
+  assert.match(overlayPrepareSource, /if \(detachedNow\) \{[\s\S]{0,600}await this\.reloadNativePdfView\(\);/);
   assert.doesNotMatch(overlayPrepareSource, /await this\.reloadNativePdfView\(\);\s*for \(const pageIndex of pageIndexes\)/);
 });
 

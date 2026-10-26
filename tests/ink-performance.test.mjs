@@ -9,15 +9,18 @@ const slice = (start, end) => source.slice(source.indexOf(start), source.indexOf
 
 test("entering edit mode reuses one parsed document instead of re-parsing", () => {
   const beginSource = slice(
-    "async beginInkEditTransaction(file: TFile, pageIndexes: Set<number>)",
+    "async beginInkEditTransaction(",
     "async completeInkEditTransaction("
   );
-  assert.match(beginSource, /getPdfReadCache\(file\)/, "the transaction must reuse the shared parse");
+  // Reuse whatever parse is already in hand instead of loading the document a
+  // second time; only a cold document is parsed here.
+  assert.match(beginSource, /const reuse = known &&/, "the transaction reuses the shared parse");
+  assert.match(beginSource, /reuse \? known!\.pdf : await PDFDocument\.load/, "a cold document is parsed at most once");
+  const newTransaction = beginSource.slice(beginSource.indexOf("const known = this.pdfReadCache"));
   assert.ok(
-    beginSource.indexOf("getPdfReadCache(file)") < beginSource.indexOf("invalidatePdfReadCache(file)"),
+    newTransaction.indexOf("const reuse = known &&") < newTransaction.indexOf("modifyBinary"),
     "the cache must not be thrown away before the write"
   );
-  assert.doesNotMatch(beginSource, /PDFDocument\.load/, "no second full parse before the reload");
   // A mutated document must never re-enter the cache (the previous attempt did
   // exactly that and corrupted the commit path).
   assert.match(beginSource, /invalidatePdfReadCache\(file\)/);

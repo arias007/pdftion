@@ -152,7 +152,7 @@ for (let cycle = 1; cycle <= 3; cycle += 1) {
   const pages = inkPages.size > 0 ? inkPages : new Set([0]);
   let enterError = null;
   try {
-    await plugin.beginInkEditTransaction(file, pages);
+    await plugin.beginInkEditTransaction(file, pages, strokes);
   } catch (error) {
     enterError = error;
   }

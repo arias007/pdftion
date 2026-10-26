@@ -6,3 +6,10 @@ yarn-error.log*
 tests/.bench-plugin-*.cjs
 tests/.geometry-probe.cjs
 tests/.probe-plugin.cjs
+tests/.crash-plugin.cjs
+tests/.noloss-plugin.cjs
+tests/.prof-plugin.cjs
+tests/.appearance-plugin.cjs
+tests/.repair-plugin.cjs
+tests/.seed-plugin.cjs
+src/.probe-seed.ts

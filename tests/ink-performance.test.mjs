@@ -15,7 +15,8 @@ test("entering edit mode reuses one parsed document instead of re-parsing", () =
   // Reuse whatever parse is already in hand instead of loading the document a
   // second time; only a cold document is parsed here.
   assert.match(beginSource, /const reuse = known &&/, "the transaction reuses the shared parse");
-  assert.match(beginSource, /reuse \? known!\.pdf : await PDFDocument\.load/, "a cold document is parsed at most once");
+  assert.match(beginSource, /reuse && known \? known\.pdf : await PDFDocument\.load/, "a cold document is parsed at most once");
+  assert.match(beginSource, /this\.knownSha256For\(file\)/, "the fingerprint cache decides whether the bytes are read");
   const newTransaction = beginSource.slice(beginSource.indexOf("const known = this.pdfReadCache"));
   assert.ok(
     newTransaction.indexOf("const reuse = known &&") < newTransaction.indexOf("modifyBinary"),
@@ -46,11 +47,15 @@ test("leaving edit mode starts the reload before the read-back verification", ()
   const hookIndex = commitSource.indexOf("hooks?.onBytesWritten?.()");
   assert.ok(writeIndex > 0, "bytes are written");
   assert.ok(hookIndex > writeIndex, "the reload is requested right after the write");
-  assert.doesNotMatch(
-    commitSource.slice(0, hookIndex),
-    /PDFDocument\.load/,
-    "no full parse may run before the reload is requested"
-  );
+  // The commit reuses the parsed detached copy; the only document it may load is a
+  // fallback for a missing ink snapshot, never a second copy of the whole file on
+  // the normal path.
+  // The commit parses exactly one document: the pre-edit backup. Building it from
+  // the detached copy both lost unknown annotations and re-authored untouched ones.
+  assert.match(commitSource, /const baseBytes = await this\.app\.vault\.adapter\.readBinary\(record\.backupPdfPath\)/);
+  assert.equal((commitSource.match(/PDFDocument\.load\(/g) ?? []).length, 1);
+  assert.match(commitSource, /planInkPageCommit\(pdf, pagesToCommit, strokes, erasedIds, erasedPages\)/,
+    "only annotations that actually changed are rewritten");
   const verifySource = slice("private verifyCommittedInkPages(", "async rollbackInkEditTransaction(");
   assert.match(verifySource, /await hooks\.waitForRender\(\)/, "verification waits for the reloaded view");
   assert.doesNotMatch(commitSource.slice(hookIndex), /await result\.verified|await this\.verifyCommittedInkPages/, "the commit must not block on verification");

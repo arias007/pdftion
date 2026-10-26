@@ -34,7 +34,7 @@ test("the spinner covers the annotation-state load and is delayed so it does not
 test("entering edit mode still detaches the ink pages (0.5.9 behaviour)", () => {
   const overlaySource = slice("private async preparePdfInkOverlayForEditing", "private async commitDetachedInkPages");
   assert.match(overlaySource, /beginInkEditTransaction\(\s*this\.file,\s*pageIndexes,/, "enter detaches, as in 0.5.9");
-  assert.match(overlaySource, /reloadNativePdfView/);
+  assert.match(overlaySource, /startBackgroundViewReload/, "the view reload still happens, just after the spinner");
   assert.doesNotMatch(overlaySource, /pendingInkDetachPages/, "lazy detach was reverted");
   assert.doesNotMatch(source, /scheduleInkDetach|runPendingInkDetach/, "no lazy-detach machinery left behind");
 });

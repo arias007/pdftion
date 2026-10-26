@@ -524,11 +524,11 @@ test("editing overlays does not detach the source PDF and guarded ink writes res
   assert.match(prepareSource, /await this\.importPdfInkForPages\(pageIndexes\)/);
   assert.match(prepareSource, /await this\.plugin\.beginInkEditTransaction\(\s*this\.file,\s*pageIndexes,/);
   assert.match(prepareSource, /this\.detachedInkEditPages\.add\(pageIndex\)/);
-  assert.match(prepareSource, /await this\.reloadNativePdfView\(\)/);
+  assert.match(prepareSource, /this\.startBackgroundViewReload\(\)|await this\.reloadNativePdfView\(\)/);
   assert.match(prepareSource, /Array\.isArray\(stroke\.pdfPoints\)/);
   assert.doesNotMatch(prepareSource, /commitDetachedInkPages|modifyBinary|saveEditableAnnotationState/);
   assert.match(recoverySource, /await this\.restoreInkEditTransaction\(file, record, true\)/);
-  assert.match(recoverySource, /await this\.saveEditableAnnotationState\(file, elements, restoredBytes\)/);
+  assert.match(recoverySource, /saveEditableAnnotationState\(file, elements, restoredBytes, \{ allowEmpty: true \}\)/);
   assert.doesNotMatch(recoverySource, /finishInkEditTransaction/);
   assert.match(autoSaveSource, /if \(this\.enabled\) \{[\s\S]*?checkpointEditableState\(\)/);
   assert.match(saveSource, /if \(hasInkPdfChange\) \{/);
@@ -563,7 +563,13 @@ test("PDF ink preparation detaches every ink page once and does not reload on re
   assert.match(prepareSource, /if \(this\.pdfInkPreparationComplete\)/);
   assert.match(prepareSource, /await this\.plugin\.getPdfInkPageIndexes\(this\.file\)/, 'the parse is still the fallback');
   assert.match(overlayPrepareSource, /const detachedNow = await this\.plugin\.beginInkEditTransaction\(\s*this\.file,\s*pageIndexes,/);
-  assert.match(overlayPrepareSource, /if \(detachedNow\) \{[\s\S]{0,600}await this\.reloadNativePdfView\(\);/);
+  assert.match(overlayPrepareSource, /if \(detachedNow\) \{[\s\S]{0,1600}(this\.startBackgroundViewReload\(\)|await this\.reloadNativePdfView\(\))/);
+  // A replayed detach parses nothing, so it skips the long collector window.
+  const reloadSource = source.slice(
+    source.indexOf("private startBackgroundViewReload"),
+    source.indexOf("private async reloadNativePdfView")
+  );
+  assert.match(reloadSource, /this\.plugin\.lastDetachParsed[\s\S]{0,160}collectorPressureDelayMs/);
   assert.doesNotMatch(overlayPrepareSource, /await this\.reloadNativePdfView\(\);\s*for \(const pageIndex of pageIndexes\)/);
 });
 

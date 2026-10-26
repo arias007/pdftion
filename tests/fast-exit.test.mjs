@@ -39,17 +39,21 @@ test("the detach can be replayed without parsing the document again", () => {
     beginSource.indexOf("findDetachedBytes(file, currentBytes") < beginSource.indexOf("PDFDocument.load(currentBytes"),
     "the replay is consulted before any parse"
   );
-  assert.match(beginSource, /const replay = await this\.findDetachedBytes/, "the replay result decides the path");
+  assert.match(beginSource, /const replay = replayHit;/, "the replay result decides the path");
   assert.match(beginSource, /currentBytes = null;/, "the pre-detach bytes are released before the save allocates");
-  assert.match(beginSource, /const sourceSha256 = replay \? null : await sha256Hex\(currentBytes\)/,
-    "identity is hashed while the bytes are still in hand, not read back later");
+  // Identity comes from the fingerprint cache when it already covers these bytes,
+  // so validating a replay costs no hash at all on a second enter.
+  assert.match(beginSource, /const knownSha256 = this\.knownSha256For\(file\)/,
+    "the fingerprint cache is consulted before hashing anything");
+  assert.match(beginSource, /replay\?\.sha256 \?\? knownSha256/,
+    "the source hash is reused instead of recomputed");
 });
 
 test("bytes already in hand are reused instead of reading the document again", () => {
   const beginSource = slice("async beginInkEditTransaction(", "private rememberDetachedBytes");
   assert.match(beginSource, /const reuse = known && known\.path === file\.path/);
-  assert.match(beginSource, /reuse \? known!\.bytes : await this\.app\.vault\.readBinary\(file\)/);
-  assert.match(beginSource, /reuse \? known!\.pdf : await PDFDocument\.load\(currentBytes/);
+  assert.match(beginSource, /reuse && known \? known\.bytes : null/, "the bytes in hand are reused, not re-read");
+  assert.match(beginSource, /reuse && known \? known\.pdf : await PDFDocument\.load\(currentBytes/);
   // The expand-transaction branch may still ask the cache (it hits), but the new
   // transaction path must go through the reuse check above.
   const newTransaction = beginSource.slice(beginSource.indexOf("const known = this.pdfReadCache"));
@@ -63,12 +67,21 @@ test("a verified annotation side-car lets enter skip the import parse", () => {
 });
 
 test("the reload is preceded by a collector-friendly yield that grows under heap pressure", () => {
-  const prepareSource = slice("private async preparePdfInkOverlayForEditing", "private async commitDetachedInkPages");
-  assert.match(prepareSource, /await yieldForCollector\(collectorPressureDelayMs\(this\.file\.stat\?\.size \?\? 0\)\)/);
+  // The reload is display handoff now, so the collector window moved with it.
+  const reloadSource = slice("private startBackgroundViewReload", "private async reloadNativePdfView");
+  assert.match(reloadSource, /collectorPressureDelayMs\(this\.file\.stat\?\.size \?\? 0\)/);
+  assert.match(reloadSource, /await yieldForCollector\(wait\)/);
   assert.ok(
-    prepareSource.indexOf("yieldForCollector") < prepareSource.indexOf("await this.reloadNativePdfView()"),
+    reloadSource.indexOf("yieldForCollector") < reloadSource.indexOf("await this\.reloadNativePdfView()"),
     "the yield happens before the reload"
   );
+  // A small document reloads in the background so the spinner can go; a large one
+  // keeps the reload inside the spinner, because pdf.js allocating a second copy of
+  // a 59 MB file while the user already draws is what kills the renderer.
+  const prepareSource = slice("private async preparePdfInkOverlayForEditing", "private async commitDetachedInkPages");
+  assert.match(prepareSource, /this\.startBackgroundViewReload\(\)/);
+  assert.match(prepareSource, />= LARGE_DOCUMENT_BYTES[\s\S]{0,600}await this\.reloadNativePdfView\(\);/,
+    "a big document still waits for the reload");
   assert.match(source, /function collectorPressureDelayMs\(documentBytes = 0\): number/);
   assert.match(source, /usedJSHeapSize \/ used\.jsHeapSizeLimit > 0\.55 \? 700 : 260/);
   // A big document always gets the long window: its reload doubles an already
@@ -99,7 +112,8 @@ test("a detach computed once is replayed from disk and pruned to one entry", () 
     "the cache is written before the transaction returns, i.e. before the caller reloads the view"
   );
   const cache = slice("private async findDetachedBytesOnDisk", "private async findDetachedBytes(");
-  assert.match(cache, /sha256Hex\(currentBytes\) !== meta\.sourceSha256/, "the replay is invalidated by any outside edit");
+  assert.match(cache, /knownSha256 === sourceSha256/, "a known hash validates the replay without hashing");
+  assert.match(cache, /await sha256Hex\(currentBytes\) === sourceSha256/, "the replay is invalidated by any outside edit");
   assert.match(cache, /cachedPages\.length !== pageIndexes\.length/, "the replay must match the detached page set");
   const prune = slice("private async pruneDetachedCaches", "private async findDetachedBytesOnDisk");
   assert.match(prune, /endsWith\("\.detached\.pdf"\)/, "stale replay files are pruned");

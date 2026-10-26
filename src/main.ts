@@ -49,6 +49,10 @@ const INK_AUTO_GROUP_GAP_PX = 28;
 const INK_AUTO_GROUP_WINDOW_MS = 3500;
 const NATIVE_POPUP_SUPPRESS_MS = 650;
 const STROKE_FAST_SAVE_DELAY_MS = 180;
+// How long the editable-ink preparation keeps retrying while a conversion holds
+// the session, and how often it retries.
+const EDITABLE_INK_PREPARE_MAX_WAIT_MS = 30_000;
+const EDITABLE_INK_PREPARE_RETRY_MS = 180;
 const STROKE_MIN_POINT_DISTANCE_PX = 0.35;
 const STROKE_INTERPOLATION_STEP_PX = 0.75;
 const VISUAL_EXPORT_PAGE_GAP_RATIO = 0.025;
@@ -1683,12 +1687,33 @@ interface PdfInkEditTransactionRecord {
   version: 1;
 }
 
+interface InkCommitHooks {
+  // Called as soon as the committed bytes are on disk, so the native PDF view
+  // can start reloading before the read-back verification parses the file again.
+  onBytesWritten?: () => void;
+  // Resolves once the reloaded view has painted; verification waits for it so the
+  // second full parse does not fight the render.
+  waitForRender?: () => Promise<void>;
+}
+
+interface InkCommitResult {
+  committed: boolean;
+  verified: Promise<boolean>;
+}
+
+const INK_COMMIT_NOTHING: InkCommitResult = { committed: true, verified: Promise.resolve(true) };
+
 interface PdfReadCacheEntry {
   bytes: ArrayBuffer;
   mtime: number;
   path: string;
   pdf: PDFDocument;
   size: number;
+}
+
+interface PdfReadCacheLoading {
+  path: string;
+  promise: Promise<PdfReadCacheEntry>;
 }
 
 interface PdfFingerprintCacheEntry {
@@ -1703,9 +1728,10 @@ export default class PdftionPlugin extends Plugin {
   private dataMaintenancePending = false;
   private dataMaintenanceRunning = false;
   private dataMaintenanceTimer: number | null = null;
-  private inkCommitPromises = new Map<string, Promise<boolean>>();
+  private inkCommitPromises = new Map<string, Promise<InkCommitResult>>();
   private missingPdfSurfaces = new Map<HTMLElement, number>();
   private pdfReadCache: PdfReadCacheEntry | null = null;
+  private pdfReadCacheLoading: PdfReadCacheLoading | null = null;
   private pdfFingerprintCache: PdfFingerprintCacheEntry | null = null;
   private sessions = new Map<HTMLElement, InkSession>();
   private surfaceScanTimers: number[] = [];
@@ -1714,23 +1740,68 @@ export default class PdftionPlugin extends Plugin {
   // Reusing one parsed PDFDocument for read-only inspection removes the two
   // extra full parses per ink-edit toggle (enter used to parse the file three
   // times: page index scan, stroke import, then the detach transaction).
-  private async getPdfReadCache(file: TFile): Promise<PdfReadCacheEntry> {
+  // Shared with InkSession through the plugin instance: one parse per document.
+  async getPdfReadCache(file: TFile): Promise<PdfReadCacheEntry> {
     const stat = file.stat;
     const cached = this.pdfReadCache;
-    if (cached && cached.path === file.path && cached.mtime === stat.mtime && cached.size === stat.size) {
-      return cached;
+    if (cached && cached.path === file.path) {
+      if (cached.mtime === stat.mtime && cached.size === stat.size) {
+        return cached;
+      }
+      // The vault's stat lags behind this plugin's own writes, and the byte
+      // length changes whenever ink annotations are detached or committed, so
+      // neither mtime nor size can be trusted as an invalidation signal.
+      // Comparing the bytes costs ~20 ms on a 20 MB file; parsing it again
+      // costs ~2 s, and that extra parse on every enter/exit cycle is what made
+      // entering edit mode feel like it never happened on big documents.
+      const currentBytes = await this.app.vault.readBinary(file);
+      if (arrayBuffersEqual(currentBytes, cached.bytes)) {
+        cached.bytes = currentBytes;
+        cached.mtime = stat.mtime;
+        cached.size = currentBytes.byteLength;
+        return cached;
+      }
     }
-    const bytes = await this.app.vault.readBinary(file);
-    const pdf = await PDFDocument.load(bytes, { ignoreEncryption: true, updateMetadata: false });
-    const entry: PdfReadCacheEntry = { bytes, mtime: stat.mtime, path: file.path, pdf, size: stat.size };
-    this.pdfReadCache = entry;
-    return entry;
+    const pending = this.pdfReadCacheLoading;
+    if (pending && pending.path === file.path) {
+      return pending.promise;
+    }
+    // One parse per document, even when several callers ask at once (entering
+    // edit mode schedules the ink preparation three times for late mounting
+    // pages; without this every one of them parsed the whole file again).
+    const loading: PdfReadCacheLoading = {
+      path: file.path,
+      promise: (async () => {
+        const bytes = await this.app.vault.readBinary(file);
+        const pdf = await PDFDocument.load(bytes, { ignoreEncryption: true, updateMetadata: false });
+        const entry: PdfReadCacheEntry = { bytes, mtime: file.stat.mtime, path: file.path, pdf, size: bytes.byteLength };
+        this.pdfReadCache = entry;
+        return entry;
+      })()
+    };
+    this.pdfReadCacheLoading = loading;
+    try {
+      return await loading.promise;
+    } finally {
+      if (this.pdfReadCacheLoading === loading) {
+        this.pdfReadCacheLoading = null;
+      }
+    }
   }
 
-  private invalidatePdfReadCache(file?: TFile): void {
+  invalidatePdfReadCache(file?: TFile): void {
     if (!file || this.pdfReadCache?.path === file.path) {
       this.pdfReadCache = null;
     }
+    this.invalidatePdfInkPageIndexes(file);
+  }
+
+  private invalidatePdfInkPageIndexes(file?: TFile): void {
+    if (!file) {
+      this.pdfInkPageIndexCache.clear();
+      return;
+    }
+    this.pdfInkPageIndexCache.delete(file.path);
   }
 
   // Checkpointing fingerprints the current PDF on every stroke pause. Keying on
@@ -2531,8 +2602,10 @@ export default class PdftionPlugin extends Plugin {
   }
 
   async beginInkEditTransaction(file: TFile, pageIndexes: Set<number>): Promise<boolean> {
-    // The transaction rewrites the file; force a fresh parse for the mutation.
-    this.invalidatePdfReadCache(file);
+    // The transaction rewrites the file. The parsed document is reused for that
+    // rewrite (one parse per document instead of one per phase): parsing a
+    // 20 MB PDF takes ~2.3 s on this device and used to run twice before the
+    // native view was even asked to reload.
     const normalizedPages = Array.from(pageIndexes)
       .filter((pageIndex) => Number.isInteger(pageIndex) && pageIndex >= 0)
       .sort((a, b) => a - b);
@@ -2548,8 +2621,7 @@ export default class PdftionPlugin extends Plugin {
       if (additionalPages.length === 0) {
         return false;
       }
-      const currentBytes = await this.app.vault.readBinary(file);
-      const pdf = await PDFDocument.load(currentBytes, { ignoreEncryption: true, updateMetadata: false });
+      const { bytes: currentBytes, pdf } = await this.getPdfReadCache(file);
       const validAdditionalPages = additionalPages.filter((pageIndex) => pageIndex < pdf.getPageCount());
       if (validAdditionalPages.length === 0) {
         return false;
@@ -2565,8 +2637,13 @@ export default class PdftionPlugin extends Plugin {
         const detachedBytes = new ArrayBuffer(saved.byteLength);
         new Uint8Array(detachedBytes).set(saved);
         await this.app.vault.modifyBinary(file, detachedBytes);
+        // The mutated document must never be handed out again: pdf-lib pages
+        // are stateful, and reusing a doc whose annotations were removed is what
+        // corrupted the commit path in the previous attempt.
+        this.invalidatePdfReadCache(file);
         return true;
       } catch (error) {
+        this.invalidatePdfReadCache(file);
         await this.restoreInkEditTransaction(file, expandedRecord, true);
         throw error;
       }
@@ -2576,8 +2653,7 @@ export default class PdftionPlugin extends Plugin {
     const safeKey = safeAnnotationKey(file.path);
     const backupPdfPath = `${dir}/${safeKey}.pdf`;
     const transactionPath = `${dir}/${safeKey}.json`;
-    const currentBytes = await this.app.vault.readBinary(file);
-    const pdf = await PDFDocument.load(currentBytes, { ignoreEncryption: true, updateMetadata: false });
+    const { bytes: currentBytes, pdf } = await this.getPdfReadCache(file);
     const transactionPages = normalizedPages.filter((pageIndex) => pageIndex < pdf.getPageCount());
     if (transactionPages.length === 0) {
       return false;
@@ -2611,19 +2687,27 @@ export default class PdftionPlugin extends Plugin {
       const detachedBytes = new ArrayBuffer(saved.byteLength);
       new Uint8Array(detachedBytes).set(saved);
       await this.app.vault.modifyBinary(file, detachedBytes);
+      // Drop the mutated document instead of caching it (see above).
+      this.invalidatePdfReadCache(file);
       return true;
     } catch (error) {
+      this.invalidatePdfReadCache(file);
       await this.restoreInkEditTransaction(file, record, true);
       throw error;
     }
   }
 
-  async completeInkEditTransaction(file: TFile, elements: InkElement[], pageIndexes: Set<number>): Promise<boolean> {
+  async completeInkEditTransaction(
+    file: TFile,
+    elements: InkElement[],
+    pageIndexes: Set<number>,
+    hooks?: InkCommitHooks
+  ): Promise<InkCommitResult> {
     const existing = this.inkCommitPromises.get(file.path);
     if (existing) {
       return existing;
     }
-    const commit = this.completeInkEditTransactionNow(file, elements, pageIndexes);
+    const commit = this.completeInkEditTransactionNow(file, elements, pageIndexes, hooks);
     this.inkCommitPromises.set(file.path, commit);
     try {
       return await commit;
@@ -2634,39 +2718,49 @@ export default class PdftionPlugin extends Plugin {
     }
   }
 
-  async finishInkEditTransaction(file: TFile, elements: InkElement[], pageIndexes: Set<number>): Promise<boolean> {
+  async finishInkEditTransaction(
+    file: TFile,
+    elements: InkElement[],
+    pageIndexes: Set<number>,
+    hooks?: InkCommitHooks
+  ): Promise<InkCommitResult> {
     const record = await this.readInkEditTransaction(file);
     if (!record) {
-      return true;
+      return INK_COMMIT_NOTHING;
     }
     const pages = new Set(record.pageIndexes.filter((pageIndex) => pageIndexes.has(pageIndex)));
     if (pages.size === 0) {
-      return true;
+      return INK_COMMIT_NOTHING;
     }
     const backupElements = await this.readInkEditBackupElements(record);
     if (!backupElements || !inkStrokeSetsEquivalent(elements, backupElements, pages)) {
-      return this.completeInkEditTransaction(file, elements, pages);
+      return this.completeInkEditTransaction(file, elements, pages, hooks);
     }
 
     // The detached PDF may already contain duplicate legacy/external Ink annotations.
     // Rewriting the unchanged page through the same verified path normalizes it instead
     // of restoring those duplicates after the user leaves edit mode.
-    return this.completeInkEditTransaction(file, elements, pages);
+    return this.completeInkEditTransaction(file, elements, pages, hooks);
   }
 
-  private async completeInkEditTransactionNow(file: TFile, elements: InkElement[], pageIndexes: Set<number>): Promise<boolean> {
-    this.invalidatePdfReadCache(file);
+  private async completeInkEditTransactionNow(
+    file: TFile,
+    elements: InkElement[],
+    pageIndexes: Set<number>,
+    hooks?: InkCommitHooks
+  ): Promise<InkCommitResult> {
     const record = await this.readInkEditTransaction(file);
     if (!record) {
-      return true;
+      return INK_COMMIT_NOTHING;
     }
     const pagesToCommit = new Set(record.pageIndexes.filter((pageIndex) => pageIndexes.has(pageIndex)));
     if (pagesToCommit.size === 0) {
-      return true;
+      return INK_COMMIT_NOTHING;
     }
-    const currentBytes = await this.app.vault.readBinary(file);
+    const readCache = await this.getPdfReadCache(file);
+    const currentBytes = readCache.bytes;
     try {
-      const pdf = await PDFDocument.load(currentBytes, { ignoreEncryption: true, updateMetadata: false });
+      const pdf = readCache.pdf;
       removeAllInkAnnotationsOnPages(pdf, pagesToCommit);
       const pages = pdf.getPages();
       const strokes = dedupeInkElements(elements.filter((element) => (
@@ -2682,22 +2776,8 @@ export default class PdftionPlugin extends Plugin {
       const committedBytes = new ArrayBuffer(saved.byteLength);
       new Uint8Array(committedBytes).set(saved);
       await this.app.vault.modifyBinary(file, committedBytes);
-      const verifyPdf = await PDFDocument.load(committedBytes, { ignoreEncryption: true, updateMetadata: false });
-      const actual = extractPdfInkAnnotations(verifyPdf, pagesToCommit);
-      for (const expected of strokes) {
-        const match = actual.find((candidate) => (
-          candidate.id === expected.id || isSamePdfInkStrokeCandidate(candidate, expected)
-        ));
-        if (!match || !inkPointsApproximatelyEqual(
-          match.points,
-          simplifyInkPoints(smoothInkPointsForPdf(expected.points, 1600), 900)
-        )) {
-          throw new Error(`Ink verification failed for ${expected.id}.`);
-        }
-      }
-      if (actual.length !== strokes.length) {
-        throw new Error(`Ink verification count mismatch: ${actual.length}/${strokes.length}.`);
-      }
+      // The committed document was mutated; never cache it.
+      this.invalidatePdfReadCache(file);
       const marked = elements.map((element) => {
         if (element.kind !== "stroke" || !pagesToCommit.has(element.pageIndex)) {
           return cloneElement(element);
@@ -2713,23 +2793,88 @@ export default class PdftionPlugin extends Plugin {
       });
       await this.saveEditableAnnotationState(file, marked, committedBytes);
       const remainingPages = record.pageIndexes.filter((pageIndex) => !pagesToCommit.has(pageIndex));
-      if (remainingPages.length === 0) {
-        const committedRecord: PdfInkEditTransactionRecord = { ...record, phase: "committed" };
-        await this.writeInkEditTransaction(file, committedRecord);
+      // The committed bytes are on disk and the annotation state already matches
+      // them, so the native view can start reloading now. Read-back verification
+      // parses the whole file again (2.3 s on 20 MB); moving it off the critical
+      // path is what makes leaving edit mode feel immediate. The record is marked
+      // before verification so a crash during verification keeps the committed
+      // PDF instead of restoring the pre-edit backup.
+      try {
+        if (remainingPages.length === 0) {
+          await this.writeInkEditTransaction(file, { ...record, phase: "committed" });
+        } else {
+          await this.writeInkEditTransaction(file, { ...record, pageIndexes: remainingPages });
+        }
+      } catch (error) {
+        console.warn("pdftion could not update the ink transaction record after committing.", error);
+      }
+      hooks?.onBytesWritten?.();
+      const verified = this.verifyCommittedInkPages(file, record, committedBytes, strokes, pagesToCommit, remainingPages, hooks);
+      return { committed: true, verified };
+    } catch (error) {
+      console.error("pdftion could not commit the PDF ink edit transaction; restoring the backup.", error);
+      this.invalidatePdfReadCache(file);
+      await this.restoreInkEditTransaction(file, record, true);
+      return { committed: false, verified: Promise.resolve(false) };
+    }
+  }
+
+  // Read the bytes back and confirm every expected stroke survived the write.
+  // Runs after the caller asked the native view to reload, so the verification
+  // cost is paid while the user is already looking at the refreshed page.
+  private verifyCommittedInkPages(
+    file: TFile,
+    record: PdfInkEditTransactionRecord,
+    committedBytes: ArrayBuffer,
+    strokes: InkStroke[],
+    pagesToCommit: Set<number>,
+    remainingPages: number[],
+    hooks?: InkCommitHooks
+  ): Promise<boolean> {
+    return (async (): Promise<boolean> => {
+      if (hooks?.waitForRender) {
         try {
-          await this.deleteInkEditTransaction(committedRecord);
+          await hooks.waitForRender();
+        } catch {
+          // A failed render wait must never turn a good commit into a rollback.
+        }
+      }
+      try {
+        const verifyPdf = await PDFDocument.load(committedBytes, { ignoreEncryption: true, updateMetadata: false });
+        const actual = extractPdfInkAnnotations(verifyPdf, pagesToCommit);
+        for (const expected of strokes) {
+          const match = actual.find((candidate) => (
+            candidate.id === expected.id || isSamePdfInkStrokeCandidate(candidate, expected)
+          ));
+          if (!match || !inkPointsApproximatelyEqual(
+            match.points,
+            simplifyInkPoints(smoothInkPointsForPdf(expected.points, 1600), 900)
+          )) {
+            throw new Error(`Ink verification failed for ${expected.id}.`);
+          }
+        }
+        if (actual.length !== strokes.length) {
+          throw new Error(`Ink verification count mismatch: ${actual.length}/${strokes.length}.`);
+        }
+      } catch (error) {
+        console.error("pdftion could not verify the committed PDF ink; restoring the backup.", error);
+        this.invalidatePdfReadCache(file);
+        try {
+          await this.restoreInkEditTransaction(file, record, true);
+        } catch (restoreError) {
+          console.error("pdftion could not restore the PDF ink backup after a failed verification.", restoreError);
+        }
+        return false;
+      }
+      if (remainingPages.length === 0) {
+        try {
+          await this.deleteInkEditTransaction(record);
         } catch (error) {
           console.warn("pdftion committed ink edits but could not remove all transaction backup files.", error);
         }
-      } else {
-        await this.writeInkEditTransaction(file, { ...record, pageIndexes: remainingPages });
       }
       return true;
-    } catch (error) {
-      console.error("pdftion could not commit the PDF ink edit transaction; restoring the backup.", error);
-      await this.restoreInkEditTransaction(file, record, true);
-      return false;
-    }
+    })();
   }
 
   async rollbackInkEditTransaction(file: TFile): Promise<boolean> {
@@ -2809,6 +2954,7 @@ export default class PdftionPlugin extends Plugin {
   private async restoreInkEditTransaction(file: TFile, record: PdfInkEditTransactionRecord, removeRecord: boolean): Promise<void> {
     const backupBytes = await this.app.vault.adapter.readBinary(record.backupPdfPath);
     await this.app.vault.modifyBinary(file, backupBytes);
+    this.invalidatePdfReadCache(file);
     const annotationStatePath = this.getAnnotationStatePath(file);
     if (record.annotationStateExisted && record.backupAnnotationStatePath) {
       const state = await this.app.vault.adapter.read(record.backupAnnotationStatePath);
@@ -3452,6 +3598,8 @@ class InkSession {
   private zoomGeometryTimer: number | null = null;
   private inkPrepareTimer: number | null = null;
   private inkPrepareTimerForce = false;
+  private inkPrepareRun: Promise<void> | null = null;
+  private preparingIndicator = false;
   private nativeAnnotationPopupTimer: number | null = null;
   private nativePopupHideTimers = new Set<number>();
   private nativePopupSuppressUntil = 0;
@@ -4535,7 +4683,24 @@ class InkSession {
     }
   }
 
+  // Entering edit mode schedules the ink preparation up to three times (0 / 260 /
+  // 760 ms) so late-mounting pages are covered. Without joining those runs every
+  // one of them parsed the whole PDF again, which is what made big files take
+  // tens of seconds and behave differently from one attempt to the next.
   private async prepareEditableInkForCurrentPage(force = false): Promise<void> {
+    if (this.inkPrepareRun) {
+      return this.inkPrepareRun;
+    }
+    const run = this.runEditableInkPrepare(force).finally(() => {
+      if (this.inkPrepareRun === run) {
+        this.inkPrepareRun = null;
+      }
+    });
+    this.inkPrepareRun = run;
+    return run;
+  }
+
+  private async runEditableInkPrepare(force = false): Promise<void> {
     try {
       if (this.conversionInProgress) {
         return;
@@ -4559,6 +4724,7 @@ class InkSession {
         this.updateExternalInkLayerState();
         return;
       }
+      this.setPreparingIndicator(true);
       const pageIndexes = await this.plugin.getPdfInkPageIndexes(this.file);
       if (pageIndexes.size === 0) {
         this.pdfInkPreparationComplete = true;
@@ -4567,22 +4733,44 @@ class InkSession {
       await this.preparePdfInkOverlayForEditing(pageIndexes);
     } catch (error) {
       console.warn("pdftion could not prepare PDF ink for editable mode.", error);
+    } finally {
+      this.setPreparingIndicator(false);
     }
   }
 
+  private setPreparingIndicator(preparing: boolean): void {
+    if (this.preparingIndicator === preparing) {
+      return;
+    }
+    this.preparingIndicator = preparing;
+    this.button?.classList.toggle("is-preparing", preparing);
+  }
+
   private scheduleEditableInkPrepare(delay = 160, force = false): void {
-    if (!this.enabled || this.conversionInProgress) {
+    if (!this.enabled) {
       return;
     }
     const shouldForce = force || this.inkPrepareTimerForce;
     this.clearEditableInkPrepareTimer();
     this.inkPrepareTimerForce = shouldForce;
-    this.inkPrepareTimer = window.setTimeout(() => {
+    // A conversion (native page -> editable) can run for seconds on a big page.
+    // The old code dropped the request when it found one running, so tapping the
+    // annotation button during a conversion did nothing at all until an unrelated
+    // scroll retriggered the scan — the "sometimes it just will not enter" case.
+    const deadline = Date.now() + EDITABLE_INK_PREPARE_MAX_WAIT_MS;
+    const attempt = (): void => {
+      this.inkPrepareTimer = null;
+      if (this.conversionInProgress || this.preparingPdfInkForEditing) {
+        if (Date.now() < deadline && this.enabled) {
+          this.inkPrepareTimer = window.setTimeout(attempt, EDITABLE_INK_PREPARE_RETRY_MS);
+        }
+        return;
+      }
       const runForce = this.inkPrepareTimerForce;
       this.inkPrepareTimerForce = false;
-      this.inkPrepareTimer = null;
       void this.prepareEditableInkForCurrentPage(runForce);
-    }, delay);
+    };
+    this.inkPrepareTimer = window.setTimeout(attempt, delay);
   }
 
   private clearEditableInkPrepareTimer(): void {
@@ -4741,8 +4929,23 @@ class InkSession {
       this.inkCommitSettlePages.add(pageIndex);
     }
     this.clearAutoSaveTimer();
-    this.finishingPdfInkEditing = this.plugin.finishInkEditTransaction(targetFile, elements, pageIndexes)
-      .then(async (committed) => {
+    // The commit fires this as soon as the new bytes are on disk, so the native
+    // view starts reloading while the read-back verification still runs.
+    let reloadStarted: Promise<void> | null = null;
+    const startReload = (): Promise<void> => {
+      if (!reloadStarted) {
+        reloadStarted = this.reloadNativePdfView();
+      }
+      return reloadStarted;
+    };
+    this.finishingPdfInkEditing = this.plugin.finishInkEditTransaction(targetFile, elements, pageIndexes, {
+      onBytesWritten: () => {
+        void startReload();
+      },
+      waitForRender: () => startReload().then(() => sleepMs(360))
+    })
+      .then(async (result) => {
+        const committed = result.committed;
         if (this.file.path !== targetPath) {
           for (const pageIndex of pageIndexes) {
             this.inkCommitSettlePages.delete(pageIndex);
@@ -4773,13 +4976,13 @@ class InkSession {
           this.deletedPdftionInkIds.clear();
         }
         this.dirty = this.getEditableElements().some((element) => !element.saved);
-        // The ink is back inside the PDF, but the view has not been reloaded
-        // yet. Keep drawing the overlay copy until the reloaded view paints
-        // the native ink, then hand display ownership back to the PDF.
+        // The ink is back inside the PDF. Keep drawing the overlay copy until
+        // the reloaded view paints the native ink, then hand display ownership
+        // back to the PDF.
         this.updateExternalInkLayerState();
         this.redrawAll();
         this.pdfInkPreparationComplete = false;
-        await this.reloadNativePdfView();
+        await startReload();
         await sleepMs(320);
         if (this.file.path === targetPath) {
           for (const pageIndex of pageIndexes) {
@@ -4789,6 +4992,11 @@ class InkSession {
           this.redrawAll();
         }
         this.scheduleQuietScan();
+        const verified = await result.verified;
+        if (!verified) {
+          await this.reloadEditableAnnotationsAfterInkRollback();
+          return false;
+        }
         return true;
       })
       .finally(() => {
@@ -8950,10 +9158,11 @@ class InkSession {
     this.saving = true;
 
     try {
-      const binary = await this.plugin.app.vault.readBinary(targetFile);
+      const readCache = await this.plugin.getPdfReadCache(targetFile);
+      const binary = readCache.bytes;
       let buffer = binary;
       if (hasInkPdfChange) {
-        const pdf = await PDFDocument.load(binary, { ignoreEncryption: true, updateMetadata: false });
+        const pdf = readCache.pdf;
         const sourcePageCount = pdf.getPageCount();
         await syncEditableInkAnnotationsOnPdf(pdf, elements, {
           deletedExternalInkIds,
@@ -8974,8 +9183,10 @@ class InkSession {
           if (await sha256Hex(written) !== await sha256Hex(buffer)) {
             throw new Error("PDF write verification failed: saved bytes changed after writing.");
           }
+          this.plugin.invalidatePdfReadCache(targetFile);
         } catch (error) {
           if (sourceModified) {
+            this.plugin.invalidatePdfReadCache(targetFile);
             await this.plugin.app.vault.modifyBinary(targetFile, binary.slice(0));
           }
           throw error;
@@ -15341,19 +15552,19 @@ function drawSelectionGroup(ctx: CanvasRenderingContext2D, elements: InkElement[
 
   ctx.save();
   ctx.globalAlpha = 1;
-  ctx.strokeStyle = "#1c7ed6";
-  ctx.lineWidth = 1.8;
-  ctx.setLineDash([7, 4]);
+  ctx.strokeStyle = "rgba(28, 126, 214, 0.58)";
+  ctx.lineWidth = 1;
+  ctx.setLineDash([6, 4]);
   ctx.strokeRect(x, y, width, height);
   ctx.setLineDash([]);
 
   for (const handle of getSelectionHandlePoints(box)) {
-    const size = 10;
+    const size = 8;
     const hx = handle.point.x * cssWidth;
     const hy = handle.point.y * cssHeight;
-    ctx.fillStyle = "#ffffff";
-    ctx.strokeStyle = "#1c7ed6";
-    ctx.lineWidth = 2;
+    ctx.fillStyle = "rgba(255, 255, 255, 0.82)";
+    ctx.strokeStyle = "rgba(28, 126, 214, 0.72)";
+    ctx.lineWidth = 1.2;
     ctx.fillRect(hx - size / 2, hy - size / 2, size, size);
     ctx.strokeRect(hx - size / 2, hy - size / 2, size, size);
   }
@@ -15369,9 +15580,9 @@ function drawNativeSelection(ctx: CanvasRenderingContext2D, selection: PdfNative
 
   ctx.save();
   ctx.globalAlpha = 1;
-  ctx.strokeStyle = "#0ca678";
-  ctx.fillStyle = selection.kind === "text" ? "rgba(12, 166, 120, 0.10)" : "rgba(12, 166, 120, 0.06)";
-  ctx.lineWidth = 1.8;
+  ctx.strokeStyle = "rgba(12, 166, 120, 0.6)";
+  ctx.fillStyle = selection.kind === "text" ? "rgba(12, 166, 120, 0.07)" : "rgba(12, 166, 120, 0.04)";
+  ctx.lineWidth = 1;
   ctx.setLineDash([5, 4]);
   ctx.fillRect(x, y, width, height);
   ctx.strokeRect(x, y, width, height);
@@ -15500,10 +15711,10 @@ function drawMarqueeBox(ctx: CanvasRenderingContext2D, start: InkPoint, end: Ink
 
   ctx.save();
   ctx.globalAlpha = 1;
-  ctx.strokeStyle = "#228be6";
-  ctx.fillStyle = "rgba(34, 139, 230, 0.1)";
-  ctx.lineWidth = 1.5;
-  ctx.setLineDash([6, 4]);
+  ctx.strokeStyle = "rgba(34, 139, 230, 0.55)";
+  ctx.fillStyle = "rgba(34, 139, 230, 0.06)";
+  ctx.lineWidth = 1;
+  ctx.setLineDash([5, 4]);
   ctx.fillRect(minX, minY, width, height);
   ctx.strokeRect(minX, minY, width, height);
   ctx.restore();
@@ -15543,8 +15754,10 @@ function textBounds(text: InkText, cssWidth: number, cssHeight: number): { maxX:
     return { maxX: minX + size, maxY: minY + size, minX, minY };
   }
   const lines = text.text.split(/\r?\n/);
-  const maxChars = Math.max(1, ...lines.map((line) => line.length));
-  const width = Math.max(text.fontSize, maxChars * text.fontSize * 0.58);
+  const width = Math.max(
+    text.fontSize,
+    ...lines.map((line) => measureTextLineWidth(line, text.fontSize, text.fontFamily))
+  );
   const height = Math.max(text.fontSize, lines.length * text.fontSize * 1.2);
   const minX = text.x * cssWidth;
   const minY = text.y * cssHeight;
@@ -15818,7 +16031,15 @@ function normalizedStrokeBounds(stroke: InkStroke): NormalizedBounds | null {
     maxY = Math.max(maxY, point.y);
   }
 
-  return { maxX, maxY, minX, minY };
+  // The visible ink of a stroke extends half its rendered line width beyond the
+  // point centres. A box built from the centres alone cuts thick highlighter and
+  // watercolour strokes in half, which is what read as "the selection box does
+  // not cover the element" and made marquee selection miss their outer edges.
+  const halfWidth = Number.isFinite(stroke.width) ? Math.max(0, stroke.width) / 2 : 0;
+  const padX = halfWidth / Math.max(1, stroke.pageCssWidth);
+  const padY = halfWidth / Math.max(1, stroke.pageCssHeight);
+
+  return { maxX: maxX + padX, maxY: maxY + padY, minX: minX - padX, minY: minY - padY };
 }
 
 function pdfIdentityPoints(stroke: InkStroke): InkPoint[] {
@@ -15846,6 +16067,57 @@ function normalizedBoundsAreNear(
   return Math.hypot(gapX, gapY) <= gapPx;
 }
 
+let textMeasureContext: CanvasRenderingContext2D | null | undefined;
+
+function getTextMeasureContext(): CanvasRenderingContext2D | null {
+  if (textMeasureContext !== undefined) {
+    return textMeasureContext;
+  }
+  try {
+    const canvas = activeDocument.createElement("canvas");
+    textMeasureContext = canvas.getContext("2d");
+  } catch {
+    textMeasureContext = null;
+  }
+  return textMeasureContext;
+}
+
+function isFullWidthGlyph(char: string): boolean {
+  const code = char.codePointAt(0) ?? 0;
+  return (
+    (code >= 0x1100 && code <= 0x115f) ||
+    (code >= 0x2e80 && code <= 0xa4cf) ||
+    (code >= 0xac00 && code <= 0xd7a3) ||
+    (code >= 0xf900 && code <= 0xfaff) ||
+    (code >= 0xfe30 && code <= 0xfe6f) ||
+    (code >= 0xff00 && code <= 0xff60) ||
+    (code >= 0xffe0 && code <= 0xffe6)
+  );
+}
+
+// The old estimate (0.58 em per character) is a Latin average. A Chinese glyph is
+// a full em wide, so every CJK text annotation got a box that clipped roughly 40%
+// of its width. Measure with the same font spec drawTextElement uses instead.
+function measureTextLineWidth(line: string, fontSize: number, fontFamily?: string): number {
+  if (!line) {
+    return 0;
+  }
+  const size = Number.isFinite(fontSize) && fontSize > 0 ? fontSize : 12;
+  const context = getTextMeasureContext();
+  if (context) {
+    context.font = `${size}px ${fontFamily ?? "sans-serif"}`;
+    const measured = context.measureText(line).width;
+    if (Number.isFinite(measured) && measured > 0) {
+      return measured;
+    }
+  }
+  let width = 0;
+  for (const char of Array.from(line)) {
+    width += isFullWidthGlyph(char) ? size : size * 0.58;
+  }
+  return width;
+}
+
 function normalizedTextBounds(text: InkText): NormalizedBounds {
   if (text.presentation === "comment") {
     const size = clamp(text.fontSize * 1.65, 22, 32);
@@ -15857,8 +16129,10 @@ function normalizedTextBounds(text: InkText): NormalizedBounds {
     };
   }
   const lines = text.text.split(/\r?\n/);
-  const maxChars = Math.max(1, ...lines.map((line) => line.length));
-  const width = Math.max(text.fontSize, maxChars * text.fontSize * 0.58) / Math.max(1, text.pageCssWidth);
+  const width = Math.max(
+    text.fontSize,
+    ...lines.map((line) => measureTextLineWidth(line, text.fontSize, text.fontFamily))
+  ) / Math.max(1, text.pageCssWidth);
   const height = Math.max(text.fontSize, lines.length * text.fontSize * 1.2) / Math.max(1, text.pageCssHeight);
   return {
     maxX: text.x + width,
@@ -16426,6 +16700,36 @@ async function fingerprintPdfBytes(buffer: ArrayBuffer, mtime?: number): Promise
     sha256: await sha256Hex(buffer),
     size: buffer.byteLength
   };
+}
+
+function arrayBuffersEqual(a: ArrayBuffer, b: ArrayBuffer): boolean {
+  if (a === b) {
+    return true;
+  }
+  if (a.byteLength !== b.byteLength) {
+    return false;
+  }
+  if (a.byteLength === 0) {
+    return true;
+  }
+  if (a.byteLength % 4 === 0) {
+    const viewA = new Uint32Array(a);
+    const viewB = new Uint32Array(b);
+    for (let index = 0; index < viewA.length; index += 1) {
+      if (viewA[index] !== viewB[index]) {
+        return false;
+      }
+    }
+    return true;
+  }
+  const viewA = new Uint8Array(a);
+  const viewB = new Uint8Array(b);
+  for (let index = 0; index < viewA.length; index += 1) {
+    if (viewA[index] !== viewB[index]) {
+      return false;
+    }
+  }
+  return true;
 }
 
 async function sha256Hex(buffer: ArrayBuffer): Promise<string> {

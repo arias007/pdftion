@@ -176,6 +176,38 @@ body.pdftion-menu-boost .pdftion-embed-actions .clickable-icon {
   color: var(--text-on-accent);
 }
 
+/* Entering edit mode on a large PDF has to parse the whole document; without a
+   visible sign the app looks like it ignored the tap. */
+.pdftion-button.is-preparing {
+  position: relative;
+}
+
+.pdftion-button.is-preparing::after {
+  animation: pdftion-preparing 1.1s linear infinite;
+  border: 2px solid color-mix(in srgb, currentColor 28%, transparent);
+  border-radius: 50%;
+  border-top-color: currentColor;
+  box-sizing: border-box;
+  content: "";
+  height: 16px;
+  left: 50%;
+  margin: -8px 0 0 -8px;
+  pointer-events: none;
+  position: absolute;
+  top: 50%;
+  width: 16px;
+}
+
+.pdftion-button.is-preparing svg {
+  opacity: 0.18;
+}
+
+@keyframes pdftion-preparing {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 .pdftion-root .pdftion-page {
   position: relative;
 }

@@ -53,7 +53,7 @@ test("rewriting a dirty PDF page removes every legacy Ink before restoring curre
   assert.match(syncSource, /!currentStrokes\.some\(\(stroke\) =>/);
   assert.match(syncSource, /removeAllInkAnnotationsOnPages\(pdf, pagesToRewrite\)/);
   assert.doesNotMatch(syncSource, /removeTargetInkAnnotations\(\s*pdf/);
-  assert.match(source, /return this\.completeInkEditTransaction\(file, elements, pages\);/);
+  assert.match(source, /return this\.completeInkEditTransaction\(file, elements, pages, hooks\);/);
   assert.match(source, /function drawRoundedPdfStroke\(/);
   assert.match(source, /page\.drawCircle\(\{/);
   assert.match(source, /AP: pdf\.context\.obj\(\{ N: appearanceRef \}\)/);
@@ -515,8 +515,8 @@ test("editing overlays does not detach the source PDF and guarded ink writes res
   assert.match(source, /const transactionPages = normalizedPages\.filter\(\(pageIndex\) => pageIndex < pdf\.getPageCount\(\)\)/);
   assert.match(source, /removeAllInkAnnotationsOnPages\(pdf, new Set\(transactionPages\)\)/);
   assert.match(source, /backupAnnotationStatePath/);
-  assert.match(source, /completeInkEditTransaction\(file: TFile, elements: InkElement\[\], pageIndexes: Set<number>\)/);
-  assert.match(source, /finishInkEditTransaction\(file: TFile, elements: InkElement\[\], pageIndexes: Set<number>\)/);
+  assert.match(source, /completeInkEditTransaction\(\s*file: TFile,\s*elements: InkElement\[\],\s*pageIndexes: Set<number>,\s*hooks\?: InkCommitHooks\s*\)/);
+  assert.match(source, /finishInkEditTransaction\(\s*file: TFile,\s*elements: InkElement\[\],\s*pageIndexes: Set<number>,\s*hooks\?: InkCommitHooks\s*\)/);
   assert.match(source, /inkStrokeSetsEquivalent\(elements, backupElements, pages\)/);
   assert.match(source, /restoreInkEditTransaction\(file, record, true\)/);
   assert.match(source, /Ink verification failed/);
@@ -544,7 +544,7 @@ test("editing overlays does not detach the source PDF and guarded ink writes res
   assert.match(source, /this\.flushSessionsOutsideFile\(file\)/);
   assert.match(source, /checkpointAllSessionsSoon\(\)/);
   assert.match(source, /readPendingInkEditElements\(file\)/);
-  assert.match(source, /private inkCommitPromises = new Map<string, Promise<boolean>>\(\)/);
+  assert.match(source, /private inkCommitPromises = new Map<string, Promise<InkCommitResult>>\(\)/);
   assert.doesNotMatch(source, /this\.detachedInkEditPages\.clear\(\);\s*this\.scheduleEditableInkPrepare\(0, true\)/);
   assert.match(source, /flushSessionsOutsideLeaf\(leaf\)/);
   assert.match(source, /void this\.finishPdfInkEditing\(\)/);

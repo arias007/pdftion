@@ -24,11 +24,7 @@ test("saved PDF ink hides its original native layer as soon as editing begins", 
   const source = await readFile(sourceUrl, "utf8");
 
   assert.match(source, /const pdfInkStrokes: InkStroke\[\] = \[\]/);
-  assert.match(source, /this\.loadNativeInkStrokesForPages\(pagesToScan\)/);
-  assert.match(source, /const fromViewer = await this\.readInkStrokesFromNativeViewer\(pageIndexes, converted\)/);
-  assert.match(source, /const \{ pdf \} = await this\.plugin\.getPdfReadCacheForInk\(this\.file\)/);
-  assert.match(source, /if \(!loaded\.ok\) \{\s*return false;/);
-  assert.match(source, /for \(const pageIndex of pagesToScan \?\? \[\]\) \{\s*this\.nativeInkScannedPages\.add\(pageIndex\);/);
+  assert.match(source, /loadPdfInkAnnotations\(this\.file, pagesToScan\)/);
   assert.match(source, /this\.nativeInkScannedPages\.add\(pageIndex\)/);
   assert.match(source, /if \(element\.pdfSaved === true\) \{[\s\S]*?this\.pendingNativeInkHidePages\.add\(element\.pageIndex\);\s*this\.updateExternalInkLayerState\(\)/);
   assert.match(source, /translateElement\(element, dx, dy\)/);
@@ -102,11 +98,7 @@ test("PDF loading keeps canvases and native ink work near the active viewport", 
 test("selection interiors move while only the four visible corner handles resize", async () => {
   const source = await readFile(sourceUrl, "utf8");
 
-  assert.match(source, /return findResizeHandleAt\(bounds, point, overlay\.cssWidth, overlay\.cssHeight, 12, 0\)/);
-  assert.match(source, /const hairline = 1 \/ dpr;/);
-  assert.match(source, /drawSelectionGroup\(ctx, selected, overlay\.cssWidth, overlay\.cssHeight, overlay\.dpr\)/);
-  assert.match(source, /drawMarqueeBox\(ctx, this\.selectionDrag\.start, this\.selectionDrag\.current, overlay\.cssWidth, overlay\.cssHeight, overlay\.dpr\)/);
-  assert.doesNotMatch(source, /ctx\.lineWidth = 1\.8;\n  ctx\.setLineDash\(\[7, 4\]\)/);
+  assert.match(source, /return findResizeHandleAt\(bounds, point, overlay\.cssWidth, overlay\.cssHeight, 8, 0\)/);
   assert.doesNotMatch(source, /textOnly \? 10 : 5/);
   assert.doesNotMatch(source, /textOnly \? 12 : 0/);
   assert.doesNotMatch(source, /canMoveFreshSelection|selectionWasExplicitTap|startedFromFreshSelection/);
@@ -504,10 +496,6 @@ test("editing overlays does not detach the source PDF and guarded ink writes res
     source.indexOf("private async preparePdfInkOverlayForEditing"),
     source.indexOf("private async commitDetachedInkPages")
   );
-  const detachSource = source.slice(
-    source.indexOf("private async detachNativeInkPages"),
-    source.indexOf("private async preparePdfInkOverlayForEditing")
-  );
   const recoverySource = source.slice(
     source.indexOf("private async recoverPendingInkEditTransactions"),
     source.indexOf("private async readPendingInkEditElements")
@@ -534,12 +522,9 @@ test("editing overlays does not detach the source PDF and guarded ink writes res
   assert.match(source, /Ink verification failed/);
   assert.match(source, /recoverPendingInkEditTransactions\(\)/);
   assert.match(prepareSource, /await this\.importPdfInkForPages\(pageIndexes\)/);
-  assert.match(prepareSource, /await this\.detachNativeInkPages\(new Set\(\[first\]\)\)/);
-  assert.match(prepareSource, /\/\/ Detaching rewrites the whole file, so never do more than one page per/);
-  assert.match(prepareSource, /const hiding = this\.classifyNativeInkHiding\(overlay\)/);
-  assert.match(detachSource, /const detachedNow = await this\.plugin\.beginInkEditTransaction\(this\.file, pageIndexes\)/);
-  assert.match(detachSource, /this\.detachedInkEditPages\.add\(pageIndex\)/);
-  assert.match(detachSource, /await this\.reloadNativePdfView\(\)/);
+  assert.match(prepareSource, /await this\.plugin\.beginInkEditTransaction\(this\.file, pageIndexes\)/);
+  assert.match(prepareSource, /this\.detachedInkEditPages\.add\(pageIndex\)/);
+  assert.match(prepareSource, /await this\.reloadNativePdfView\(\)/);
   assert.match(prepareSource, /Array\.isArray\(stroke\.pdfPoints\)/);
   assert.doesNotMatch(prepareSource, /commitDetachedInkPages|modifyBinary|saveEditableAnnotationState/);
   assert.match(recoverySource, /await this\.restoreInkEditTransaction\(file, record, true\)/);
@@ -575,13 +560,11 @@ test("PDF ink preparation detaches every ink page once and does not reload on re
     source.indexOf("private async preparePdfInkOverlayForEditing"),
     source.indexOf("private async commitDetachedInkPages")
   );
-  assert.doesNotMatch(prepareSource, /await this\.plugin\.getPdfInkPageIndexes\(this\.file\)/);
-  assert.match(prepareSource, /const loaded = await this\.loadNativeInkStrokesForPages\(targets\)/);
-  assert.match(prepareSource, /for \(const pageIndex of targets\) \{\s*this\.nativeInkCountByPage\.set\(pageIndex, 0\);/);
-  assert.match(overlayPrepareSource, /await this\.importPdfInkForPages\(pageIndexes\)/);
-  assert.match(overlayPrepareSource, /const detachPages = new Set<number>\(\)/);
-  assert.match(source, /private inkCheckedPages = new Set<number>\(\)/);
-  assert.doesNotMatch(overlayPrepareSource, /await this\.reloadNativePdfView\(\),\s*\n\s*for \(const pageIndex of pageIndexes\) \{/);
+  assert.match(prepareSource, /if \(this\.pdfInkPreparationComplete\)/);
+  assert.match(prepareSource, /const pageIndexes = await this\.plugin\.getPdfInkPageIndexes\(this\.file\)/);
+  assert.match(overlayPrepareSource, /const detachedNow = await this\.plugin\.beginInkEditTransaction\(this\.file, pageIndexes\)/);
+  assert.match(overlayPrepareSource, /if \(detachedNow\) \{\s*await this\.reloadNativePdfView\(\);/);
+  assert.doesNotMatch(overlayPrepareSource, /await this\.reloadNativePdfView\(\);\s*for \(const pageIndex of pageIndexes\)/);
 });
 
 test("native PDF text selection follows the last highlight or copy action", async () => {
@@ -623,128 +606,4 @@ test("PPTX dependencies are browser-safe and the release bundle has no dynamic e
   assert.equal(packageJson.dependencies.jszip, "^3.10.1");
   assert.equal(manifest.author, "Murat");
   assert.equal(packageJson.author, "Murat");
-});
-
-test("entering edit mode never parses or writes the whole PDF before the first stroke", async () => {
-  const source = await readFile(sourceUrl, "utf8");
-  const enterSource = source.slice(
-    source.indexOf("private async prepareEditableInkForCurrentPage"),
-    source.indexOf("private scheduleEditableInkPrepare")
-  );
-  const overlayPrepareSource = source.slice(
-    source.indexOf("private async preparePdfInkOverlayForEditing"),
-    source.indexOf("private async commitDetachedInkPages")
-  );
-
-  // Per-page, lazily: only pages that scrolled into view and were never checked.
-  assert.match(source, /private inkCheckedPages = new Set<number>\(\)/);
-  assert.match(enterSource, /for \(let pageIndex = 0; pageIndex < total; pageIndex \+= 1\)/);
-  assert.match(source, /for \(const item of candidates\.slice\(0, 4\)\) \{\s*pages\.add\(item\.overlay\.pageIndex\);/);
-  assert.doesNotMatch(overlayPrepareSource, /for \(const pageIndex of pageIndexes\) \{\s*this\.pendingNativeInkHidePages\.add\(pageIndex\);\s*\/\/ The native view still paints/);
-
-  // Ink is read from the viewer that already parsed the document.
-  assert.match(source, /converted\?: Map<number, \{ count: number; ids: Set<string> \}>/);
-  assert.match(source, /return attempts >= 6 \? "detach" : "unknown"/);
-  assert.match(source, /annotations = await page\.getAnnotations\(\{ intent: "display" \}\)/);
-  assert.match(source, /function pdfJsInkAnnotationToStrokes\(/);
-  assert.match(source, /const \[a, b, c, d, e, f\] = transform;/);
-
-  // Empty/ink-free files are ruled out from raw bytes, not by a full parse.
-  assert.match(source, /function bytesMayContainInkAnnotations\(buffer: ArrayBuffer\): boolean/);
-  assert.match(source, /function bufferContainsAsciiToken\(bytes: Uint8Array, token: number\[\]\): boolean/);
-  assert.doesNotMatch(source, /new TextDecoder\("latin1"\)\.decode\(new Uint8Array\(buffer\)\)/);
-
-  // The index survives restarts so a reopened large PDF is instant.
-  assert.match(source, /private getPdfInkPageIndexStorePath\(\): string/);
-  assert.match(source, /data\/ink-page-index\.json/);
-  assert.match(source, /invalidatePdfInkPageIndex\(file\?: TFile\): void/);
-
-  // Detaching (the slow file rewrite) only happens when the viewer has no
-  // annotation DOM to hide.
-  assert.match(source, /private classifyNativeInkHiding\(overlay: PageOverlay\): "css" \| "detach" \| "unknown"/);
-  assert.match(source, /return attempts >= 6 \? "detach" : "unknown"/);
-  assert.match(source, /if \(domAnnotations > 0\) \{\s*\/\/ The hide rule covers the whole annotation layer of the page/);
-  assert.match(source, /if \(nativeInkCount === 0\) \{/);
-  assert.match(overlayPrepareSource, /if \(!overlay\) \{\s*\/\/ No overlay yet \(page is outside the retained window\)/);
-  assert.match(overlayPrepareSource, /\} else if \(hiding === "detach"\) \{\s*detachPages\.add\(pageIndex\);/);
-  assert.match(overlayPrepareSource, /\/\/ "unknown": the page has not been painted yet/);
-});
-
-test("every InkList path becomes its own stroke and taps survive as dots", async () => {
-  const source = await readFile(sourceUrl, "utf8");
-  const convertSource = source.slice(source.indexOf("function externalInkAnnotationToStrokes"), source.indexOf("function pdftionInkStrokeId"));
-
-  assert.match(source, /function externalInkAnnotationToStrokes\(\s*annot: PDFDict,\s*pageIndex: number,\s*annotIndex: number,\s*mapping: PageDisplayMapping\s*\): InkStroke\[\]/);
-  assert.match(convertSource, /const paths: InkPoint\[\]\[\] = \[\]/);
-  assert.match(convertSource, /paths\.push\(points\.length === 1 \? \[points\[0\], \{ \.\.\.points\[0\] \}\] : points\)/);
-  assert.match(convertSource, /id: `\$\{pdftionId \?\? fallbackId\}\$\{multiplePaths \? `:p\$\{pathIndex\}` : ""\}`/);
-  // Stroke weight comes from /BS /W (the real visible width), not /Border alone.
-  assert.match(convertSource, /const width = resolveInkBorderWidth\(annot\)/);
-  assert.match(source, /function resolveInkBorderWidth\(annot: PDFDict\): number/);
-  assert.match(source, /const styleWidth = borderStyle\?\.lookupMaybe\(PDFName\.of\("W"\), PDFNumber\)\?\.asNumber\(\)/);
-});
-
-test("leaving edit mode hands the native annotations back to the viewer", async () => {
-  const source = await readFile(sourceUrl, "utf8");
-  const setEnabledSource = source.slice(
-    source.indexOf("private setEnabled(enabled: boolean"),
-    source.indexOf("private async prepareEditableInkForCurrentPage")
-  );
-  const exitBranch = setEnabledSource.slice(setEnabledSource.indexOf("} else {"));
-
-  // Without this the page keeps `pdftion-hide-native-ink-layer`, so the PDF's
-  // own ink stays invisible after the user leaves edit mode.
-  assert.match(exitBranch, /this\.updateExternalInkLayerState\(\);\s*this\.restoreHiddenNativeInkAnnotations\(\);/);
-  assert.match(exitBranch, /this\.inkCheckedPages\.clear\(\)/);
-  assert.match(exitBranch, /this\.nativeInkScannedPages\.clear\(\)/);
-});
-
-test("annotation mode stays responsive while editing", async () => {
-  const source = await readFile(sourceUrl, "utf8");
-
-  // Popup suppression must not query the whole document on a short timer.
-  assert.match(source, /for \(const candidate of Array\.from\(this\.rootEl\.querySelectorAll<HTMLElement>\(selectors\.join\(","\)\)\)\)/);
-  assert.doesNotMatch(source, /for \(const candidate of Array\.from\(activeDocument\.querySelectorAll<HTMLElement>\(selectors\.join\(","\)\)\)\)/);
-  assert.match(source, /window\.setInterval\(\(\) => this\.hideNativePdfAnnotationPopups\(\), 500\)/);
-  assert.match(source, /const OVERLAY_HEALTH_CHECK_MS = 12_000;/);
-  assert.match(source, /window\.setTimeout\(\(\) => \{\s*if \(this\.enabled && !this\.pdfInkPreparationComplete\)/);
-  assert.match(source, /this\.pdfInkPreparationComplete = true;/);
-});
-
-test("native ink is hidden per page only when every annotation converted", async () => {
-  const source = await readFile(sourceUrl, "utf8");
-  const updateSource = source.slice(
-    source.indexOf("private updateExternalInkLayerState"),
-    source.indexOf("private scheduleExternalInkLayerUpdate")
-  );
-
-  // One deterministic rule instead of geometric guessing: a page is covered only
-  // when all of its native Ink annotations became editable strokes.
-  assert.match(source, /private convertedInkByPage = new Map<number, \{ count: number; ids: Set<string> \}>\(\)/);
-  assert.match(updateSource, /const drawnStrokes = this\.strokeHistory\.filter\(\(stroke\) => \(/);
-  assert.match(updateSource, /nativeCount > 0 && convertedCount >= nativeCount && drawnStrokes >= nativeCount/);
-  assert.match(source, /private watchInkPageCanvas\(pageIndex: number\): void/);
-  assert.match(source, /private async repaintPageCanvas\(pageIndex: number, drawAnnotations: boolean\): Promise<boolean>/);
-  assert.match(source, /annotationMode: drawAnnotations \? 1 : 0/);
-  assert.match(updateSource, /pageEl\.classList\.add\("pdftion-hide-native-ink-layer"\)/);
-  assert.match(updateSource, /pageEl\.classList\.remove\("pdftion-hide-native-ink-layer"\)/);
-  // Pages are enumerated from the DOM, not from the overlay map, so ink is
-  // hidden even when the page has no overlay mounted yet.
-  assert.match(updateSource, /for \(const pageEl of Array\.from\(this\.rootEl\.querySelectorAll<HTMLElement>\("\.page"\)\)\)/);
-  // The copy is drawn only where the native layer is hidden.
-  assert.match(source, /return this\.enabled && this\.nativeInkCoveredPages\.has\(pageIndex\)/);
-  assert.match(source, /private revealUncoveredNativeInk\(coveredPages: Set<number>\): void/);
-});
-
-test("reading annotations never hashes the whole PDF", async () => {
-  const source = await readFile(sourceUrl, "utf8");
-  const loadSource = source.slice(
-    source.indexOf("async loadAnnotationState(file: TFile)"),
-    source.indexOf("async loadPdfInkAnnotations")
-  );
-  assert.doesNotMatch(loadSource, /getPdfFingerprint/);
-  assert.match(loadSource, /const state = await this\.loadAnnotationRecord\(file\)/);
-  assert.match(source, /private async loadAnnotationRecord\(file: TFile\): Promise<AnnotationStateRecord \| null>/);
-  // Verification still happens before anything destructive.
-  assert.match(source, /private async loadVerifiedAnnotationRecord\(file: TFile, currentFingerprint: PdfFingerprint\)/);
 });

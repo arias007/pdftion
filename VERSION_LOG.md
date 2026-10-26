@@ -1,5 +1,42 @@
 # VERSION LOG
 
+## 0.7.0 — 2026-10-26
+
+A version bump on top of the **0.6.4 pipeline**, which is the build confirmed on
+the device. Three later directions were tried and rejected there:
+
+| version | idea | why it failed on device |
+| --- | --- | --- |
+| 0.6.5 / 0.6.6 | a large document enters edit mode without detaching; only CSS hides the native ink | the editor never opened, no spinner at all. The native annotation layer is `display:none` while pdftion is active, so the overlay is the only painter — skipping it hid all 78 imported strokes |
+| 0.6.7 | a large document's exit writes only the side-car | same: entering edit mode stopped working |
+
+### What 0.7.0 keeps
+
+- entering edit mode really detaches the ink and reloads the native view; that
+  path cannot be bypassed
+- the detach result is replayed from disk, so a second enter does not parse
+- an unchanged exit restores the enter bytes instead of rewriting
+- a document at or above 32 MB keeps the reload inside the spinner instead of
+  running it in the background while the user already draws
+- the commit merges per page and only rewrites annotations that changed, so
+  imported ink keeps its geometry, its width attribute and its appearance
+- an empty annotation list can no longer be written over a full side-car
+- interruptions are recoverable: a journal plus a save-time backup let the next
+  start restore the document and re-attach the strokes; a committed transaction
+  parks its backup instead of destroying it
+
+### Verified
+
+| check | result |
+| --- | --- |
+| `npx tsc --noEmit` | clean |
+| `node --check main.js` | clean |
+| `node --test tests/*.test.mjs` | 60 tests, 59 pass (the one failure is the pre-existing `i18n.test.mjs`, which needs Node's TypeScript support) |
+| `tests/ink-appearance.mjs` on 19 MB / 2 strokes | appearance stable |
+| `tests/no-ink-loss.mjs` on 19 MB / 2 strokes + 1 new | committed, verified, no loss |
+| `tests/ink-roundtrip.mjs` on 6.1 MB / 30 strokes | three cycles, ink 30/30, enter 966/856/833 ms, exit 47/42/49 ms |
+| release assets | `main.js` 2a56f2d88c405666…, `manifest.json` 078b96892c3e89ba…, `styles.css` e201665ec4680567… — identical across local build, GitHub release and the installed plugin |
+
 ## 0.6.3 — 2026-10-26
 
 Targets the large-document crash. The enter flow is unchanged (it still detaches),

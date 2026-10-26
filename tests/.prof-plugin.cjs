@@ -1219,7 +1219,6 @@ var PdftionPlugin = class extends import_obsidian.Plugin {
   missingPdfSurfaces = /* @__PURE__ */ new Map();
   pdfReadCache = null;
   pdfReadCacheLoading = null;
-  detachedBytesCache = null;
   pdfFingerprintCache = null;
   sessions = /* @__PURE__ */ new Map();
   surfaceScanTimers = [];
@@ -2044,7 +2043,7 @@ var PdftionPlugin = class extends import_obsidian.Plugin {
     const known = this.pdfReadCache;
     const stat = file.stat;
     const reuse = known && known.path === file.path && known.mtime === stat.mtime && known.size === stat.size;
-    const currentBytes = reuse ? known.bytes : await this.app.vault.readBinary(file);
+    let currentBytes = reuse ? known.bytes : await this.app.vault.readBinary(file);
     await this.ensureAdapterFolder(dir);
     await this.app.vault.adapter.writeBinary(backupPdfPath, currentBytes);
     const replay = await this.findDetachedBytes(file, currentBytes, normalizedPages);
@@ -2086,11 +2085,17 @@ var PdftionPlugin = class extends import_obsidian.Plugin {
       return true;
     }
     try {
+      currentBytes = null;
+      if (reuse) {
+        this.pdfReadCache = null;
+      }
       removeAllInkAnnotationsOnPages(pdf, new Set(transactionPages));
       const saved = await pdf.save({ addDefaultPage: false, useObjectStreams: false });
       const detachedBytes = toPdfBytes(saved);
-      this.rememberDetachedBytes(file, currentBytes, transactionPages, detachedBytes);
       await this.app.vault.modifyBinary(file, detachedBytes);
+      await this.writeDetachedCache(file, detachedBytes, transactionPages, record).catch((error) => {
+        console.warn("pdftion could not store the detached PDF for reuse.", error);
+      });
       this.invalidatePdfReadCache(file);
       return true;
     } catch (error) {
@@ -2099,31 +2104,72 @@ var PdftionPlugin = class extends import_obsidian.Plugin {
       throw error;
     }
   }
-  // Remembers the bytes produced by a detach so the same file can be detached
-  // again without a parse. Only one entry is kept: the cost of holding it is the
-  // size of the document, and the benefit only exists for the document in use.
-  rememberDetachedBytes(file, sourceBytes, pageIndexes, detachedBytes) {
-    void sha256Hex(sourceBytes).then((sourceSha256) => {
-      this.detachedBytesCache = {
-        detachedBytes,
-        pageIndexes: [...pageIndexes],
-        path: file.path,
-        sourceSha256
-      };
-    });
+  getDetachedCachePaths(file) {
+    const key = safeAnnotationKey(file.path);
+    const dir = `${this.manifest.dir}/data/ink-edit-transactions`;
+    return { metaPath: `${dir}/${key}.detached.json`, pdfPath: `${dir}/${key}.detached.pdf` };
+  }
+  async writeDetachedCache(file, detachedBytes, pageIndexes, record) {
+    const { metaPath, pdfPath } = this.getDetachedCachePaths(file);
+    const sourceBytes = await this.app.vault.adapter.readBinary(record.backupPdfPath);
+    const sourceSha256 = await sha256Hex(sourceBytes);
+    await this.app.vault.adapter.writeBinary(pdfPath, detachedBytes);
+    await this.app.vault.adapter.write(
+      metaPath,
+      JSON.stringify({ filePath: file.path, pageIndexes: [...pageIndexes], sourceSha256, version: 1 })
+    );
+    await this.pruneDetachedCaches(file, pdfPath, metaPath);
+  }
+  // Only one replay cache is kept: it costs a whole document on disk, and only
+  // the document being edited can benefit from it.
+  async pruneDetachedCaches(file, keepPdfPath, keepMetaPath) {
+    const dir = `${this.manifest.dir}/data/ink-edit-transactions`;
+    let listing;
+    try {
+      listing = await this.app.vault.adapter.list(dir);
+    } catch {
+      return;
+    }
+    for (const entry of listing.files ?? []) {
+      if (!entry.endsWith(".detached.pdf") && !entry.endsWith(".detached.json")) {
+        continue;
+      }
+      if (entry === keepPdfPath || entry === keepMetaPath) {
+        continue;
+      }
+      try {
+        await this.app.vault.adapter.remove(entry);
+      } catch {
+      }
+    }
+  }
+  async findDetachedBytesOnDisk(file, currentBytes, pageIndexes) {
+    const { metaPath, pdfPath } = this.getDetachedCachePaths(file);
+    let meta = null;
+    try {
+      meta = JSON.parse(await this.app.vault.adapter.read(metaPath));
+    } catch {
+      return null;
+    }
+    if (!meta || meta.filePath !== file.path || typeof meta.sourceSha256 !== "string") {
+      return null;
+    }
+    const cachedPages = Array.isArray(meta.pageIndexes) ? meta.pageIndexes : [];
+    if (cachedPages.length !== pageIndexes.length || cachedPages.some((pageIndex, index) => pageIndex !== pageIndexes[index])) {
+      return null;
+    }
+    if (await sha256Hex(currentBytes) !== meta.sourceSha256) {
+      return null;
+    }
+    try {
+      const cached = await this.app.vault.adapter.readBinary(pdfPath);
+      return cached.byteLength > 0 ? cached : null;
+    } catch {
+      return null;
+    }
   }
   async findDetachedBytes(file, currentBytes, pageIndexes) {
-    const cached = this.detachedBytesCache;
-    if (!cached || cached.path !== file.path) {
-      return null;
-    }
-    if (await sha256Hex(currentBytes) !== cached.sourceSha256) {
-      return null;
-    }
-    if (cached.pageIndexes.length !== pageIndexes.length || cached.pageIndexes.some((pageIndex, index) => pageIndex !== pageIndexes[index])) {
-      return null;
-    }
-    return cached.detachedBytes;
+    return this.findDetachedBytesOnDisk(file, currentBytes, pageIndexes);
   }
   async completeInkEditTransaction(file, elements, pageIndexes, hooks) {
     const existing = this.inkCommitPromises.get(file.path);
@@ -3985,7 +4031,7 @@ var InkSession = class {
         this.detachedInkEditPages.add(pageIndex);
       }
       if (detachedNow) {
-        await yieldForCollector();
+        await yieldForCollector(collectorPressureDelayMs());
         await this.reloadNativePdfView();
       }
       for (const pageIndex of pageIndexes) {
@@ -14116,6 +14162,13 @@ function yieldForCollector(delayMs = 260) {
   return new Promise((resolve) => {
     window.setTimeout(() => window.setTimeout(resolve, delayMs), 0);
   });
+}
+function collectorPressureDelayMs() {
+  const used = performance.memory;
+  if (!used?.usedJSHeapSize || !used?.jsHeapSizeLimit) {
+    return 260;
+  }
+  return used.usedJSHeapSize / used.jsHeapSizeLimit > 0.55 ? 700 : 260;
 }
 async function sha256Hex(buffer) {
   if (!activeWindow.crypto?.subtle) {

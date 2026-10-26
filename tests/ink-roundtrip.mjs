@@ -145,10 +145,18 @@ console.log(`file=${path.basename(target)} ink=${baseline}`);
 
 let failed = false;
 let previousInk = null;
+let cachedPages = null;
+let cachedStrokes = null;
 for (let cycle = 1; cycle <= 3; cycle += 1) {
   const enterStart = performance.now();
-  const inkPages = await plugin.getPdfInkPageIndexes(file);
-  const strokes = await plugin.loadPdfInkAnnotations(file, inkPages);
+  // TRUSTED=1 emulates the side-car path the plugin takes when a verified
+  // annotation state exists: the ink page set and the strokes come from memory,
+  // so no document parse happens before the transaction.
+  const trusted = process.env.TRUSTED === "1" && cachedPages !== null;
+  const inkPages = trusted ? cachedPages : await plugin.getPdfInkPageIndexes(file);
+  const strokes = trusted ? cachedStrokes : await plugin.loadPdfInkAnnotations(file, inkPages);
+  cachedPages = inkPages;
+  cachedStrokes = strokes;
   const pages = inkPages.size > 0 ? inkPages : new Set([0]);
   let enterError = null;
   try {

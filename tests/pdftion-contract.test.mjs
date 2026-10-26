@@ -561,7 +561,7 @@ test("PDF ink preparation detaches every ink page once and does not reload on re
     source.indexOf("private async commitDetachedInkPages")
   );
   assert.match(prepareSource, /if \(this\.pdfInkPreparationComplete\)/);
-  assert.match(prepareSource, /const pageIndexes = await this\.plugin\.getPdfInkPageIndexes\(this\.file\)/);
+  assert.match(prepareSource, /await this\.plugin\.getPdfInkPageIndexes\(this\.file\)/, 'the parse is still the fallback');
   assert.match(overlayPrepareSource, /const detachedNow = await this\.plugin\.beginInkEditTransaction\(\s*this\.file,\s*pageIndexes,/);
   assert.match(overlayPrepareSource, /if \(detachedNow\) \{[\s\S]{0,600}await this\.reloadNativePdfView\(\);/);
   assert.doesNotMatch(overlayPrepareSource, /await this\.reloadNativePdfView\(\);\s*for \(const pageIndex of pageIndexes\)/);

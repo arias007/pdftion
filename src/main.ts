@@ -41,7 +41,6 @@ const HIT_TOLERANCE_STRICT_PX = 3;
 const HIT_TOLERANCE_LOOSE_PX = 12;
 const DATA_MAINTENANCE_DELETE_DELAY_MS = 30_000;
 const DATA_MAINTENANCE_START_DELAY_MS = 15_000;
-const MAX_DETACHED_CACHE_BYTES = 32 * 1024 * 1024;
 const OVERLAY_HEALTH_CHECK_MS = 5000;
 const OVERLAY_MAX_DPR = 2;
 const PDF_ZOOM_SETTLE_DELAY_MS = 160;
@@ -1715,16 +1714,6 @@ interface PdfReadCacheEntry {
   size: number;
 }
 
-interface DetachedBytesCacheEntry {
-  detachedBytes: ArrayBuffer;
-  pageIndexes: number[];
-  path: string;
-  // Hash of the pre-detach bytes. Holding the bytes themselves would cost a
-  // second copy of the whole document (59 MB on the largest probe file) for the
-  // sole purpose of identity checking.
-  sourceSha256: string;
-}
-
 interface PdfReadCacheLoading {
   path: string;
   promise: Promise<PdfReadCacheEntry>;
@@ -1746,7 +1735,6 @@ export default class PdftionPlugin extends Plugin {
   private missingPdfSurfaces = new Map<HTMLElement, number>();
   private pdfReadCache: PdfReadCacheEntry | null = null;
   private pdfReadCacheLoading: PdfReadCacheLoading | null = null;
-  private detachedBytesCache: DetachedBytesCacheEntry | null = null;
   private pdfFingerprintCache: PdfFingerprintCacheEntry | null = null;
   private sessions = new Map<HTMLElement, InkSession>();
   private surfaceScanTimers: number[] = [];
@@ -2676,9 +2664,14 @@ export default class PdftionPlugin extends Plugin {
     const known = this.pdfReadCache;
     const stat = file.stat;
     const reuse = known && known.path === file.path && known.mtime === stat.mtime && known.size === stat.size;
-    const currentBytes = reuse ? known!.bytes : await this.app.vault.readBinary(file);
+    let currentBytes: ArrayBuffer | null = reuse ? known!.bytes : await this.app.vault.readBinary(file);
     await this.ensureAdapterFolder(dir);
     await this.app.vault.adapter.writeBinary(backupPdfPath, currentBytes);
+    // A detach already computed for these exact bytes is replayed from disk. This
+    // is what keeps a second and every later enter out of pdf-lib entirely: the
+    // 58.6 MB instrument document needs 5.2-8.2 s and ~330 MB of RSS for a parse
+    // plus ~390 MB to save it, and that peak on top of the PDF view's own copy is
+    // what takes the renderer down.
     const replay = await this.findDetachedBytes(file, currentBytes, normalizedPages);
     const pdf = replay ? null : (reuse ? known!.pdf : await PDFDocument.load(currentBytes, { ignoreEncryption: true, updateMetadata: false }));
     const pageCount = pdf ? pdf.getPageCount() : Number.MAX_SAFE_INTEGER;
@@ -2725,15 +2718,29 @@ export default class PdftionPlugin extends Plugin {
       return true;
     }
 
+    // Identify the input now, while the bytes are in hand: hashing costs no extra
+    // memory, reading the 59 MB backup again later would.
+    const sourceSha256 = replay ? null : await sha256Hex(currentBytes);
     try {
+      // Release the pre-detach bytes before saving: the save allocates a second
+      // document-sized buffer, and on a 59 MB file holding both at once is 59 MB
+      // of peak that buys nothing (the backup on disk already holds the original).
+      currentBytes = null;
+      if (reuse) {
+        this.pdfReadCache = null;
+      }
       removeAllInkAnnotationsOnPages(pdf!, new Set(transactionPages));
       const saved = await pdf!.save({ addDefaultPage: false, useObjectStreams: false });
       const detachedBytes = toPdfBytes(saved);
-      this.rememberDetachedBytes(file, currentBytes, transactionPages, detachedBytes);
       await this.app.vault.modifyBinary(file, detachedBytes);
-      // Drop every reference to the parse and to the pre-detach bytes before the
-      // caller reloads the native view; the cache is deliberately not re-filled
-      // with a mutated document.
+      // Write the replay cache before the caller reloads the native view: if that
+      // reload is what dies, the very next attempt is a plain file copy instead of
+      // another parse + save.
+      await this.writeDetachedCache(file, detachedBytes, transactionPages, sourceSha256).catch((error) => {
+        console.warn("pdftion could not store the detached PDF for reuse.", error);
+      });
+      // Drop every reference to the parse before the caller reloads the native
+      // view; the cache is deliberately not re-filled with a mutated document.
       this.invalidatePdfReadCache(file);
       return true;
     } catch (error) {
@@ -2743,30 +2750,85 @@ export default class PdftionPlugin extends Plugin {
     }
   }
 
-  // Remembers the bytes produced by a detach so the same file can be detached
-  // again without a parse. Only one entry is kept: the cost of holding it is the
-  // size of the document, and the benefit only exists for the document in use.
-  private rememberDetachedBytes(
+  private getDetachedCachePaths(file: TFile): { metaPath: string; pdfPath: string } {
+    const key = safeAnnotationKey(file.path);
+    const dir = `${this.manifest.dir}/data/ink-edit-transactions`;
+    return { metaPath: `${dir}/${key}.detached.json`, pdfPath: `${dir}/${key}.detached.pdf` };
+  }
+
+  private async writeDetachedCache(
     file: TFile,
-    sourceBytes: ArrayBuffer,
+    detachedBytes: ArrayBuffer,
     pageIndexes: number[],
-    detachedBytes: ArrayBuffer
-  ): void {
-    // Caching keeps a whole extra document-sized buffer alive, and it is alive
-    // exactly when the native view is reloading — the moment the renderer runs
-    // out of room on big files. Only small documents get the shortcut.
-    if (detachedBytes.byteLength > MAX_DETACHED_CACHE_BYTES) {
-      this.detachedBytesCache = null;
+    sourceSha256: string | null
+  ): Promise<void> {
+    if (!sourceSha256) {
       return;
     }
-    void sha256Hex(sourceBytes).then((sourceSha256) => {
-      this.detachedBytesCache = {
-        detachedBytes,
-        pageIndexes: [...pageIndexes],
-        path: file.path,
-        sourceSha256
-      };
-    });
+    const { metaPath, pdfPath } = this.getDetachedCachePaths(file);
+    await this.app.vault.adapter.writeBinary(pdfPath, detachedBytes);
+    await this.app.vault.adapter.write(
+      metaPath,
+      JSON.stringify({ filePath: file.path, pageIndexes: [...pageIndexes], sourceSha256, version: 1 })
+    );
+    await this.pruneDetachedCaches(file, pdfPath, metaPath);
+  }
+
+  // Only one replay cache is kept: it costs a whole document on disk, and only
+  // the document being edited can benefit from it.
+  private async pruneDetachedCaches(file: TFile, keepPdfPath: string, keepMetaPath: string): Promise<void> {
+    const dir = `${this.manifest.dir}/data/ink-edit-transactions`;
+    let listing: { files?: string[] };
+    try {
+      listing = await this.app.vault.adapter.list(dir);
+    } catch {
+      return;
+    }
+    for (const entry of listing.files ?? []) {
+      if (!entry.endsWith(".detached.pdf") && !entry.endsWith(".detached.json")) {
+        continue;
+      }
+      if (entry === keepPdfPath || entry === keepMetaPath) {
+        continue;
+      }
+      try {
+        await this.app.vault.adapter.remove(entry);
+      } catch {
+        // A cache that cannot be removed is harmless; it is validated by hash.
+      }
+    }
+  }
+
+  private async findDetachedBytesOnDisk(
+    file: TFile,
+    currentBytes: ArrayBuffer,
+    pageIndexes: number[]
+  ): Promise<ArrayBuffer | null> {
+    const { metaPath, pdfPath } = this.getDetachedCachePaths(file);
+    let meta: { filePath?: unknown; pageIndexes?: unknown; sourceSha256?: unknown } | null = null;
+    try {
+      meta = JSON.parse(await this.app.vault.adapter.read(metaPath));
+    } catch {
+      return null;
+    }
+    if (!meta || meta.filePath !== file.path || typeof meta.sourceSha256 !== "string") {
+      return null;
+    }
+    const cachedPages = Array.isArray(meta.pageIndexes) ? meta.pageIndexes as number[] : [];
+    if (cachedPages.length !== pageIndexes.length || cachedPages.some((pageIndex, index) => pageIndex !== pageIndexes[index])) {
+      return null;
+    }
+    // Hash check makes the cache self-invalidating: any outside edit to the PDF
+    // changes the source bytes and the replay is dropped.
+    if (await sha256Hex(currentBytes) !== meta.sourceSha256) {
+      return null;
+    }
+    try {
+      const cached = await this.app.vault.adapter.readBinary(pdfPath);
+      return cached.byteLength > 0 ? cached : null;
+    } catch {
+      return null;
+    }
   }
 
   private async findDetachedBytes(
@@ -2774,20 +2836,7 @@ export default class PdftionPlugin extends Plugin {
     currentBytes: ArrayBuffer,
     pageIndexes: number[]
   ): Promise<ArrayBuffer | null> {
-    const cached = this.detachedBytesCache;
-    if (!cached || cached.path !== file.path) {
-      return null;
-    }
-    if (await sha256Hex(currentBytes) !== cached.sourceSha256) {
-      return null;
-    }
-    if (cached.pageIndexes.length !== pageIndexes.length ||
-      cached.pageIndexes.some((pageIndex, index) => pageIndex !== pageIndexes[index])) {
-      return null;
-    }
-    // Handing out the cached buffer itself is safe: the vault copies on write and
-    // nobody mutates a saved PDF in place.
-    return cached.detachedBytes;
+    return this.findDetachedBytesOnDisk(file, currentBytes, pageIndexes);
   }
 
   async completeInkEditTransaction(
@@ -4853,7 +4902,19 @@ class InkSession {
         this.updateExternalInkLayerState();
         return;
       }
-      const pageIndexes = await this.plugin.getPdfInkPageIndexes(this.file);
+      // A verified side-car already lists every ink annotation in this exact
+      // file, so the ink page set can be derived from the loaded strokes. Asking
+      // the plugin instead parses the whole document (5-8 s and ~330 MB on the
+      // 58.6 MB instrument document) for information already in hand.
+      let pageIndexes = this.annotationStateTrusted
+        ? new Set(this.strokeHistory.filter((stroke) => Array.isArray(stroke.pdfPoints)).map((stroke) => stroke.pageIndex))
+        : new Set<number>();
+      if (pageIndexes.size === 0) {
+        // Either the state is not trusted, or it lists no ink for a document that
+        // may still have some (older state versions omit pdfPoints). Fall back to
+        // the parse rather than silently entering without detaching.
+        pageIndexes = await this.plugin.getPdfInkPageIndexes(this.file);
+      }
       if (pageIndexes.size === 0) {
         this.pdfInkPreparationComplete = true;
         return;
@@ -5033,7 +5094,7 @@ class InkSession {
         // same 59 MB again, and the two peaks together are what took Obsidian
         // down. Yielding here gives the collector a chance to reclaim the parse
         // before that second allocation.
-        await yieldForCollector(collectorPressureDelayMs());
+        await yieldForCollector(collectorPressureDelayMs(this.file.stat?.size ?? 0));
         await this.reloadNativePdfView();
       }
       // The reloaded view no longer contains the native ink, so the overlay
@@ -16919,7 +16980,12 @@ function yieldForCollector(delayMs = 260): Promise<void> {
 // The reload allocates a second full document inside pdf.js. If the renderer is
 // already close to its ceiling, give the collector more time before asking for
 // it, which is the difference between a slow enter and a dead WebView.
-function collectorPressureDelayMs(): number {
+function collectorPressureDelayMs(documentBytes = 0): number {
+  // Big documents: the reload doubles an already enormous footprint, so always
+  // give the collector the long window. Small ones only when the heap is tight.
+  if (documentBytes >= 32 * 1024 * 1024) {
+    return 700;
+  }
   const used = (performance as unknown as { memory?: { usedJSHeapSize?: number; jsHeapSizeLimit?: number } }).memory;
   if (!used?.usedJSHeapSize || !used?.jsHeapSizeLimit) {
     return 260;

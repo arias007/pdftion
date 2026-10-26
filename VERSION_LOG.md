@@ -1,5 +1,65 @@
 # VERSION LOG
 
+## 0.6.3 — 2026-10-26
+
+Targets the large-document crash. The enter flow is unchanged (it still detaches),
+but a document only ever pays for that computation **once**.
+
+### Root cause on the 58.6 MB / 66 page document
+
+| step | cost |
+| --- | --- |
+| `getPdfInkPageIndexes` (parses the document) | 5.2–8.2 s, RSS 330 MB |
+| detach `save()` | +1.0 s, peak RSS 390–500 MB |
+| `modifyBinary` of the 59 MB result | 59 MB buffer |
+| native view reload (pdf.js reads the same 59 MB again) | another full copy |
+
+The device reports `jsHeapSizeLimit` 1078 MB with 179 MB already used by
+Obsidian, so the transaction's ~450 MB sits on top of the PDF view's own copy of
+the same document. That is the peak that kills the renderer.
+
+### Detach replay, on disk
+
+- After computing a detach, the result is stored next to the transaction backup
+  (`<key>.detached.pdf` + `<key>.detached.json`), keyed by the SHA-256 of the
+  source bytes and the page set.
+- The next enter finds it and just copies it into the vault: no parse, no save.
+  Measured on 6.1 MB / 42 pages and 58.6 MB / 66 pages: repeat enters 4.9–5.1 s →
+  **0.23–0.36 s**.
+- It is invalidated by any outside edit (the hash no longer matches) and by a
+  different ink page set. Only one replay file is kept, since it costs a whole
+  document on disk.
+- Written *before* the caller reloads the view, so if the reload is what dies, the
+  next attempt is the cheap path.
+- If the source PDF is destroyed or the plugin is uninstalled the cache goes with
+  the plugin data directory; a stale one is never trusted because of the hash.
+
+### Entering no longer parses when a verified state exists
+
+`runEditableInkPrepare` derives the ink page set from the loaded strokes instead
+of calling `getPdfInkPageIndexes`, which parses the document. Falls back to the
+parse whenever the derived set is empty, so an older state that omits `pdfPoints`
+cannot silently skip the detach.
+
+### Peak reduction
+
+- The pre-detach bytes are released before `save()` allocates a second
+  document-sized buffer, and the parsed document is dropped from the read cache at
+  the same point (the mutated document is never re-cached).
+- The source hash is computed while the bytes are in hand, so the cache write does
+  not read the 59 MB backup back into memory.
+- The collector yield before the native reload is now 700 ms for any document
+  ≥ 32 MB, not only when the heap reports pressure — the reload doubles an already
+  enormous footprint regardless of reported headroom.
+
+### Tests
+
+`tests/fast-exit.test.mjs` now pins the replay consult-before-parse order, the
+hash identity, the page-set check, the single-entry pruning and the size-aware
+collector delay. `tests/ink-roundtrip.mjs` gained `TRUSTED=1`, which reproduces
+the side-car path: on the 58.6 MB document cycles 2 and 3 enter in 297/319 ms with
+ink stable at 76/76. Full suite: 52 passing.
+
 ## 0.6.2 — 2026-10-26
 
 Same enter flow as 0.6.1 (detach, no special case). What changes is how much work

@@ -1,5 +1,58 @@
 # VERSION LOG
 
+## 0.6.0 — 2026-10-26
+
+Entering edit mode no longer touches the file at all; a page is rewritten only
+when its ink is actually modified. Leaving shows the same spinner as entering.
+
+### Why (measured on the 58.6 MB / 66 page probe document)
+
+| step | cost |
+| --- | --- |
+| read + fingerprint (what enter needs now) | 106 ms, RSS 168 MB |
+| `PDFDocument.load` (what enter used to need) | 4 920 ms, RSS 424 MB |
+| detach rewrite (`save` + write 59 MB) | +2 000–4 000 ms |
+| pdf.js loading the rewritten file | its own full copy |
+
+Entering edit mode used to detach every ink page immediately: parse the whole
+document (424 MB of heap), save it, write it back, then have pdf.js load the
+rewritten file. On a 60 MB PDF that is the peak that killed the WebView — the
+"spinner spins, then Obsidian disappears" crash.
+
+### Lazy detach
+
+- `preparePdfInkOverlayForEditing` no longer rewrites the PDF: it arms the ink
+  pages in `pendingInkDetachPages` and leaves the PDF painting its own ink.
+- `markElementChanged` / `markStrokeDeleted` schedule `runPendingInkDetach`,
+  which detaches the touched pages once (never mid-gesture), then hands display
+  ownership to the overlay copy.
+- A verified annotation side-car (`annotationStateTrusted`) lets enter skip the
+  parser entirely; the first import now persists the index so later sessions do
+  not parse at all. The fingerprint keeps it self-invalidating when the file
+  changes.
+- Leaving cancels a pending detach (it would race the save) and waits for one
+  already in flight.
+
+### Spinner
+
+- Exit shows the spinner too (`finishPdfInkEditing`).
+- Ref-counted (`preparingDepth`) so enter and detach cannot clear each other.
+- Delayed by 120 ms before appearing, so fast enters no longer flash.
+
+### Memory
+
+- `toPdfBytes` hands `pdf.save()` output to the vault without a second
+  full-size copy (previously every save allocated the document size twice).
+- A short yield before the reload lets the large parsed document be collected
+  before pdf.js allocates its own copy of the file.
+
+### Tests
+
+`tests/lazy-detach.test.mjs` — enter never rewrites or reloads, modify triggers
+detach, both directions show the spinner, no full-size save copies.
+Full suite: 44 tests passing. `tests/ink-roundtrip.mjs` still passes on 6.1 MB
+and 58.6 MB documents (3 enter/exit cycles each, ink count stable).
+
 ## 0.5.9 — 2026-10-26
 
 Entering and leaving PDF edit mode no longer re-parses the whole document, and

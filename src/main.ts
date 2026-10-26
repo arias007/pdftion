@@ -2634,8 +2634,7 @@ export default class PdftionPlugin extends Plugin {
       try {
         removeAllInkAnnotationsOnPages(pdf, new Set(validAdditionalPages));
         const saved = await pdf.save({ addDefaultPage: false, useObjectStreams: false });
-        const detachedBytes = new ArrayBuffer(saved.byteLength);
-        new Uint8Array(detachedBytes).set(saved);
+        const detachedBytes = toPdfBytes(saved);
         await this.app.vault.modifyBinary(file, detachedBytes);
         // The mutated document must never be handed out again: pdf-lib pages
         // are stateful, and reusing a doc whose annotations were removed is what
@@ -2684,8 +2683,7 @@ export default class PdftionPlugin extends Plugin {
     try {
       removeAllInkAnnotationsOnPages(pdf, new Set(transactionPages));
       const saved = await pdf.save({ addDefaultPage: false, useObjectStreams: false });
-      const detachedBytes = new ArrayBuffer(saved.byteLength);
-      new Uint8Array(detachedBytes).set(saved);
+      const detachedBytes = toPdfBytes(saved);
       await this.app.vault.modifyBinary(file, detachedBytes);
       // Drop the mutated document instead of caching it (see above).
       this.invalidatePdfReadCache(file);
@@ -2773,8 +2771,7 @@ export default class PdftionPlugin extends Plugin {
         }
       }
       const saved = await pdf.save({ addDefaultPage: false, useObjectStreams: false });
-      const committedBytes = new ArrayBuffer(saved.byteLength);
-      new Uint8Array(committedBytes).set(saved);
+      const committedBytes = toPdfBytes(saved);
       await this.app.vault.modifyBinary(file, committedBytes);
       // The committed document was mutated; never cache it.
       this.invalidatePdfReadCache(file);
@@ -3599,7 +3596,13 @@ class InkSession {
   private inkPrepareTimer: number | null = null;
   private inkPrepareTimerForce = false;
   private inkPrepareRun: Promise<void> | null = null;
+  private pendingInkDetachPages = new Set<number>();
+  private inkDetachQueuedPages = new Set<number>();
+  private inkDetachTimer: number | null = null;
+  private inkDetachRun: Promise<boolean> | null = null;
+  private annotationStateTrusted = false;
   private preparingIndicator = false;
+  private preparingDepth = 0;
   private nativeAnnotationPopupTimer: number | null = null;
   private nativePopupHideTimers = new Set<number>();
   private nativePopupSuppressUntil = 0;
@@ -3925,6 +3928,11 @@ class InkSession {
       this.dirty = true;
       this.scheduleAutoSave(250);
     }
+    // The side-car is only accepted when its stored fingerprint matches the
+    // current bytes, so a verified state already describes every ink annotation
+    // in the PDF. Entering edit mode can then skip the pdf-lib parse entirely —
+    // that parse is what took seconds and hundreds of megabytes on big files.
+    this.annotationStateTrusted = state !== null;
     this.loadedAnnotationState = true;
     this.redrawAll();
     this.refreshCommentManager();
@@ -4701,6 +4709,20 @@ class InkSession {
   }
 
   private async runEditableInkPrepare(force = false): Promise<void> {
+    // Only show the spinner if the wait is actually noticeable, so a fast enter
+    // does not flash, and a slow one (first open of a big file) always shows it.
+    let spinnerTimer: number | null = window.setTimeout(() => {
+      spinnerTimer = null;
+      this.setPreparingIndicator(true);
+    }, 120);
+    const stopSpinner = (): void => {
+      if (spinnerTimer !== null) {
+        window.clearTimeout(spinnerTimer);
+        spinnerTimer = null;
+      } else {
+        this.setPreparingIndicator(false);
+      }
+    };
     try {
       if (this.conversionInProgress) {
         return;
@@ -4724,7 +4746,24 @@ class InkSession {
         this.updateExternalInkLayerState();
         return;
       }
-      this.setPreparingIndicator(true);
+      if (this.annotationStateTrusted) {
+        // Nothing to import: the verified side-car already lists every ink
+        // annotation in this exact file, so skip the parse (and the rewrite)
+        // entirely and just arm the lazy detach.
+        const inkPages = new Set(
+          this.strokeHistory
+            .filter((stroke) => Array.isArray(stroke.pdfPoints))
+            .map((stroke) => stroke.pageIndex)
+        );
+        for (const pageIndex of inkPages) {
+          this.pendingInkDetachPages.add(pageIndex);
+          this.inkDetachReloadPendingPages.add(pageIndex);
+        }
+        this.pdfInkPreparationComplete = true;
+        this.updateExternalInkLayerState();
+        this.redrawAll();
+        return;
+      }
       const pageIndexes = await this.plugin.getPdfInkPageIndexes(this.file);
       if (pageIndexes.size === 0) {
         this.pdfInkPreparationComplete = true;
@@ -4734,16 +4773,20 @@ class InkSession {
     } catch (error) {
       console.warn("pdftion could not prepare PDF ink for editable mode.", error);
     } finally {
-      this.setPreparingIndicator(false);
+      stopSpinner();
     }
   }
 
+  // Nested work (enter preparation + lazy detach) must not clear each other's
+  // spinner, and the button must show it the instant the user taps.
   private setPreparingIndicator(preparing: boolean): void {
-    if (this.preparingIndicator === preparing) {
+    this.preparingDepth = Math.max(0, this.preparingDepth + (preparing ? 1 : -1));
+    const visible = this.preparingDepth > 0;
+    if (this.preparingIndicator === visible) {
       return;
     }
-    this.preparingIndicator = preparing;
-    this.button?.classList.toggle("is-preparing", preparing);
+    this.preparingIndicator = visible;
+    this.button?.classList.toggle("is-preparing", visible);
   }
 
   private scheduleEditableInkPrepare(delay = 160, force = false): void {
@@ -4849,69 +4892,169 @@ class InkSession {
 
     this.preparingPdfInkForEditing = true;
     try {
-      for (const pageIndex of pageIndexes) {
-        this.pendingNativeInkHidePages.add(pageIndex);
-        // The native view still paints the original ink until the detach
-        // rewrite is reloaded; suppress the overlay copy in the meantime.
-        this.inkDetachReloadPendingPages.add(pageIndex);
-      }
-      this.updateExternalInkLayerState();
       await this.importPdfInkForPages(pageIndexes);
+      const inkBearingPages = Array.from(pageIndexes).filter((pageIndex) => this.hasNativeInkOnPage(pageIndex));
+
       // Fast path: when the native ink is rendered as DOM annotation elements,
       // the existing CSS hiding already guarantees a single visible layer, so
-      // rewriting the PDF file and reloading the view is unnecessary. Skipping
-      // both removes the slow conversion window and the double-layer risk.
+      // no file rewrite is needed at all.
       const relevantOverlays = Array.from(this.overlays.values())
-        .filter((overlay) => pageIndexes.has(overlay.pageIndex));
+        .filter((overlay) => inkBearingPages.includes(overlay.pageIndex));
       const cssHidingCapable = relevantOverlays.length > 0 && relevantOverlays.every((overlay) => (
         this.canHideNativeInkOnPage(overlay)
       ));
       if (cssHidingCapable) {
-        for (const pageIndex of pageIndexes) {
-          this.inkDetachReloadPendingPages.delete(pageIndex);
-          const hasNativeInk = this.strokeHistory.some((stroke) => (
-            stroke.pageIndex === pageIndex && Array.isArray(stroke.pdfPoints)
-          ));
-          if (!hasNativeInk) {
-            this.pendingNativeInkHidePages.delete(pageIndex);
-          }
+        for (const pageIndex of inkBearingPages) {
+          this.pendingNativeInkHidePages.add(pageIndex);
         }
         this.updateExternalInkLayerState();
         this.redrawAll();
         this.pdfInkPreparationComplete = true;
         return;
       }
-      const detachedNow = await this.plugin.beginInkEditTransaction(this.file, pageIndexes);
-      for (const pageIndex of pageIndexes) {
-        this.detachedInkEditPages.add(pageIndex);
-      }
-      if (detachedNow) {
-        await this.reloadNativePdfView();
-      }
-      // The reloaded view no longer contains the native ink, so the overlay
-      // copy becomes the only visible layer from here on.
-      for (const pageIndex of pageIndexes) {
-        const hasNativeInk = this.strokeHistory.some((stroke) => (
-          stroke.pageIndex === pageIndex && Array.isArray(stroke.pdfPoints)
-        ));
-        if (!hasNativeInk) {
-          this.pendingNativeInkHidePages.delete(pageIndex);
-        }
-        this.inkDetachReloadPendingPages.delete(pageIndex);
+
+      // Lazy detach. Rewriting the whole PDF on enter is what made this button
+      // feel unusable and what crashed Obsidian: detaching a 60 MB document
+      // needs ~430 MB of heap (measured), and the native view then has to load
+      // the rewritten file again in the same breath. Instead the file stays
+      // untouched while the PDF keeps painting its own ink, and a page is
+      // rewritten only when the user actually modifies ink on it.
+      for (const pageIndex of inkBearingPages) {
+        this.pendingInkDetachPages.add(pageIndex);
+        // Our editable copy is identical to what the PDF already paints, and
+        // the PDF's own rendering owns the display until the page is detached.
+        this.inkDetachReloadPendingPages.add(pageIndex);
       }
       this.updateExternalInkLayerState();
       this.redrawAll();
       this.pdfInkPreparationComplete = true;
+      // Persist what was imported so the next enter can trust the side-car and
+      // skip the parser entirely (the fingerprint makes it self-invalidating if
+      // the file changes under us).
+      if (!this.annotationStateTrusted) {
+        try {
+          await this.plugin.saveEditableAnnotationState(this.file, this.getEditableElements());
+          this.annotationStateTrusted = true;
+        } catch (error) {
+          console.debug("pdftion could not cache the imported ink index.", error);
+        }
+      }
     } catch (error) {
       console.warn("pdftion could not prepare PDF ink annotations for editing.", error);
       for (const pageIndex of pageIndexes) {
         this.pendingNativeInkHidePages.delete(pageIndex);
         this.inkDetachReloadPendingPages.delete(pageIndex);
+        this.pendingInkDetachPages.delete(pageIndex);
       }
       this.updateExternalInkLayerState();
       this.redrawAll();
     } finally {
       this.preparingPdfInkForEditing = false;
+    }
+  }
+
+  private hasNativeInkOnPage(pageIndex: number): boolean {
+    return this.strokeHistory.some((stroke) => (
+      stroke.pageIndex === pageIndex && Array.isArray(stroke.pdfPoints)
+    ));
+  }
+
+  // Detach the pages a modification actually needs, then hand the display back
+  // to the overlay copy. Runs once per page for the whole session.
+  private scheduleInkDetach(pageIndexes: Iterable<number>): void {
+    if (!this.enabled || this.destroyed) {
+      return;
+    }
+    let queued = false;
+    for (const pageIndex of pageIndexes) {
+      if (!this.pendingInkDetachPages.has(pageIndex)) {
+        continue;
+      }
+      this.inkDetachQueuedPages.add(pageIndex);
+      queued = true;
+    }
+    if (!queued) {
+      return;
+    }
+    if (this.inkDetachTimer !== null) {
+      window.clearTimeout(this.inkDetachTimer);
+    }
+    // Wait for the gesture to finish: a reload must never land mid-drag.
+    this.inkDetachTimer = window.setTimeout(() => {
+      this.inkDetachTimer = null;
+      void this.runPendingInkDetach();
+    }, 60);
+  }
+
+  private async runPendingInkDetach(): Promise<boolean> {
+    if (this.inkDetachRun) {
+      return this.inkDetachRun;
+    }
+    const pages = new Set(this.inkDetachQueuedPages);
+    this.inkDetachQueuedPages.clear();
+    if (pages.size === 0 || !this.enabled || this.destroyed) {
+      return true;
+    }
+    const targetPath = this.file.path;
+    const run = (async (): Promise<boolean> => {
+      try {
+        // Never reload while the user is still drawing, dragging or erasing.
+        for (let waited = 0; waited < 4000; waited += 80) {
+          if (!this.isInteracting() && !this.currentStroke && !this.selectionDrag) {
+            break;
+          }
+          await sleepMs(80);
+        }
+        this.setPreparingIndicator(true);
+        const detachedNow = await this.plugin.beginInkEditTransaction(this.file, pages);
+        if (this.file.path !== targetPath || this.destroyed) {
+          return false;
+        }
+        for (const pageIndex of pages) {
+          this.detachedInkEditPages.add(pageIndex);
+          this.pendingInkDetachPages.delete(pageIndex);
+          this.inkDetachReloadPendingPages.add(pageIndex);
+        }
+        if (detachedNow) {
+          // The rewrite leaves a large parsed document (and, on mobile, a large
+          // external buffer) for the collector; the reload then allocates a
+          // fresh pdf.js copy of the same file. Yielding here lets the collector
+          // run before that second allocation, which is what used to push big
+          // documents over the WebView heap limit.
+          await sleepMs(160);
+          await this.reloadNativePdfView();
+        }
+        for (const pageIndex of pages) {
+          this.inkDetachReloadPendingPages.delete(pageIndex);
+          if (this.hasNativeInkOnPage(pageIndex)) {
+            this.pendingNativeInkHidePages.add(pageIndex);
+          }
+        }
+        this.updateExternalInkLayerState();
+        this.redrawAll();
+        return true;
+      } catch (error) {
+        console.warn("pdftion could not detach the ink pages for editing.", error);
+        for (const pageIndex of pages) {
+          this.inkDetachReloadPendingPages.delete(pageIndex);
+        }
+        this.updateExternalInkLayerState();
+        this.redrawAll();
+        return false;
+      } finally {
+        this.setPreparingIndicator(false);
+      }
+    })();
+    this.inkDetachRun = run;
+    try {
+      return await run;
+    } finally {
+      if (this.inkDetachRun === run) {
+        this.inkDetachRun = null;
+      }
+      if (this.inkDetachQueuedPages.size > 0) {
+        this.scheduleInkDetach(new Set(this.inkDetachQueuedPages));
+      }
     }
   }
 
@@ -5008,16 +5151,33 @@ class InkSession {
   private async finishPdfInkEditing(): Promise<boolean> {
     this.clearEditableInkPrepareTimer();
     this.commitNativeTextEditor();
-    if (this.detachedInkEditPages.size > 0) {
-      const committed = await this.commitDetachedInkPages(new Set(this.detachedInkEditPages));
-      if (!committed) {
-        return false;
+    // Leaving edit mode is the other half of the wait, so it shows the same
+    // spinner. Modifications made on pages that were never detached are flushed
+    // through the normal save path below.
+    // A detach scheduled just before leaving must not race the save below.
+    if (this.inkDetachTimer !== null) {
+      window.clearTimeout(this.inkDetachTimer);
+      this.inkDetachTimer = null;
+    }
+    this.inkDetachQueuedPages.clear();
+    if (this.inkDetachRun) {
+      await this.inkDetachRun.catch(() => false);
+    }
+    this.setPreparingIndicator(true);
+    try {
+      if (this.detachedInkEditPages.size > 0) {
+        const committed = await this.commitDetachedInkPages(new Set(this.detachedInkEditPages));
+        if (!committed) {
+          return false;
+        }
       }
+      if (this.hasPendingPdfWrite()) {
+        await this.saveIntoPdf(true);
+      }
+      return true;
+    } finally {
+      this.setPreparingIndicator(false);
     }
-    if (this.hasPendingPdfWrite()) {
-      await this.saveIntoPdf(true);
-    }
-    return true;
   }
 
   private async reloadEditableAnnotationsAfterInkRollback(): Promise<void> {
@@ -8068,8 +8228,7 @@ class InkSession {
 
   private async persistPdfRewrite(saved: Uint8Array, elements: InkElement[], message: string): Promise<void> {
     await this.savePdfRewriteBackup();
-    const buffer = new ArrayBuffer(saved.byteLength);
-    new Uint8Array(buffer).set(saved);
+    const buffer = toPdfBytes(saved);
     await this.plugin.app.vault.modifyBinary(this.file, buffer);
     const basePdf = await this.plugin.ensureBasePdfBytes(this.file, buffer);
     const marked = elements.map((element) => markElementSaved(cloneElement(element)));
@@ -9170,8 +9329,7 @@ class InkSession {
           dirtyPages: changedInkPages
         });
         const saved = await pdf.save({ addDefaultPage: false, useObjectStreams: false });
-        buffer = new ArrayBuffer(saved.byteLength);
-        new Uint8Array(buffer).set(saved);
+        buffer = toPdfBytes(saved);
         await validatePdfWriteCandidate(buffer, sourcePageCount);
         await this.savePdfRewriteBackup();
         let sourceModified = false;
@@ -9933,8 +10091,7 @@ class InkSession {
       await drawVisibleInkElementsOnPdf(pdf, elements, fontBytes);
 
       const saved = await pdf.save({ addDefaultPage: false, useObjectStreams: false });
-      const buffer = new ArrayBuffer(saved.byteLength);
-      new Uint8Array(buffer).set(saved);
+      const buffer = toPdfBytes(saved);
       const exportedFile = await this.plugin.app.vault.createBinary(targetPath, buffer);
       const opened = await this.openConvertedFile(exportedFile);
 
@@ -11126,8 +11283,15 @@ class InkSession {
         if (!element.pdfPoints) {
           element.pdfPoints = element.points.map((point) => ({ ...point }));
         }
-        this.pendingNativeInkHidePages.add(element.pageIndex);
-        this.updateExternalInkLayerState();
+        // The PDF still paints this page's ink. Hiding the native layer here
+        // would make the ink vanish until the rewrite lands, so the page is
+        // detached first and the display is handed over afterwards.
+        if (this.pendingInkDetachPages.has(element.pageIndex)) {
+          this.scheduleInkDetach([element.pageIndex]);
+        } else {
+          this.pendingNativeInkHidePages.add(element.pageIndex);
+          this.updateExternalInkLayerState();
+        }
       }
       if (element.source === "external-ink") {
         element.externalDirty = true;
@@ -11138,6 +11302,9 @@ class InkSession {
 
   private markStrokeDeleted(stroke: InkStroke): void {
     this.markInkPageDirty(stroke.pageIndex);
+    if (Array.isArray(stroke.pdfPoints) || stroke.pdfSaved === true) {
+      this.scheduleInkDetach([stroke.pageIndex]);
+    }
     if (stroke.source === "external-ink") {
       this.deletedExternalInkIds.add(stroke.id);
       return;
@@ -16730,6 +16897,15 @@ function arrayBuffersEqual(a: ArrayBuffer, b: ArrayBuffer): boolean {
     }
   }
   return true;
+}
+
+function toPdfBytes(view: Uint8Array): ArrayBuffer {
+  if (view.byteOffset === 0 && view.byteLength === view.buffer.byteLength) {
+    return view.buffer as ArrayBuffer;
+  }
+  const copy = new ArrayBuffer(view.byteLength);
+  new Uint8Array(copy).set(view);
+  return copy;
 }
 
 async function sha256Hex(buffer: ArrayBuffer): Promise<string> {

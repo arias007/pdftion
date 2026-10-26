@@ -1,5 +1,27 @@
 # VERSION LOG
 
+## 0.6.1 — 2026-10-26
+
+Reverts the 0.6.0 lazy detach on the enter path (it could not enter edit mode on
+device) and keeps the parts that were wanted.
+
+- Entering edit mode is back to the 0.5.9 flow: it detaches the ink pages, which
+  works, at the cost of one rewrite per session.
+- Kept: leaving edit mode shows the spinner (`finishPdfInkEditing`).
+- Kept: the spinner is ref-counted (`preparingDepth`), so an exit that overlaps
+  the enter preparation cannot clear the indicator the enter still needs.
+- Kept: the spinner is armed before the annotation-state load and appears after
+  120 ms. The state load hashes the whole PDF on a first open and used to run
+  before the indicator turned on — that is why some enters showed no spinner.
+- Kept: `toPdfBytes` hands `pdf.save()` output to the vault without a second
+  full-size copy.
+- Removed: `pendingInkDetachPages`, `scheduleInkDetach`, `runPendingInkDetach`,
+  `annotationStateTrusted` and their hooks. Enter detaches; nothing else does.
+
+Tests: `tests/spinner.test.mjs` pins the spinner behaviour and asserts the enter
+path is back to detaching with no lazy-detach machinery left behind. Full suite
+43 passing; `tests/ink-roundtrip.mjs` passes three enter/exit cycles on 6.1 MB.
+
 ## 0.6.0 — 2026-10-26
 
 Entering edit mode no longer touches the file at all; a page is rewritten only

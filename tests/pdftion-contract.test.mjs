@@ -494,7 +494,7 @@ test("editing overlays does not detach the source PDF and guarded ink writes res
   const source = await readFile(sourceUrl, "utf8");
   const prepareSource = source.slice(
     source.indexOf("private async preparePdfInkOverlayForEditing"),
-    source.indexOf("private hasNativeInkOnPage")
+    source.indexOf("private async commitDetachedInkPages")
   );
   const recoverySource = source.slice(
     source.indexOf("private async recoverPendingInkEditTransactions"),
@@ -522,14 +522,11 @@ test("editing overlays does not detach the source PDF and guarded ink writes res
   assert.match(source, /Ink verification failed/);
   assert.match(source, /recoverPendingInkEditTransactions\(\)/);
   assert.match(prepareSource, /await this\.importPdfInkForPages\(pageIndexes\)/);
-  // The enter path no longer detaches or reloads; lazy detach owns both.
-  assert.doesNotMatch(prepareSource, /beginInkEditTransaction|reloadNativePdfView/);
-  assert.match(prepareSource, /this\.pendingInkDetachPages\.add\(pageIndex\)/);
-  assert.match(prepareSource, /hasNativeInkOnPage|Array\.isArray\(stroke\.pdfPoints\)/);
-  // The enter path must not commit, rewrite bytes, or write state that claims a
-  // different file version; persisting the imported index is the only write.
-  assert.doesNotMatch(prepareSource, /commitDetachedInkPages|modifyBinary/);
-  assert.doesNotMatch(prepareSource, /saveAnnotationState\(/);
+  assert.match(prepareSource, /await this\.plugin\.beginInkEditTransaction\(this\.file, pageIndexes\)/);
+  assert.match(prepareSource, /this\.detachedInkEditPages\.add\(pageIndex\)/);
+  assert.match(prepareSource, /await this\.reloadNativePdfView\(\)/);
+  assert.match(prepareSource, /Array\.isArray\(stroke\.pdfPoints\)/);
+  assert.doesNotMatch(prepareSource, /commitDetachedInkPages|modifyBinary|saveEditableAnnotationState/);
   assert.match(recoverySource, /await this\.restoreInkEditTransaction\(file, record, true\)/);
   assert.match(recoverySource, /await this\.saveEditableAnnotationState\(file, elements, restoredBytes\)/);
   assert.doesNotMatch(recoverySource, /finishInkEditTransaction/);
@@ -553,7 +550,7 @@ test("editing overlays does not detach the source PDF and guarded ink writes res
   assert.match(source, /void this\.finishPdfInkEditing\(\)/);
 });
 
-test("PDF ink preparation arms lazy detach per ink page and does not reload on repeated preparation", async () => {
+test("PDF ink preparation detaches every ink page once and does not reload on repeated preparation", async () => {
   const source = await readFile(sourceUrl, "utf8");
   const prepareSource = source.slice(
     source.indexOf("private async prepareEditableInkForCurrentPage"),
@@ -561,15 +558,13 @@ test("PDF ink preparation arms lazy detach per ink page and does not reload on r
   );
   const overlayPrepareSource = source.slice(
     source.indexOf("private async preparePdfInkOverlayForEditing"),
-    source.indexOf("private hasNativeInkOnPage")
+    source.indexOf("private async commitDetachedInkPages")
   );
   assert.match(prepareSource, /if \(this\.pdfInkPreparationComplete\)/);
   assert.match(prepareSource, /const pageIndexes = await this\.plugin\.getPdfInkPageIndexes\(this\.file\)/);
-  // Entering must never rewrite the file: it only arms the pages for a lazy
-  // detach, which the ink-modification hooks trigger.
-  assert.doesNotMatch(overlayPrepareSource, /beginInkEditTransaction/);
-  assert.doesNotMatch(overlayPrepareSource, /reloadNativePdfView/);
-  assert.match(overlayPrepareSource, /pendingInkDetachPages\.add\(pageIndex\)/);
+  assert.match(overlayPrepareSource, /const detachedNow = await this\.plugin\.beginInkEditTransaction\(this\.file, pageIndexes\)/);
+  assert.match(overlayPrepareSource, /if \(detachedNow\) \{\s*await this\.reloadNativePdfView\(\);/);
+  assert.doesNotMatch(overlayPrepareSource, /await this\.reloadNativePdfView\(\);\s*for \(const pageIndex of pageIndexes\)/);
 });
 
 test("native PDF text selection follows the last highlight or copy action", async () => {

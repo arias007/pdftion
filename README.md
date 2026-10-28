@@ -1,5 +1,8 @@
 # Pdftion
 
+<!-- hire-line -->
+> **Need this adapted, extended, or built from scratch?** I wrote this plugin — [custom work available](https://github.com/arias007/arias007#hire-me). Working proof first, payment after.
+
 ![Pdftion demo](assets/pdftion-demo.gif)
 
 Pdftion is a PDF annotation and editing plugin for note-focused PDF workflows. It adds editable ink, highlights, text overlays, cover blocks, image overlays, visual PDF/DOCX/PPTX/PNG/HTML export, NoteDraw-aware Markdown conversion, and an AI-friendly operation API to PDF views and embedded PDF previews.
